@@ -1,8 +1,32 @@
+[workspace]
+members = [
+    ".",
+    "ui"
+]
+
 [package]
 name = "nexir"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+wgpu = { version = "0.19.4", features = ["wgsl"] }
+pollster = "0.3"
+raw-window-handle = "0.6"
+half = "2"
+rayon = "1.10"
+dashmap = "6"
+lru = "0.12"
+cpal = "0.15"
+num_cpus = "1"
+wgpu-hal = "0.19.4"
+ash = "0.38"
 
 [dev-dependencies]
+pollster = "0.3"
+
+[build-dependencies]
+pkg-config = "0.3"
+cc = "1.0"
