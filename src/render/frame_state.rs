@@ -15,6 +15,7 @@ pub struct ClipRenderEntry {
     pub clip_height:   u32,
     pub transform:     ClipTransform,
     pub opacity:       f32,
+    pub is_nv12:       bool,
 }
 
 /// Everything the graph needs for one frame.

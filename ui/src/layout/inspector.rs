@@ -9,6 +9,7 @@ pub struct InspectorState {
     pub rotation: f32,
     pub opacity:  f32,
     pub speed:    f32,
+    pub pitch:    f32,
 
     /// The clip store-index we last loaded values from.
     /// Used to detect when the selection changes so we can reload.
@@ -24,6 +25,7 @@ impl Default for InspectorState {
             rotation: 0.0,
             opacity:  100.0,
             speed:    1.0,
+            pitch:    0.0,
             last_loaded_clip: None,
         }
     }
@@ -34,6 +36,16 @@ pub fn draw(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, sele
     ui.separator();
     ui.add_space(4.0);
 
+    // Wrap everything in a scroll area so content is always reachable
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+        draw_inner(ui, state, project, selected_clip);
+    });
+}
+
+fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, selected_clip: Option<usize>) {
+
     // ── Sync local state when selection changes ──────────────────────────
     if selected_clip != state.last_loaded_clip {
         if let Some(idx) = selected_clip {
@@ -43,7 +55,8 @@ pub fn draw(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, sele
             state.scale    = t.scale[0];          // uniform scale (X)
             state.rotation = t.rotation.to_degrees();
             state.opacity  = project.clips.opacity_at(idx) * 100.0;
-            state.speed    = 1.0; // placeholder — speed field not yet in store
+            state.speed    = project.clips.speed_at(idx);
+            state.pitch    = project.clips.pitch_at(idx);
         } else {
             *state = InspectorState::default();
         }
@@ -77,9 +90,9 @@ pub fn draw(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, sele
                 );
             });
             ui.add_space(6.0);
-            ui.collapsing("⚡  Speed", |ui| {
+            ui.collapsing("⚡  Speed & Pitch", |ui| {
                 ui.label(
-                    RichText::new("Select a clip to edit speed.")
+                    RichText::new("Select a clip to edit speed and pitch.")
                         .color(Color32::from_rgb(100, 100, 100))
                         .italics(),
                 );
@@ -176,36 +189,63 @@ pub fn draw(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, sele
 
             ui.add_space(6.0);
 
-            // ── Speed ─────────────────────────────────────────────────────
-            ui.collapsing("⚡  Speed", |ui| {
-                egui::Grid::new("speed_grid")
-                    .num_columns(2)
-                    .spacing([8.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("Speed");
-                        ui.add(
-                            egui::Slider::new(&mut state.speed, 0.1..=8.0)
-                                .suffix("x")
-                                .logarithmic(true),
-                        );
-                        ui.end_row();
-                    });
+            // ── Speed & Pitch ──────────────────────────────────────────────
+            let speed_resp = egui::CollapsingHeader::new("⚡  Speed & Pitch")
+                .default_open(true)
+                .id_source("speed_pitch_header")
+                .show(ui, |ui| {
+                    egui::Grid::new("speed_pitch_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Speed");
+                            if ui.add(
+                                egui::Slider::new(&mut state.speed, 0.1..=8.0)
+                                    .suffix("x")
+                                    .logarithmic(true),
+                            ).changed() {
+                                project.clips.set_speed_at(idx, state.speed);
+                            }
+                            ui.end_row();
 
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    for preset in [0.25_f32, 0.5, 1.0, 1.5, 2.0, 4.0] {
-                        if ui.small_button(format!("{}×", preset)).clicked() {
-                            state.speed = preset;
+                            ui.label("Pitch");
+                            if ui.add(
+                                egui::Slider::new(&mut state.pitch, -12.0..=12.0)
+                                    .suffix(" st")
+                                    .fixed_decimals(1),
+                            ).changed() {
+                                project.clips.set_pitch_at(idx, state.pitch);
+                            }
+                            ui.end_row();
+                        });
+
+                    ui.add_space(4.0);
+                    // Speed presets
+                    ui.label(RichText::new("Speed presets:").color(Color32::from_rgb(160, 160, 160)).small());
+                    ui.horizontal(|ui| {
+                        for (i, &preset) in [0.25_f32, 0.5, 1.0, 1.5, 2.0, 4.0].iter().enumerate() {
+                            let btn = egui::Button::new(format!("{}×", preset)).small();
+                            if ui.add(btn).clicked() {
+                                state.speed = preset;
+                                project.clips.set_speed_at(idx, preset);
+                            }
+                            let _ = i; // suppress warning
                         }
-                    }
+                    });
+                    ui.add_space(4.0);
+                    // Pitch presets
+                    ui.label(RichText::new("Pitch presets:").color(Color32::from_rgb(160, 160, 160)).small());
+                    ui.horizontal(|ui| {
+                        for &semitones in &[-12_i32, -7, -5, 0, 5, 7, 12] {
+                            let label = if semitones == 0 { "0".to_string() } else { format!("{:+}", semitones) };
+                            if ui.add(egui::Button::new(format!("{} st", label)).small()).clicked() {
+                                state.pitch = semitones as f32;
+                                project.clips.set_pitch_at(idx, semitones as f32);
+                            }
+                        }
+                    });
                 });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("ℹ Speed editing requires clip re-render (coming soon).")
-                        .color(Color32::from_rgb(100, 100, 100))
-                        .small(),
-                );
-            });
+            let _ = speed_resp;
 
             ui.add_space(6.0);
 

@@ -19,7 +19,9 @@ pub fn query_active(
     let boundary = store.pts_in_slice().partition_point(|&x| x <= query_pts);
     for i in 0..boundary {
         if store.pts_out_at(i) > query_pts {
-            let source_pts = query_pts - store.pts_in_at(i) + store.source_in_at(i);
+            let offset = query_pts - store.pts_in_at(i);
+            let speed = store.speed_at(i) as f64;
+            let source_pts = (offset as f64 * speed).round() as i64 + store.source_in_at(i);
             out.push(ActiveClip { store_index: i, source_pts });
         }
     }

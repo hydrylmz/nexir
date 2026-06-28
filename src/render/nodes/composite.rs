@@ -30,6 +30,7 @@ pub struct CompositeNode {
     sampler:             wgpu::Sampler,
     device:              Arc<wgpu::Device>,
     queue:               Arc<wgpu::Queue>,
+    out_format:          wgpu::TextureFormat,
 }
 
 impl CompositeNode {
@@ -131,19 +132,25 @@ impl CompositeNode {
             sampler,
             device: Arc::clone(&device.device),
             queue: Arc::clone(&device.queue),
+            out_format: surface_format,
         }
     }
 
     pub fn upload_instances(&self, frame: &FrameState) -> u32 {
         let mut instances = Vec::with_capacity(frame.clips.len());
-        for entry in &frame.clips {
-            let m = entry.transform.to_matrix(entry.clip_width as f32, entry.clip_height as f32);
+        for (i, entry) in frame.clips.iter().enumerate() {
+            let m = entry.transform.to_matrix(
+                entry.clip_width as f32, 
+                entry.clip_height as f32,
+                frame.canvas_width as f32,
+                frame.canvas_height as f32
+            );
             instances.push(ClipInstance {
                 col0: [m[0], m[1], m[2], 0.0],
                 col1: [m[3], m[4], m[5], 0.0],
                 col2: [m[6], m[7], m[8], 0.0],
                 opacity: entry.opacity,
-                tex_index: entry.texture_slot,
+                tex_index: i as u32,
                 _pad: [0.0; 2],
             });
         }
@@ -164,7 +171,7 @@ impl RenderNode for CompositeNode {
         builder.creates.push((self.out_color, ResourceDescriptor {
             label: Some("FinalColor".into()),
             size: ResolutionSource::Canvas,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: self.out_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
         }));
         for &id in &self.input_textures {
@@ -232,6 +239,6 @@ impl RenderNode for CompositeNode {
 
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.draw(0..3, 0..count);
+        pass.draw(0..6, 0..count);
     }
 }

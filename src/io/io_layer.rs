@@ -14,13 +14,15 @@ use crate::timeline::source::SourceRegistry;
 
 pub struct IoLayer {
     pub device:  Arc<wgpu::Device>,
-    pool:        Arc<FrameSlotPool>,
+    pub pool:        Arc<FrameSlotPool>,
     pub cache:   Arc<FrameCache>,
-    source_reg:  Arc<std::sync::RwLock<SourceRegistry>>,
+    pub source_reg:  Arc<std::sync::RwLock<SourceRegistry>>,
     demuxers:    DashMap<SourceId, Arc<Mutex<Demuxer>>>,
     decoders:    DashMap<SourceId, Arc<Mutex<Decoder>>>,
     prefetch_tx: std::sync::mpsc::SyncSender<PrefetchRequest>,
     project_tb:  Rational,
+    /// Last successfully decoded pts per source (for sequential playback optimisation).
+    last_decoded_pts: DashMap<SourceId, i64>,
 }
 
 impl IoLayer {
@@ -41,6 +43,7 @@ impl IoLayer {
             decoders: DashMap::new(),
             prefetch_tx,
             project_tb,
+            last_decoded_pts: DashMap::new(),
         }
     }
 
@@ -48,7 +51,7 @@ impl IoLayer {
         &self,
         source_id: SourceId,
         pts:       i64,
-    ) -> Option<FrameSlotId> {
+    ) -> Option<(FrameSlotId, bool)> {
         if let Some(slot) = self.cache.touch(source_id, pts) {
             return Some(slot);
         }
@@ -66,47 +69,91 @@ impl IoLayer {
         &self,
         source_id: SourceId,
         pts:       i64,
-    ) -> Option<FrameSlotId> {
-        if let Some(slot) = self.cache.get(source_id, pts) {
+    ) -> Option<(FrameSlotId, bool)> {
+        if let Some(slot) = self.cache.touch(source_id, pts) {
             return Some(slot);
         }
 
         let required = self.source_reg.read().unwrap().frame_size_bytes(source_id).ok()?;
-        let slot = self.pool.acquire(required)?;
+        let mut slot = self.pool.acquire(required);
+        while slot.is_none() {
+            if !self.cache.evict_one() {
+                break;
+            }
+            slot = self.pool.acquire(required);
+        }
+        let slot = slot?;
 
         let demuxer_arc = self.get_or_open_demuxer(source_id)?;
         let decoder_arc = self.get_or_open_decoder(source_id, &demuxer_arc)?;
 
-        let actual_pts = {
-            let mut demuxer = demuxer_arc.lock().unwrap();
-            let stream_pts = demuxer.seek(pts, self.project_tb).ok()?;
-            let mut decoder = decoder_arc.lock().unwrap();
-            decoder.seek_to(&mut demuxer, stream_pts).ok()?
+        // Check if we can decode forward without seeking.
+        // Only seek if target is before last decoded position or too far ahead (>5s in 90kHz ticks).
+        let prev_pts = self.last_decoded_pts.get(&source_id).map(|v| *v).unwrap_or(i64::MIN);
+        // 5 seconds in project timebase (90000 ticks/second)
+        let five_seconds_pts = 5 * self.project_tb.den as i64;
+        let need_seek = prev_pts == i64::MIN || pts < prev_pts || (pts - prev_pts) > five_seconds_pts;
+
+        let target_stream_pts = {
+            if need_seek {
+                let mut demuxer = demuxer_arc.lock().unwrap();
+                let stream_pts = demuxer.seek(pts, self.project_tb).ok()?;
+                let mut decoder = decoder_arc.lock().unwrap();
+                decoder.seek_to(&mut demuxer, stream_pts).ok()?
+            } else {
+                // Sequential path: translate project PTS to stream PTS without seeking
+                let demux = demuxer_arc.lock().unwrap();
+                let stream_tb = demux.video_stream.as_ref()?.time_base;
+                drop(demux);
+                self.project_tb.rescale_pts(pts, stream_tb)
+            }
         };
 
-        {
+        let mut final_is_nv12 = false;
+        let mut decoded_anything = false;
+        let decoded_pts = {
             let mut dec = decoder_arc.lock().unwrap();
             let mut dem = demuxer_arc.lock().unwrap();
+            let mut found_pts = target_stream_pts;
 
             self.pool.with_buffer_mut(slot, |mapped| {
-                loop {
+                // Read forward up to 600 packets to find the target frame
+                for _ in 0..600 {
                     let pkt = match dem.next_video_packet().ok().flatten() {
                         Some(p) => p,
-                        None => break,
+                        None    => break,
                     };
-                    if let Some((frame_pts, _is_nv12, _w, _h)) = dec.decode_into(&pkt, mapped, None).ok().flatten() {
-                        if frame_pts >= actual_pts {
+                    let pkt_pts = pkt.pts;
+                    if let Some((frame_pts, is_nv12, _w, _h)) = dec.decode_into(&pkt, mapped, None).ok().flatten() {
+                        let eff_pts = if frame_pts == 0 { pkt_pts } else { frame_pts };
+                        if eff_pts >= target_stream_pts {
+                            found_pts = eff_pts;
+                            final_is_nv12 = is_nv12;
+                            decoded_anything = true;
                             break;
                         }
                     }
                 }
             });
-        } // mapped range dropped here
 
-        // GPU upload is handled in the YuvUploadNode during render graph execution.
-        // We just return the slot ID. The slot pool maps CPU memory.
-        self.cache.insert(source_id, pts, slot);
-        Some(slot)
+            found_pts
+        };
+
+        if !decoded_anything {
+            self.pool.release(slot);
+            if let Some(prev) = self.last_decoded_pts.get(&source_id).map(|v| *v) {
+                if let Some(cached) = self.cache.touch(source_id, prev) {
+                    return Some(cached);
+                }
+            }
+            return None;
+        }
+
+        // Update sequential tracking using requested pts
+        self.last_decoded_pts.insert(source_id, pts);
+
+        self.cache.insert(source_id, pts, slot, final_is_nv12);
+        Some((slot, final_is_nv12))
     }
 
     fn get_or_open_demuxer(

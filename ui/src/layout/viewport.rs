@@ -1,13 +1,31 @@
 use egui::{Ui, RichText, Color32, Vec2, Align2, Rect, pos2};
+use nexir::project::Project;
+use crate::layout::timeline::TimelineState;
 
 /// Draw the preview viewport, preserving the video's aspect ratio via letter-boxing / pillar-boxing.
 /// `video_width` / `video_height` are the actual decoded frame dimensions (0 = unknown).
-pub fn draw(ui: &mut Ui, preview_id: Option<egui::TextureId>, video_width: u32, video_height: u32) -> Vec2 {
+pub fn draw(
+    ui: &mut Ui,
+    preview_id: Option<egui::TextureId>,
+    video_width: u32,
+    video_height: u32,
+    state: &mut TimelineState,
+    project: &mut Project,
+) -> Vec2 {
+    // ── Live timecode ────────────────────────────────────────────────────
+    let fps = project.settings.frame_rate.num.max(1);
+    let f   = state.playhead_frame;
+    let ff  = f % fps;
+    let ss  = (f / fps) % 60;
+    let mm  = (f / (fps * 60)) % 60;
+    let hh  = f / (fps * 3600);
+    let timecode = format!("{:02}:{:02}:{:02}:{:02}", hh, mm, ss, ff);
+
     // Top: Player info / Timecode
     ui.horizontal(|ui| {
         ui.label(RichText::new("Player").color(Color32::WHITE));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new("00:00:00:00").monospace().color(Color32::LIGHT_GRAY));
+            ui.label(RichText::new(timecode).monospace().color(Color32::LIGHT_GRAY));
         });
     });
 
@@ -67,15 +85,32 @@ pub fn draw(ui: &mut Ui, preview_id: Option<egui::TextureId>, video_width: u32, 
 
     ui.add_space(8.0);
 
-    // Bottom: Playback controls
+    // ── Bottom: Playback controls ─────────────────────────────────────────
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_justify(true), |ui| {
             ui.horizontal(|ui| {
-                if ui.button("⏮").clicked() {}
-                if ui.button("⏪").clicked() {}
-                if ui.button("▶").clicked() {}
-                if ui.button("⏩").clicked() {}
-                if ui.button("⏭").clicked() {}
+                if ui.button("⏮").on_hover_text("Go to start").clicked() {
+                    state.playhead_frame = 0;
+                    state.playing = false;
+                }
+                if ui.button("⏪").on_hover_text("Step back").clicked() {
+                    state.playing = false;
+                    state.playhead_frame = (state.playhead_frame - 1).max(0);
+                }
+                let play_label = if state.playing { "⏸" } else { "▶" };
+                let play_hint  = if state.playing { "Pause" } else { "Play" };
+                if ui.button(play_label).on_hover_text(play_hint).clicked() {
+                    state.playing = !state.playing;
+                    state.last_tick = if state.playing { Some(std::time::Instant::now()) } else { None };
+                }
+                if ui.button("⏩").on_hover_text("Step forward").clicked() {
+                    state.playing = false;
+                    state.playhead_frame += 1;
+                }
+                if ui.button("⏭").on_hover_text("Go to end").clicked() {
+                    state.playing = false;
+                    state.playhead_frame = project.duration_frames();
+                }
             });
         });
     });

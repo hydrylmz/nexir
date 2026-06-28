@@ -14,6 +14,10 @@ pub struct ClipInsertParams {
     pub layer_order: u16,
     pub opacity:     f32,
     pub transform:   ClipTransform,
+    /// Playback speed multiplier (1.0 = normal).
+    pub speed:       f32,
+    /// Pitch shift in semitones (0.0 = no shift).
+    pub pitch:       f32,
 }
 
 pub fn insert_clip(
@@ -34,7 +38,9 @@ pub fn insert_clip(
     store.layer_order.insert(pos, params.layer_order);
     store.opacity.insert(pos, params.opacity);
     store.transform.insert(pos, params.transform);
-    store.effect_start.insert(pos, 0); 
+    store.speed.insert(pos, params.speed);
+    store.pitch.insert(pos, params.pitch);
+    store.effect_start.insert(pos, 0);
     store.effect_count.insert(pos, 0);
 
     let clip_id = ClipId(store.next_id);
@@ -65,7 +71,7 @@ pub fn insert_clip_overwrite(
 
     // Collect all clip IDs on the same track that overlap the new clip range.
     // We need to handle them after collecting to avoid borrowing issues.
-    let overlapping: Vec<(ClipId, i64, i64, i64, SourceId, TrackId, u16, f32, ClipTransform)> = {
+    let overlapping: Vec<(ClipId, i64, i64, i64, SourceId, TrackId, u16, f32, ClipTransform, f32, f32)> = {
         (0..store.len())
             .filter(|&i| {
                 store.track_ids[i] == track
@@ -82,11 +88,13 @@ pub fn insert_clip_overwrite(
                 store.layer_order[i],
                 store.opacity[i],
                 store.transform[i],
+                store.speed[i],
+                store.pitch[i],
             ))
             .collect()
     };
 
-    for (id, ex_in, ex_out, ex_src_in, ex_src_id, ex_track, ex_layer, ex_opacity, ex_transform) in overlapping {
+    for (id, ex_in, ex_out, ex_src_in, ex_src_id, ex_track, ex_layer, ex_opacity, ex_transform, ex_speed, ex_pitch) in overlapping {
         if ex_in >= new_in && ex_out <= new_out {
             // Fully covered — delete it.
             remove_clip(store, id)?;
@@ -106,6 +114,8 @@ pub fn insert_clip_overwrite(
                 layer_order: ex_layer,
                 opacity:     ex_opacity,
                 transform:   ex_transform,
+                speed:       ex_speed,
+                pitch:       ex_pitch,
             })?;
             // Tail
             insert_clip(store, ClipInsertParams {
@@ -117,6 +127,8 @@ pub fn insert_clip_overwrite(
                 layer_order: ex_layer,
                 opacity:     ex_opacity,
                 transform:   ex_transform,
+                speed:       ex_speed,
+                pitch:       ex_pitch,
             })?;
         } else if ex_in < new_in {
             // Existing clip starts before new clip — trim its tail to new_in.
@@ -130,6 +142,8 @@ pub fn insert_clip_overwrite(
                 layer_order: ex_layer,
                 opacity:     ex_opacity,
                 transform:   ex_transform,
+                speed:       ex_speed,
+                pitch:       ex_pitch,
             })?;
         } else {
             // Existing clip starts inside new clip — trim its head to new_out.
@@ -144,6 +158,8 @@ pub fn insert_clip_overwrite(
                 layer_order: ex_layer,
                 opacity:     ex_opacity,
                 transform:   ex_transform,
+                speed:       ex_speed,
+                pitch:       ex_pitch,
             })?;
         }
     }
@@ -167,6 +183,8 @@ pub fn remove_clip(
     store.layer_order.remove(idx);
     store.opacity.remove(idx);
     store.transform.remove(idx);
+    store.speed.remove(idx);
+    store.pitch.remove(idx);
     store.effect_start.remove(idx);
     store.effect_count.remove(idx);
 
@@ -192,6 +210,8 @@ pub fn move_clip(
         layer_order: store.layer_order[idx],
         opacity: store.opacity[idx],
         transform: store.transform[idx],
+        speed: store.speed[idx],
+        pitch: store.pitch[idx],
     };
 
     remove_clip(store, id)?;
@@ -225,6 +245,8 @@ pub fn trim_clip_in(
         layer_order: store.layer_order[idx],
         opacity: store.opacity[idx],
         transform: store.transform[idx],
+        speed: store.speed[idx],
+        pitch: store.pitch[idx],
     };
 
     remove_clip(store, id)?;

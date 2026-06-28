@@ -44,7 +44,7 @@ pub fn build_islands(
         let source_id  = store.source_id_at(idx);
         let pts_in     = store.pts_in_at(idx);
         let source_in  = store.source_in_at(idx);
-        let source_pts = query_pts - pts_in + source_in;
+        let source_pts = active.source_pts;
         let transform  = store.transform_at(idx).clone();
         let opacity    = store.opacity_at(idx);
         let layer      = store.layer_order_at(idx);

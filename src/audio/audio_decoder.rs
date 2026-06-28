@@ -53,6 +53,8 @@ impl AudioDecoder {
         project_tb: Rational,
         shutdown:   Arc<AtomicBool>,
         seek_request: Arc<Mutex<Option<(i64, i64)>>>,
+        speed:      f32,
+        pitch:      f32,
     ) -> Result<Self, AudioError> {
         let mut demuxer = Demuxer::open(path).map_err(AudioError::Demux)?;
         
@@ -62,7 +64,7 @@ impl AudioDecoder {
         let decoder = Decoder::open(&audio_stream, audio_stream.codecpar, false).map_err(AudioError::Decode)?;
 
         // Need FFI for codec parameters to set up SwrContext
-        let (in_ch_layout, in_sample_fmt, in_sample_rate) = unsafe {
+        let (in_ch_layout, in_sample_fmt, mut in_sample_rate) = unsafe {
             let ctx = decoder.ctx();
             let sr = crate::io::ffi::avcodec::avcodec_ctx_get_sample_rate(ctx);
             let mut cl = crate::io::ffi::avcodec::avcodec_ctx_get_channel_layout(ctx);
@@ -75,6 +77,11 @@ impl AudioDecoder {
             
             (cl as i64, fmt as i32, sr as i32)
         };
+
+        // Varispeed: adjusting sample rate stretches both speed and pitch
+        let pitch_factor = 2.0_f32.powf(pitch / 12.0);
+        let varispeed = speed * pitch_factor;
+        in_sample_rate = (in_sample_rate as f32 * varispeed).round() as i32;
 
         let swr = unsafe {
             swr_alloc_set_opts(

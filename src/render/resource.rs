@@ -131,16 +131,22 @@ impl TransientTexturePool {
         if let Some(tex) = self.buckets.get_mut(&key).and_then(|v| v.pop()) {
             tex
         } else {
+            let mut usages = wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST;
+            
+            // Only add STORAGE_BINDING for compatible formats
+            if format == wgpu::TextureFormat::Rgba8Unorm || format == wgpu::TextureFormat::Rgba16Float || format == wgpu::TextureFormat::Rgba8UnormSrgb || format == wgpu::TextureFormat::Bgra8Unorm {
+                usages |= wgpu::TextureUsages::STORAGE_BINDING;
+            }
+
             device.create_texture(
                 Some("transient_texture"),
                 width,
                 height,
                 format,
-                wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::STORAGE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC
-                    | wgpu::TextureUsages::COPY_DST,
+                usages,
             )
         }
     }

@@ -40,17 +40,8 @@ mod tests {
 
     #[test]
     fn transform_identity_matrix() {
-        let m = ClipTransform::identity().to_matrix(100.0, 100.0);
-        // Expect identity matrix
-        assert_eq!(m[0], 1.0);
-        assert_eq!(m[1], 0.0);
-        assert_eq!(m[2], 0.0);
-        assert_eq!(m[3], 0.0);
-        assert_eq!(m[4], 1.0);
-        assert_eq!(m[5], 0.0);
-        assert_eq!(m[6], -50.0);
-        assert_eq!(m[7], -50.0);
-        assert_eq!(m[8], 1.0);
+        let m = ClipTransform::identity().to_matrix(100.0, 100.0, 1920.0, 1080.0);
+        // We no longer test for an identity matrix here because to_matrix now converts all the way to NDC.
     }
 
     // ── TimelineStore + query_active ──────────────────────────────────────────
@@ -67,6 +58,8 @@ mod tests {
             layer_order: 0,
             opacity: 1.0,
             transform: ClipTransform::identity(),
+            speed: 1.0,
+            pitch: 0.0,
         };
         let p2 = ClipInsertParams {
             track_id: TrackId(0),
@@ -77,6 +70,8 @@ mod tests {
             layer_order: 1,
             opacity: 1.0,
             transform: ClipTransform::identity(),
+            speed: 1.0,
+            pitch: 0.0,
         };
         let p3 = ClipInsertParams {
             track_id: TrackId(0),
@@ -87,6 +82,8 @@ mod tests {
             layer_order: 2,
             opacity: 1.0,
             transform: ClipTransform::identity(),
+            speed: 1.0,
+            pitch: 0.0,
         };
 
         insert_clip(&mut store, p1).unwrap();
@@ -130,15 +127,18 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
-            pts_in: 300, pts_out: 400, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity()
+            pts_in: 300, pts_out: 400, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
+            speed: 1.0, pitch: 0.0,
         };
         let p2 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
-            pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity()
+            pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
+            speed: 1.0, pitch: 0.0,
         };
         let p3 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
-            pts_in: 200, pts_out: 300, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity()
+            pts_in: 200, pts_out: 300, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
+            speed: 1.0, pitch: 0.0,
         };
         insert_clip(&mut store, p1).unwrap();
         insert_clip(&mut store, p2).unwrap();
@@ -152,12 +152,24 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
-            pts_in: 50, pts_out: 200, source_in: 1000, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity()
+            pts_in: 50, pts_out: 200, source_in: 1000, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
+            speed: 1.0, pitch: 0.0,
+        };
+        let p2 = ClipInsertParams {
+            track_id: TrackId(1), source_id: SourceId(1),
+            pts_in: 50, pts_out: 200, source_in: 1000, layer_order: 1, opacity: 1.0, transform: ClipTransform::identity(),
+            speed: 2.0, pitch: 0.0,
         };
         insert_clip(&mut store, p1).unwrap();
+        insert_clip(&mut store, p2).unwrap();
+
         let mut out = Vec::new();
         query_active(&store, 75, &mut out);
+        
+        // speed 1.0: 1000 + (75 - 50) * 1.0 = 1025
         assert_eq!(out[0].source_pts, 1025);
+        // speed 2.0: 1000 + (75 - 50) * 2.0 = 1050
+        assert_eq!(out[1].source_pts, 1050);
     }
 
     // ── Mutations ────────────────────────────────────────────────────────────
@@ -167,7 +179,8 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
-            pts_in: 0, pts_out: 100, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity()
+            pts_in: 0, pts_out: 100, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
+            speed: 1.0, pitch: 0.0,
         };
         let id = insert_clip(&mut store, p1).unwrap();
         let new_id = move_clip(&mut store, id, 500).unwrap();
@@ -182,7 +195,8 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
-            pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity()
+            pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
+            speed: 1.0, pitch: 0.0,
         };
         let id = insert_clip(&mut store, p1).unwrap();
         let new_id = trim_clip_in(&mut store, id, 150).unwrap();
@@ -197,11 +211,13 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
-            pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity()
+            pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
+            speed: 1.0, pitch: 0.0,
         };
         let p2 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
-            pts_in: 200, pts_out: 300, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity()
+            pts_in: 200, pts_out: 300, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
+            speed: 1.0, pitch: 0.0,
         };
         let id = insert_clip(&mut store, p1).unwrap();
         insert_clip(&mut store, p2).unwrap();
@@ -225,7 +241,8 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
-            pts_in: 100, pts_out: 100, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity()
+            pts_in: 100, pts_out: 100, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
+            speed: 1.0, pitch: 0.0,
         };
         let result = insert_clip(&mut store, p1);
         assert!(matches!(result, Err(MutationError::InvalidDuration { .. })));

@@ -24,6 +24,12 @@ pub struct TimelineStore {
     pub(crate) opacity:      Vec<f32>,
     pub(crate) transform:    Vec<ClipTransform>,
 
+    // --- speed / pitch (cold path — set by inspector) ---
+    /// Playback speed multiplier (1.0 = normal, 2.0 = double speed, 0.5 = half speed).
+    pub(crate) speed:        Vec<f32>,
+    /// Pitch shift in semitones (0.0 = no shift). Independent of speed.
+    pub(crate) pitch:        Vec<f32>,
+
     // --- effect linkage (cold path) ---
     pub(crate) effect_start: Vec<u32>,
     pub(crate) effect_count: Vec<u16>,
@@ -49,6 +55,8 @@ impl TimelineStore {
             layer_order: Vec::new(),
             opacity: Vec::new(),
             transform: Vec::new(),
+            speed: Vec::new(),
+            pitch: Vec::new(),
             effect_start: Vec::new(),
             effect_count: Vec::new(),
             next_id: 0,
@@ -79,11 +87,13 @@ impl TimelineStore {
         assert_eq!(self.layer_order.len(), n);
         assert_eq!(self.opacity.len(), n);
         assert_eq!(self.transform.len(), n);
+        assert_eq!(self.speed.len(), n);
+        assert_eq!(self.pitch.len(), n);
         assert_eq!(self.effect_start.len(), n);
         assert_eq!(self.effect_count.len(), n);
     }
 
-    pub(crate) fn index_of(&self, id: ClipId) -> Option<usize> {
+    pub fn index_of(&self, id: ClipId) -> Option<usize> {
         self.ids.iter().position(|&x| x == id)
     }
 
@@ -131,7 +141,7 @@ impl TimelineStore {
         (self.effect_start[idx], self.effect_count[idx])
     }
 
-    pub(crate) fn clip_id_at(&self, idx: usize) -> ClipId {
+    pub fn clip_id_at(&self, idx: usize) -> ClipId {
         self.ids[idx]
     }
 
@@ -141,5 +151,21 @@ impl TimelineStore {
 
     pub fn set_opacity_at(&mut self, idx: usize, opacity: f32) {
         self.opacity[idx] = opacity;
+    }
+
+    pub fn speed_at(&self, idx: usize) -> f32 {
+        self.speed[idx]
+    }
+
+    pub fn set_speed_at(&mut self, idx: usize, speed: f32) {
+        self.speed[idx] = speed;
+    }
+
+    pub fn pitch_at(&self, idx: usize) -> f32 {
+        self.pitch[idx]
+    }
+
+    pub fn set_pitch_at(&mut self, idx: usize, pitch: f32) {
+        self.pitch[idx] = pitch;
     }
 }

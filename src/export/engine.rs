@@ -11,11 +11,15 @@ use crate::render::device::GpuDevice;
 use crate::render::graph::{CompiledGraph, RenderNode};
 use crate::scheduler::frame_scheduler::FrameScheduler;
 use crate::io::ffi::avutil::AVRational;
+use crate::timeline::store::TimelineStore;
+use crate::timeline::source::SourceRegistry;
 
 pub struct ExportEngine {
     device:     Arc<GpuDevice>,
     job:        Arc<ExportJob>,
     scheduler:  Arc<FrameScheduler>,
+    timeline:   Arc<std::sync::RwLock<TimelineStore>>,
+    sources:    Arc<std::sync::RwLock<SourceRegistry>>,
 }
 
 impl ExportEngine {
@@ -23,8 +27,10 @@ impl ExportEngine {
         device:    Arc<GpuDevice>,
         job:       ExportJob,
         scheduler: Arc<FrameScheduler>,
+        timeline:  Arc<std::sync::RwLock<TimelineStore>>,
+        sources:   Arc<std::sync::RwLock<SourceRegistry>>,
     ) -> Self {
-        Self { device, job: Arc::new(job), scheduler }
+        Self { device, job: Arc::new(job), scheduler, timeline, sources }
     }
 
     pub fn start(
@@ -47,6 +53,8 @@ impl ExportEngine {
             .map_err(ExportError::MuxerOpen)?);
 
         let queue = Arc::new(EncoderQueue::new());
+        let timeline_clone = Arc::clone(&self.timeline);
+        let sources_clone = Arc::clone(&self.sources);
         let segments = SegmentPartitioner::partition(&self.job);
 
         let job_clone     = Arc::clone(&self.job);
@@ -71,7 +79,8 @@ impl ExportEngine {
         std::thread::Builder::new().name("ve-export-dispatch".into()).spawn(move || {
             let mut renderer = ExportRenderer::new(
                 Arc::clone(&device_clone), graph, nodes,
-                Arc::clone(&scheduler_clone), rtt_id, Arc::clone(&job_clone)
+                Arc::clone(&scheduler_clone), rtt_id, Arc::clone(&job_clone),
+                Arc::clone(&timeline_clone), Arc::clone(&sources_clone)
             ).unwrap();
 
             for seg in &segments {

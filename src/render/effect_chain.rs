@@ -13,7 +13,7 @@ use crate::timeline::effect::{EffectKind, EffectStore};
 use crate::timeline::transform::EffectParams;
 
 pub struct EffectChainBuilder<'a> {
-    device:         Arc<GpuDevice>,
+    device:         &'a GpuDevice,
     shaders:        &'a ShaderRegistry,
     pipeline_cache: &'a ComputePipelineCache,
     canvas_width:   u32,
@@ -22,7 +22,7 @@ pub struct EffectChainBuilder<'a> {
 
 impl<'a> EffectChainBuilder<'a> {
     pub fn new(
-        device:         Arc<GpuDevice>,
+        device:         &'a GpuDevice,
         shaders:        &'a ShaderRegistry,
         pipeline_cache: &'a ComputePipelineCache,
         canvas_width:   u32,

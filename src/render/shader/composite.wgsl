@@ -22,22 +22,21 @@ fn vs_main(
     @builtin(instance_index) iid:  u32,
 ) -> VOut {
     var out: VOut;
-    // Generate full-screen triangle
-    var x = -1.0;
-    var y = -1.0;
-    var u = 0.0;
-    var v = 1.0;
+    // Generate quad using 6 vertices
+    var uvs = array<vec2<f32>, 6>(
+        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
+        vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0)
+    );
+    let uv = uvs[vid];
 
-    if (vid == 1u) {
-        x = 3.0;
-        u = 2.0;
-    } else if (vid == 2u) {
-        y = 3.0;
-        v = -1.0;
-    }
+    // transform is a 3x3 matrix in the first 3 columns/rows of mat3x4.
+    // We treat local_pos as vec3(u, v, 1.0).
+    // result is vec4. x,y are ndc, z is 0.0, w is 1.0 (from our construction).
+    let local_pos = vec3<f32>(uv.x, uv.y, 1.0);
+    let ndc_pos = instances[iid].transform * local_pos;
 
-    out.pos = vec4(x, y, 0.0, 1.0);
-    out.uv = vec2(u, v);
+    out.pos = vec4(ndc_pos.x, ndc_pos.y, 0.0, 1.0);
+    out.uv = uv;
     out.opacity = instances[iid].opacity;
     out.tex_index = instances[iid].tex_index;
     return out;

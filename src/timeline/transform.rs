@@ -9,7 +9,7 @@ use bytemuck::{Pod, Zeroable};
 #[repr(C)]
 pub struct ClipTransform {
     /// Canvas-space translation of the anchor point, in pixels.
-    /// (0,0) = top-left of canvas.
+    /// (0,0) = centre of canvas.
     pub position: [f32; 2],
 
     /// Scale multipliers. (1.0, 1.0) = original size.
@@ -59,10 +59,11 @@ impl ClipTransform {
         (self.anchor[1] - id.anchor[1]).abs() < f32::EPSILON
     }
 
-    /// Decompose into the 3×3 column-major affine matrix that the GPU vertex shader expects.
-    /// The full transform is: T * R * S (scale first, then rotate, then translate).
-    pub fn to_matrix(&self, clip_w: f32, clip_h: f32) -> [f32; 9] { 
-        let (sin_r, cos_r) = self.rotation.sin_cos();
+    /// Decompose into the 3x3 column-major affine matrix that the GPU vertex shader expects.
+    /// The matrix maps from clip UV coordinates [0..1] to NDC coordinates [-1..1].
+    pub fn to_matrix(&self, clip_w: f32, clip_h: f32, canvas_w: f32, canvas_h: f32) -> [f32; 9] { 
+        // Negate rotation to make positive values rotate counter-clockwise (since Y is down)
+        let (sin_r, cos_r) = (-self.rotation).sin_cos();
 
         // Scale factors
         let sx = self.scale[0];
@@ -72,31 +73,28 @@ impl ClipTransform {
         let ax = self.anchor[0] * clip_w;
         let ay = self.anchor[1] * clip_h;
 
-        // Translation components
-        let tx = self.position[0];
-        let ty = self.position[1];
+        // Translation in canvas pixels (0,0 is center of canvas)
+        let tx = self.position[0] + canvas_w * 0.5;
+        let ty = self.position[1] + canvas_h * 0.5;
 
-        // Combined 2D affine transformation elements (M = T * R * S * pre_T)
-        // Column 0
-        let m00 = cos_r * sx;
-        let m10 = sin_r * sx;
-        let m20 = 0.0;
+        // Matrix mapping UV [0..1] to canvas pixels
+        let m00 = sx * cos_r * clip_w;
+        let m10 = sx * sin_r * clip_w;
+        
+        let m01 = -sy * sin_r * clip_h;
+        let m11 =  sy * cos_r * clip_h;
+        
+        let m02 = tx - (ax * sx * cos_r - ay * sy * sin_r);
+        let m12 = ty - (ax * sx * sin_r + ay * sy * cos_r);
 
-        // Column 1
-        let m01 = -sin_r * sy;
-        let m11 = cos_r * sy;
-        let m21 = 0.0;
+        // Convert canvas pixels to NDC
+        let to_ndc_x = 2.0 / canvas_w;
+        let to_ndc_y = -2.0 / canvas_h;
 
-        // Column 2 (Translation column, accounts for the pre-translation anchor shift)
-        let m02 = tx - (ax * m00 + ay * m01);
-        let m12 = ty - (ax * m10 + ay * m11);
-        let m22 = 1.0;
-
-        // Return in column-major order as expected by WGSL mat3x3
         [
-            m00, m10, m20, // Column 0
-            m01, m11, m21, // Column 1
-            m02, m12, m22, // Column 2
+            m00 * to_ndc_x,       m10 * to_ndc_y,       0.0,
+            m01 * to_ndc_x,       m11 * to_ndc_y,       0.0,
+            m02 * to_ndc_x - 1.0, m12 * to_ndc_y + 1.0, 1.0,
         ]
     }
     

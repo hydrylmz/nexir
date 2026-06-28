@@ -4,6 +4,8 @@ use crate::render::graph::{CompiledGraph, RenderNode};
 use crate::render::resource::ResourceId;
 use crate::scheduler::frame_scheduler::FrameScheduler;
 use crate::export::job::ExportJob;
+use crate::timeline::store::TimelineStore;
+use crate::timeline::source::SourceRegistry;
 use crate::export::partitioner::ExportSegment;
 use crate::export::readback::FrameReadback;
 use crate::export::queue::{EncoderQueue, QueueItem};
@@ -18,6 +20,8 @@ pub struct ExportRenderer {
     readback:  FrameReadback,
     rtt_id:    ResourceId,
     job:       Arc<ExportJob>,
+    timeline:  Arc<std::sync::RwLock<TimelineStore>>,
+    sources:   Arc<std::sync::RwLock<SourceRegistry>>,
 }
 
 impl ExportRenderer {
@@ -28,6 +32,8 @@ impl ExportRenderer {
         scheduler: Arc<FrameScheduler>,
         rtt_id:    ResourceId,
         job:       Arc<ExportJob>,
+        timeline:  Arc<std::sync::RwLock<TimelineStore>>,
+        sources:   Arc<std::sync::RwLock<SourceRegistry>>,
     ) -> Result<Self, RenderError> {
         let readback = FrameReadback::new(&device, job.width, job.height)
             .map_err(RenderError::ReadbackInit)?;
@@ -40,6 +46,8 @@ impl ExportRenderer {
             readback,
             rtt_id,
             job,
+            timeline,
+            sources,
         })
     }
 
@@ -55,7 +63,11 @@ impl ExportRenderer {
         for frame_idx in segment.frame_start..=segment.frame_end {
             if frame_idx < segment.frame_end {
                 let pts = self.job.frame_pts(frame_idx);
-                let frame_state = self.scheduler.schedule_frame(pts);
+                let frame_state = self.scheduler.schedule_frame(
+                    pts,
+                    &self.timeline.read().unwrap(),
+                    &self.sources.read().unwrap()
+                );
                 
                 let mut encoder = self.device.begin_frame();
                 

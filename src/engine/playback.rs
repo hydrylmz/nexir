@@ -13,12 +13,16 @@ use crate::sync::presentation::{PresentationDecider, PresentAction};
 #[cfg(any(test, debug_assertions))]
 use crate::sync::sync_probe::SyncProbe;
 use crate::timeline::rational::Rational;
+use crate::timeline::store::TimelineStore;
+use crate::timeline::source::SourceRegistry;
 
 pub struct PlaybackEngine {
     device:      Arc<GpuDevice>,
     surface:     wgpu::Surface<'static>,
     graph:       CompiledGraph,
     scheduler:   Arc<FrameScheduler>,
+    timeline:    Arc<std::sync::RwLock<TimelineStore>>,
+    sources:     Arc<std::sync::RwLock<SourceRegistry>>,
     clock:       Arc<MasterClock>,
     decider:     PresentationDecider,
     corrector:   DriftCorrector,
@@ -37,6 +41,8 @@ impl PlaybackEngine {
         surface:      wgpu::Surface<'static>,
         graph:        CompiledGraph,
         scheduler:    Arc<FrameScheduler>,
+        timeline:     Arc<std::sync::RwLock<TimelineStore>>,
+        sources:      Arc<std::sync::RwLock<SourceRegistry>>,
         ring:         Arc<AudioRingBuffer>,
         project_tb:   Rational,
         frame_rate:   Rational,
@@ -60,6 +66,8 @@ impl PlaybackEngine {
             surface,
             graph,
             scheduler,
+            timeline,
+            sources,
             clock,
             decider,
             corrector,
@@ -83,7 +91,11 @@ impl PlaybackEngine {
             match action {
                 PresentAction::Drop => {
                     // Schedule a frame to keep cache warm, but do NOT render or present
-                    let _frame_state = self.scheduler.schedule_frame(next_pts);
+                    let _frame_state = self.scheduler.schedule_frame(
+                        next_pts,
+                        &self.timeline.read().unwrap(),
+                        &self.sources.read().unwrap()
+                    );
                     continue;
                 }
                 PresentAction::Hold => {
@@ -99,7 +111,11 @@ impl PlaybackEngine {
                     continue;
                 }
                 PresentAction::Present => {
-                    let frame_state = self.scheduler.schedule_frame(next_pts);
+                    let frame_state = self.scheduler.schedule_frame(
+                        next_pts,
+                        &self.timeline.read().unwrap(),
+                        &self.sources.read().unwrap()
+                    );
 
                     let output = match self.surface.get_current_texture() {
                         Ok(o) => o,

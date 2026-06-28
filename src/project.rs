@@ -118,6 +118,45 @@ impl Project {
         insert_clip_overwrite(&mut self.clips, params)
     }
 
+    /// Move a clip to a new start position (keeping its duration and source-in).
+    /// Returns the new ClipId (the clip is removed and re-inserted, so the id changes).
+    pub fn move_clip(&mut self, id: ClipId, new_pts_in: i64) -> Result<ClipId, MutationError> {
+        use crate::timeline::mutation::move_clip;
+        move_clip(&mut self.clips, id, new_pts_in)
+    }
+
+    /// Move a clip to a different track AND new start position.
+    pub fn move_clip_to_track(
+        &mut self,
+        id:         ClipId,
+        new_track:  TrackId,
+        new_pts_in: i64,
+    ) -> Result<ClipId, MutationError> {
+        use crate::timeline::mutation::{remove_clip, insert_clip};
+        let idx = self.clips.index_of(id).ok_or(crate::timeline::mutation::MutationError::ClipNotFound(id))?;
+        let duration   = self.clips.pts_out_at(idx) - self.clips.pts_in_at(idx);
+        let source_id  = self.clips.source_id_at(idx);
+        let source_in  = self.clips.source_in_at(idx);
+        let layer      = self.clips.layer_order_at(idx);
+        let opacity    = self.clips.opacity_at(idx);
+        let transform  = *self.clips.transform_at(idx);
+        let speed      = self.clips.speed_at(idx);
+        let pitch      = self.clips.pitch_at(idx);
+        remove_clip(&mut self.clips, id)?;
+        insert_clip(&mut self.clips, ClipInsertParams {
+            track_id:    new_track,
+            source_id,
+            pts_in:      new_pts_in,
+            pts_out:     new_pts_in + duration,
+            source_in,
+            layer_order: layer,
+            opacity,
+            transform,
+            speed,
+            pitch,
+        })
+    }
+
     // ─────────────────────────────────────────────
     // Time helpers
     // ─────────────────────────────────────────────
