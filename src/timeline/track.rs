@@ -82,6 +82,10 @@ impl TrackList {
         self.tracks.iter().find(|t| t.id == id)
     }
 
+    pub fn index_of(&self, id: TrackId) -> Option<usize> {
+        self.tracks.iter().position(|t| t.id == id)
+    }
+
     /// Mutable lookup.
     pub fn get_mut(&mut self, id: TrackId) -> Option<&mut Track> {
         self.tracks.iter_mut().find(|t| t.id == id)

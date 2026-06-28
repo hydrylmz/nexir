@@ -108,12 +108,14 @@ impl Project {
     // ─────────────────────────────────────────────
 
     /// Insert a clip. `pts_in` and `pts_out` are in project timebase ticks.
-    pub fn insert_clip(&mut self, params: ClipInsertParams) -> Result<ClipId, MutationError> {
+    pub fn insert_clip(&mut self, mut params: ClipInsertParams) -> Result<ClipId, MutationError> {
+        params.layer_order = self.tracks.index_of(params.track_id).unwrap_or(0) as u16;
         insert_clip(&mut self.clips, params)
     }
 
     /// Insert a clip using overwrite mode (trims/removes any overlapping clips on the same track).
-    pub fn insert_clip_overwrite(&mut self, params: ClipInsertParams) -> Result<ClipId, MutationError> {
+    pub fn insert_clip_overwrite(&mut self, mut params: ClipInsertParams) -> Result<ClipId, MutationError> {
+        params.layer_order = self.tracks.index_of(params.track_id).unwrap_or(0) as u16;
         use crate::timeline::mutation::insert_clip_overwrite;
         insert_clip_overwrite(&mut self.clips, params)
     }
@@ -137,7 +139,7 @@ impl Project {
         let duration   = self.clips.pts_out_at(idx) - self.clips.pts_in_at(idx);
         let source_id  = self.clips.source_id_at(idx);
         let source_in  = self.clips.source_in_at(idx);
-        let layer      = self.clips.layer_order_at(idx);
+        let layer      = self.tracks.index_of(new_track).unwrap_or(0) as u16;
         let opacity    = self.clips.opacity_at(idx);
         let transform  = *self.clips.transform_at(idx);
         let speed      = self.clips.speed_at(idx);
