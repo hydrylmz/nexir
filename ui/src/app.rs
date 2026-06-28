@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use crate::layout::inspector::InspectorState;
 use crate::layout::media_pool::MediaPoolState;
 use crate::layout::timeline::TimelineState;
+use crate::history::HistoryState;
 use nexir::audio::audio_decoder::AudioDecoder;
 use nexir::audio::output_stream::AudioOutputStream;
 use nexir::audio::ring_buffer::AudioRingBuffer;
@@ -48,6 +49,7 @@ pub struct NexirApp {
     pub inspector:    InspectorState,
     pub media_pool:   MediaPoolState,
     pub timeline:     TimelineState,
+    pub history:      HistoryState,
     pub project:      Project,
     pub shaders:      ShaderRegistry,
     pub compute_cache: ComputePipelineCache,
@@ -69,6 +71,9 @@ pub struct NexirApp {
     audio_shutdown:    Arc<AtomicBool>,
     audio_seek:        Arc<Mutex<Option<(i64, i64)>>>,
     audio_path:        Option<std::path::PathBuf>,  // currently playing audio file
+    audio_volume:      f32,
+    audio_pan:         f32,
+    audio_muted:       bool,
     audio_speed:       f32,
     audio_pitch:       f32,
     audio_was_playing: bool,
@@ -190,6 +195,7 @@ impl NexirApp {
             inspector: InspectorState::default(),
             media_pool: MediaPoolState::default(),
             timeline: TimelineState::default(),
+            history: HistoryState::default(),
             project,
             shaders,
             compute_cache,
@@ -205,6 +211,9 @@ impl NexirApp {
             audio_shutdown,
             audio_seek,
             audio_path: None,
+            audio_volume: 1.0,
+            audio_pan: 0.0,
+            audio_muted: false,
             audio_speed: 1.0,
             audio_pitch: 0.0,
             audio_was_playing: false,
@@ -220,15 +229,45 @@ impl NexirApp {
         let raw_input = self.egui_state.take_egui_input(window);
         self.egui_ctx.begin_frame(raw_input);
 
+        let (undo_pressed, redo_pressed) = self.egui_ctx.input(|i| {
+            let cmd = i.modifiers.command || i.modifiers.ctrl;
+            (
+                cmd && i.key_pressed(egui::Key::Z) && !i.modifiers.shift,
+                (cmd && i.key_pressed(egui::Key::Y)) || (cmd && i.modifiers.shift && i.key_pressed(egui::Key::Z)),
+            )
+        });
+        if undo_pressed && self.history.undo(&mut self.project) {
+            self.timeline.clear_interaction();
+            self.timeline.selected_clip = None;
+        } else if redo_pressed && self.history.redo(&mut self.project) {
+            self.timeline.clear_interaction();
+            self.timeline.selected_clip = None;
+        }
+
         egui::TopBottomPanel::top("top_bar").show(&self.egui_ctx, |ui| {
-            crate::layout::top_bar::draw(ui);
+            if let Some(action) = crate::layout::top_bar::draw(ui, self.history.can_undo(), self.history.can_redo()) {
+                match action {
+                    crate::layout::top_bar::TopBarAction::Undo => {
+                        if self.history.undo(&mut self.project) {
+                            self.timeline.clear_interaction();
+                            self.timeline.selected_clip = None;
+                        }
+                    }
+                    crate::layout::top_bar::TopBarAction::Redo => {
+                        if self.history.redo(&mut self.project) {
+                            self.timeline.clear_interaction();
+                            self.timeline.selected_clip = None;
+                        }
+                    }
+                }
+            }
         });
 
         egui::TopBottomPanel::bottom("timeline")
             .resizable(true)
             .default_height(300.0)
             .show(&self.egui_ctx, |ui| {
-                crate::layout::timeline::draw(ui, &mut self.project, &mut self.timeline, &mut self.media_pool.dragging_item);
+                crate::layout::timeline::draw(ui, &mut self.project, &mut self.timeline, &mut self.media_pool.dragging_item, &mut self.history);
             });
 
         egui::SidePanel::left("media_pool")
@@ -283,6 +322,7 @@ impl NexirApp {
                     &mut self.inspector,
                     &mut self.project,
                     self.timeline.selected_clip,
+                    &mut self.history,
                 );
             });
 
@@ -301,6 +341,7 @@ impl NexirApp {
                 &mut self.timeline,
                 &mut self.project,
                 &active_clips,
+                &mut self.history,
             );
         });
 
@@ -382,6 +423,9 @@ impl NexirApp {
             if let Some(ref clip) = top_audio_clip {
                 let source_id = self.project.clips.source_id_at(clip.store_index);
                 let source_pts = clip.source_pts;
+                let volume = self.project.clips.volume_at(clip.store_index);
+                let pan = self.project.clips.pan_at(clip.store_index);
+                let audio_muted = self.project.clips.audio_muted_at(clip.store_index);
                 let speed = self.project.clips.speed_at(clip.store_index);
                 let pitch = self.project.clips.pitch_at(clip.store_index);
                 let path = {
@@ -390,8 +434,13 @@ impl NexirApp {
                 };
 
                 if let Some(path) = path {
-                    // Check if we need to switch to a new audio file or if speed/pitch changed
-                    let need_new_decoder = self.audio_path.as_ref() != Some(&path) || self.audio_speed != speed || self.audio_pitch != pitch;
+                    // Check if we need to switch to a new audio file or if audio properties changed.
+                    let need_new_decoder = self.audio_path.as_ref() != Some(&path)
+                        || self.audio_volume != volume
+                        || self.audio_pan != pan
+                        || self.audio_muted != audio_muted
+                        || self.audio_speed != speed
+                        || self.audio_pitch != pitch;
                     if need_new_decoder {
                         // Stop current decoder if running
                         self.audio_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -419,6 +468,9 @@ impl NexirApp {
                         });
                         
                         self.audio_path = Some(path);
+                        self.audio_volume = volume;
+                        self.audio_pan = pan;
+                        self.audio_muted = audio_muted;
                         self.audio_speed = speed;
                         self.audio_pitch = pitch;
                         force_seek = true; // force a seek when opening a new file
