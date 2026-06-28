@@ -6,6 +6,20 @@ use nexir::timeline::mutation::{ClipInsertParams, remove_clip};
 use nexir::timeline::transform::ClipTransform;
 use crate::layout::media_pool::MediaEntry;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ResizeEdge {
+    Left,
+    Right,
+}
+
+struct ClipResize {
+    clip_id: ClipId,
+    orig_idx: usize,
+    edge: ResizeEdge,
+    orig_pts_in: i64,
+    orig_pts_out: i64,
+}
+
 /// State for an in-progress clip drag.
 struct ClipDrag {
     /// Stable clip id being dragged.
@@ -18,6 +32,14 @@ struct ClipDrag {
     orig_track: TrackId,
 }
 
+#[derive(Clone, Copy)]
+pub struct ViewportResize {
+    pub clip_id: ClipId,
+    pub handle_index: usize,
+    pub start_pointer: egui::Pos2,
+    pub start_transform: ClipTransform,
+}
+
 /// Timeline UI state owned by `NexirApp`.
 pub struct TimelineState {
     pub playhead_frame: i64,
@@ -25,10 +47,12 @@ pub struct TimelineState {
     pub zoom: f32, // pixels per frame
     pub playing: bool,
     pub last_tick: Option<std::time::Instant>,
-    /// Store index of the currently selected clip, if any.
     pub selected_clip: Option<usize>,
     /// Active clip drag state.
     drag: Option<ClipDrag>,
+    /// Active clip resize state.
+    resize: Option<ClipResize>,
+    viewport_resize: Option<ViewportResize>,
 }
 
 impl Default for TimelineState {
@@ -41,7 +65,38 @@ impl Default for TimelineState {
             last_tick: None,
             selected_clip: None,
             drag: None,
+            resize: None,
+            viewport_resize: None,
         }
+    }
+}
+
+impl TimelineState {
+    pub fn is_interacting_with_clip(&self) -> bool {
+        self.drag.is_some() || self.resize.is_some() || self.viewport_resize.is_some()
+    }
+
+    pub fn start_viewport_resize(
+        &mut self,
+        clip_id: ClipId,
+        handle_index: usize,
+        start_pointer: egui::Pos2,
+        start_transform: ClipTransform,
+    ) {
+        self.viewport_resize = Some(ViewportResize {
+            clip_id,
+            handle_index,
+            start_pointer,
+            start_transform,
+        });
+    }
+
+    pub fn viewport_resize(&self) -> Option<ViewportResize> {
+        self.viewport_resize
+    }
+
+    pub fn finish_viewport_resize(&mut self) {
+        self.viewport_resize = None;
     }
 }
 
@@ -127,7 +182,7 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(
-                egui::Slider::new(&mut state.zoom, 2.0..=40.0)
+                egui::Slider::new(&mut state.zoom, 0.1..=500.0)
                     .text("Zoom")
                     .clamp_to_range(true),
             );
@@ -149,6 +204,13 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
     let mut track_lane_rects: Vec<(TrackId, Rect)> = Vec::new();
 
     // ── Pending moves/drops applied after the draw loop ──────────────────
+    struct PendingClipResize {
+        clip_id: ClipId,
+        edge: ResizeEdge,
+        new_pts: i64,
+    }
+    let mut pending_clip_resize: Option<PendingClipResize> = None;
+
     struct PendingClipMove {
         clip_id:   ClipId,
         new_track: TrackId,
@@ -171,6 +233,14 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
     }
     let mut pending_track_mutations: Vec<TrackMutation> = Vec::new();
 
+    // ── Pending clip mutations (from context menu) ──────────────────────────
+    enum ClipAction {
+        Delete(ClipId),
+        Duplicate(ClipId),
+        SplitAtPlayhead(ClipId),
+    }
+    let mut pending_clip_actions: Vec<ClipAction> = Vec::new();
+
     // ── Is a clip currently being dragged? ───────────────────────────────
     let pointer_released = ui.input(|i| i.pointer.any_released());
     let pointer_pos      = ui.ctx().pointer_hover_pos();
@@ -183,6 +253,27 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
                 "mp3" | "wav" | "aac" | "ogg" | "flac" | "m4a" | "opus" | "wma"))
             .unwrap_or(false)
     };
+
+    // ── Timeline Zooming ─────────────────────────────────────────────────
+    let pointer_in_timeline = ui.rect_contains_pointer(ui.max_rect());
+    if pointer_in_timeline {
+        let zoom_factor = ui.input(|i| {
+            let mut factor = i.zoom_delta();
+            let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            if ctrl {
+                if i.raw_scroll_delta.y > 0.0 {
+                    factor *= 1.2;
+                } else if i.raw_scroll_delta.y < 0.0 {
+                    factor *= 0.8333;
+                }
+            }
+            factor
+        });
+        
+        if zoom_factor != 1.0 {
+            state.zoom = (state.zoom * zoom_factor).clamp(0.1, 500.0);
+        }
+    }
 
     // ── Ruler + lanes canvas ─────────────────────────────────────────────
     egui::ScrollArea::horizontal()
@@ -392,6 +483,7 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
 
                     let is_selected   = state.selected_clip == Some(idx);
                     let is_being_dragged = state.drag.as_ref().map(|d| d.clip_id == clip_id).unwrap_or(false);
+                    let is_being_resized = state.resize.as_ref().map(|r| r.clip_id == clip_id).unwrap_or(false);
 
                     let x_in = GUTTER_W + frame_in as f32 * state.zoom;
                     let clip_rect = Rect::from_min_size(
@@ -405,31 +497,80 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
                         egui::Id::new(("clip", clip_id.index())),
                         Sense::click_and_drag(),
                     );
+                    
+                    clip_resp.context_menu(|ui| {
+                        if ui.button("Delete").clicked() {
+                            pending_clip_actions.push(ClipAction::Delete(clip_id));
+                            ui.close_menu();
+                        }
+                        if ui.button("Duplicate").clicked() {
+                            pending_clip_actions.push(ClipAction::Duplicate(clip_id));
+                            ui.close_menu();
+                        }
+                        
+                        let playhead_pts = project.frame_to_pts(state.playhead_frame);
+                        let is_playhead_inside = playhead_pts > pts_in && playhead_pts < pts_out;
+                        
+                        if ui.add_enabled(is_playhead_inside, egui::Button::new("Split at Playhead")).clicked() {
+                            pending_clip_actions.push(ClipAction::SplitAtPlayhead(clip_id));
+                            ui.close_menu();
+                        }
+                    });
 
                     // Click → select
-                    if clip_resp.clicked() && !is_being_dragged {
+                    if clip_resp.clicked() && !is_being_dragged && !is_being_resized {
                         state.selected_clip = Some(idx);
                         clicked_a_clip = true;
                     }
 
+                    // ── Resize / Drag Cursor ──
+                    let edge_width = 12.0;
+                    if clip_resp.hovered() && !is_being_dragged && !is_being_resized {
+                        if let Some(pos) = clip_resp.hover_pos() {
+                            if pos.x - clip_rect.left() < edge_width {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                            } else if clip_rect.right() - pos.x < edge_width {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                            }
+                        }
+                    }
+
                     // Drag start
-                    if clip_resp.drag_started() && state.drag.is_none() && dragging_item.is_none() {
-                        let grab_x = pointer_pos.map(|p| p.x).unwrap_or(clip_rect.min.x);
-                        let grab_offset_px = (grab_x - clip_rect.min.x).max(0.0);
-                        state.drag = Some(ClipDrag {
-                            clip_id,
-                            orig_idx: idx,
-                            grab_offset_px,
-                            orig_track: track.id,
-                        });
+                    if clip_resp.drag_started() && state.drag.is_none() && state.resize.is_none() && dragging_item.is_none() {
+                        let grab_x = ui.ctx().input(|i| i.pointer.press_origin()).map(|p| p.x).unwrap_or_else(|| pointer_pos.map(|p| p.x).unwrap_or(clip_rect.min.x));
+                        if grab_x - clip_rect.left() < edge_width {
+                            state.resize = Some(ClipResize {
+                                clip_id,
+                                orig_idx: idx,
+                                edge: ResizeEdge::Left,
+                                orig_pts_in: pts_in,
+                                orig_pts_out: pts_out,
+                            });
+                        } else if clip_rect.right() - grab_x < edge_width {
+                            state.resize = Some(ClipResize {
+                                clip_id,
+                                orig_idx: idx,
+                                edge: ResizeEdge::Right,
+                                orig_pts_in: pts_in,
+                                orig_pts_out: pts_out,
+                            });
+                        } else {
+                            let grab_offset_px = (grab_x - clip_rect.min.x).max(0.0);
+                            state.drag = Some(ClipDrag {
+                                clip_id,
+                                orig_idx: idx,
+                                grab_offset_px,
+                                orig_track: track.id,
+                            });
+                        }
                         state.selected_clip = Some(idx);
                         clicked_a_clip = true;
                     }
 
                     // ── Visual appearance ─────────────────────────────────
-                    let alpha: u8 = if is_being_dragged { 60 } else { 255 };
+                    let alpha: u8 = if is_being_dragged || is_being_resized { 60 } else { 255 };
 
-                    let base_color = if clip_resp.hovered() && !is_selected && !is_being_dragged {
+                    let base_color = if clip_resp.hovered() && !is_selected && !is_being_dragged && !is_being_resized {
                         Color32::from_rgba_unmultiplied(
                             (stripe_color.r() as u16 + 25).min(255) as u8,
                             (stripe_color.g() as u16 + 25).min(255) as u8,
@@ -446,11 +587,11 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
                     let top_strip = Rect::from_min_size(clip_rect.min, Vec2::new(clip_rect.width(), 3.0));
                     ui.painter().rect_filled(
                         top_strip, 3.0,
-                        Color32::from_rgba_unmultiplied(255, 255, 255, if is_being_dragged { 15 } else { 40 }),
+                        Color32::from_rgba_unmultiplied(255, 255, 255, if is_being_dragged || is_being_resized { 15 } else { 40 }),
                     );
 
-                    // Selection border
-                    if is_selected && !is_being_dragged {
+                    // Selection border and Resize handles
+                    if is_selected && !is_being_dragged && !is_being_resized {
                         ui.painter().rect_stroke(
                             clip_rect, 3.0,
                             egui::Stroke::new(2.0, Color32::from_rgb(0, 200, 255)),
@@ -459,10 +600,31 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
                             clip_rect, 3.0,
                             Color32::from_rgba_unmultiplied(255, 255, 255, 30),
                         );
+
+                        // Draw visual resize handles on the edges if the clip is wide enough
+                        if clip_rect.width() > 16.0 {
+                            let handle_w = 4.0;
+                            let handle_h = clip_rect.height() * 0.4;
+                            let handle_y = clip_rect.center().y - handle_h * 0.5;
+                            
+                            // Left handle
+                            let left_handle = Rect::from_min_size(
+                                egui::pos2(clip_rect.left() + 2.0, handle_y),
+                                Vec2::new(handle_w, handle_h),
+                            );
+                            ui.painter().rect_filled(left_handle, 2.0, Color32::WHITE);
+                            
+                            // Right handle
+                            let right_handle = Rect::from_min_size(
+                                egui::pos2(clip_rect.right() - handle_w - 2.0, handle_y),
+                                Vec2::new(handle_w, handle_h),
+                            );
+                            ui.painter().rect_filled(right_handle, 2.0, Color32::WHITE);
+                        }
                     }
 
                     // Label
-                    if clip_rect.width() > 30.0 && !is_being_dragged {
+                    if clip_rect.width() > 30.0 && !is_being_dragged && !is_being_resized {
                         let sources = project.sources.read().unwrap();
                         let source_id = project.clips.source_id_at(idx);
                         let clip_name = sources.path(source_id)
@@ -496,6 +658,26 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
                         if let Some(track) = project.tracks.get_mut(id) {
                             track.solo = !track.solo;
                         }
+                    }
+                }
+            }
+
+            // ── Apply pending clip actions ────────────────────────────────
+            for action in pending_clip_actions {
+                state.selected_clip = None;
+                match action {
+                    ClipAction::Delete(id) => {
+                        let _ = remove_clip(&mut project.clips, id);
+                        if state.drag.as_ref().map_or(false, |d| d.clip_id == id) {
+                            state.drag = None;
+                        }
+                    }
+                    ClipAction::Duplicate(id) => {
+                        let _ = nexir::timeline::mutation::duplicate_clip(&mut project.clips, id);
+                    }
+                    ClipAction::SplitAtPlayhead(id) => {
+                        let playhead_pts = project.frame_to_pts(state.playhead_frame);
+                        let _ = nexir::timeline::mutation::split_clip(&mut project.clips, id, playhead_pts);
                     }
                 }
             }
@@ -579,6 +761,71 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
                 ui.ctx().request_repaint();
             }
 
+            if let Some(ref resize) = state.resize {
+                if let Some(cursor) = pointer_pos {
+                    if let Some(&(_, lane_rect)) = track_lane_rects.iter().find(|(t, _)| *t == project.clips.track_id_at(resize.orig_idx)) {
+                        let track_h = lane_rect.height();
+                        let cursor_frame = ((cursor.x - lane_rect.min.x) / state.zoom).max(0.0) as i64;
+                        
+                        let mut new_pts_in = resize.orig_pts_in;
+                        let mut new_pts_out = resize.orig_pts_out;
+                        
+                        let min_dur = project.frame_to_pts(1);
+                        match resize.edge {
+                            ResizeEdge::Left => {
+                                new_pts_in = project.frame_to_pts(cursor_frame).min(resize.orig_pts_out - min_dur);
+                            }
+                            ResizeEdge::Right => {
+                                new_pts_out = project.frame_to_pts(cursor_frame).max(resize.orig_pts_in + min_dur);
+                            }
+                        }
+                        
+                        let frame_in = project.pts_to_frame(new_pts_in);
+                        let frame_out = project.pts_to_frame(new_pts_out);
+                        let clip_w_px = ((frame_out - frame_in) as f32 * state.zoom).max(4.0);
+                        let ghost_x = lane_rect.min.x + frame_in as f32 * state.zoom;
+                        
+                        let ghost_rect = Rect::from_min_size(
+                            egui::pos2(ghost_x, lane_rect.min.y + CLIP_H_PAD),
+                            Vec2::new(clip_w_px, track_h - CLIP_H_PAD * 2.0),
+                        );
+                        
+                        ui.painter().rect_filled(
+                            ghost_rect, 3.0,
+                            Color32::from_rgba_unmultiplied(255, 180, 0, 80),
+                        );
+                        ui.painter().rect_stroke(
+                            ghost_rect, 3.0,
+                            egui::Stroke::new(2.0, Color32::from_rgb(255, 200, 0)),
+                        );
+                        
+                        let ghost_frame = if matches!(resize.edge, ResizeEdge::Left) { frame_in } else { frame_out };
+                        let ghost_secs = ghost_frame / fps;
+                        let ghost_ff = ghost_frame % fps;
+                        let align = if matches!(resize.edge, ResizeEdge::Left) { Align2::LEFT_TOP } else { Align2::RIGHT_TOP };
+                        let pos = if matches!(resize.edge, ResizeEdge::Left) { ghost_rect.left_top() + egui::vec2(4.0, 2.0) } else { ghost_rect.right_top() + egui::vec2(-4.0, 2.0) };
+                        
+                        ui.painter().text(pos, align, format!("{}:{:02}", ghost_secs, ghost_ff), egui::FontId::proportional(9.0), Color32::WHITE);
+                    }
+                }
+                
+                if pointer_released {
+                    if let Some(cursor) = pointer_pos {
+                        if let Some(&(_, lane_rect)) = track_lane_rects.iter().find(|(t, _)| *t == project.clips.track_id_at(resize.orig_idx)) {
+                            let cursor_frame = ((cursor.x - lane_rect.min.x) / state.zoom).max(0.0) as i64;
+                            let new_pts = project.frame_to_pts(cursor_frame);
+                            pending_clip_resize = Some(PendingClipResize {
+                                clip_id: resize.clip_id,
+                                edge: resize.edge.clone(),
+                                new_pts,
+                            });
+                        }
+                    }
+                    state.resize = None;
+                }
+                ui.ctx().request_repaint();
+            }
+
             // ── Apply any pending clip insertion (from media-pool drop) ───
             if let (Some(track_id), Some(path)) = (pending_drop.track_id, pending_drop.media_path) {
                 if !project.sources.read().unwrap().path_registered(&path) {
@@ -632,6 +879,25 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
                         speed:       1.0,
                         pitch:       0.0,
                     });
+                }
+            }
+
+            // ── Apply pending clip resize ─────────────────────────────────
+            if let Some(rsz) = pending_clip_resize {
+                if let Some(idx) = project.clips.index_of(rsz.clip_id) {
+                    let min_dur = project.frame_to_pts(1);
+                    match rsz.edge {
+                        ResizeEdge::Left => {
+                            let pts_out = project.clips.pts_out_at(idx);
+                            let new_pts_in = rsz.new_pts.min(pts_out - min_dur);
+                            let _ = nexir::timeline::mutation::trim_clip_in(&mut project.clips, rsz.clip_id, new_pts_in);
+                        }
+                        ResizeEdge::Right => {
+                            let pts_in = project.clips.pts_in_at(idx);
+                            let new_pts_out = rsz.new_pts.max(pts_in + min_dur);
+                            let _ = nexir::timeline::mutation::trim_clip_out(&mut project.clips, rsz.clip_id, new_pts_out);
+                        }
+                    }
                 }
             }
 

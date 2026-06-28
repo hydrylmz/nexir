@@ -47,7 +47,7 @@ pub fn draw(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, sele
 fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, selected_clip: Option<usize>) {
 
     // ── Sync local state when selection changes ──────────────────────────
-    if selected_clip != state.last_loaded_clip {
+    if selected_clip != state.last_loaded_clip || selected_clip.is_some() {
         if let Some(idx) = selected_clip {
             let t = project.clips.transform_at(idx);
             state.pos_x    = t.position[0];
@@ -134,29 +134,31 @@ fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, se
             ui.add_space(6.0);
 
             // ── Transform ────────────────────────────────────────────────
-            let xform_open = ui.collapsing("🎬  Transform", |ui| {
+            let mut transform_changed = false;
+            let mut opacity_changed = false;
+            ui.collapsing("🎬  Transform", |ui| {
                 egui::Grid::new("transform_grid")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
                         ui.label("Scale");
-                        ui.add(egui::Slider::new(&mut state.scale, 0.1..=5.0).suffix("x"));
+                        transform_changed |= ui.add(egui::Slider::new(&mut state.scale, 0.1..=5.0).suffix("x")).changed();
                         ui.end_row();
 
                         ui.label("Position X");
-                        ui.add(egui::Slider::new(&mut state.pos_x, -1920.0..=1920.0).suffix("px"));
+                        transform_changed |= ui.add(egui::Slider::new(&mut state.pos_x, -1920.0..=1920.0).suffix("px")).changed();
                         ui.end_row();
 
                         ui.label("Position Y");
-                        ui.add(egui::Slider::new(&mut state.pos_y, -1080.0..=1080.0).suffix("px"));
+                        transform_changed |= ui.add(egui::Slider::new(&mut state.pos_y, -1080.0..=1080.0).suffix("px")).changed();
                         ui.end_row();
 
                         ui.label("Rotation");
-                        ui.add(egui::Slider::new(&mut state.rotation, -180.0..=180.0).suffix("°"));
+                        transform_changed |= ui.add(egui::Slider::new(&mut state.rotation, -180.0..=180.0).suffix("°")).changed();
                         ui.end_row();
 
                         ui.label("Opacity");
-                        ui.add(egui::Slider::new(&mut state.opacity, 0.0..=100.0).suffix("%"));
+                        opacity_changed |= ui.add(egui::Slider::new(&mut state.opacity, 0.0..=100.0).suffix("%")).changed();
                         ui.end_row();
                     });
 
@@ -167,16 +169,20 @@ fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, se
                     state.pos_y    = 0.0;
                     state.rotation = 0.0;
                     state.opacity  = 100.0;
+                    transform_changed = true;
+                    opacity_changed = true;
                 }
             });
             // Write edited values back into the clip store
-            if xform_open.body_returned.is_some() || true {
+            if transform_changed {
                 let t = project.clips.transform_at(idx);
                 let mut new_t = *t;
                 new_t.position = [state.pos_x, state.pos_y];
                 new_t.scale    = [state.scale, state.scale];
                 new_t.rotation = state.rotation.to_radians();
                 project.clips.set_transform_at(idx, new_t);
+            }
+            if opacity_changed {
                 project.clips.set_opacity_at(idx, state.opacity / 100.0);
             }
 

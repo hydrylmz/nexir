@@ -286,6 +286,11 @@ impl NexirApp {
                 );
             });
 
+        // Query active clips to pass to viewport for interaction (hit testing, drawing handles)
+        let playhead_pts = self.project.frame_to_pts(self.timeline.playhead_frame);
+        let mut active_clips = Vec::new();
+        query_active(&self.project.clips, playhead_pts, &mut active_clips);
+
         let mut viewport_size = egui::Vec2::ZERO;
         egui::CentralPanel::default().show(&self.egui_ctx, |ui| {
             viewport_size = crate::layout::viewport::draw(
@@ -295,6 +300,7 @@ impl NexirApp {
                 self.preview.video_height,
                 &mut self.timeline,
                 &mut self.project,
+                &active_clips,
             );
         });
 
@@ -338,9 +344,6 @@ impl NexirApp {
                               || !self.timeline.playing; // Moved while paused
                               
             self.last_playhead = playhead_pts;
-
-            let mut active_clips = Vec::new();
-            query_active(&self.project.clips, playhead_pts, &mut active_clips);
 
             // Respect mute / solo: pre-compute whether any track is soloed.
             let any_soloed = self.project.tracks.any_soloed();

@@ -27,7 +27,10 @@ pub fn draw(ui: &mut Ui) {
             if ui.button("Redo").clicked() {}
         });
         ui.menu_button("View", |ui| {
-            if ui.button("Reset Layout").clicked() {}
+            if ui.button("Reset Layout").clicked() {
+                ui.ctx().memory_mut(|mem| *mem = Default::default());
+                ui.close_menu();
+            }
         });
         ui.menu_button("Help", |ui| {
             if ui.button("About nexir").clicked() {

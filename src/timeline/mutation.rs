@@ -268,6 +268,63 @@ pub fn trim_clip_out(
     Ok(())
 }
 
+pub fn split_clip(
+    store:     &mut TimelineStore,
+    id:        ClipId,
+    split_pts: i64,
+) -> Result<ClipId, MutationError> {
+    let idx = store.index_of(id).ok_or(MutationError::ClipNotFound(id))?;
+    let pts_in = store.pts_in[idx];
+    let pts_out = store.pts_out[idx];
+    
+    if split_pts <= pts_in || split_pts >= pts_out {
+        return Err(MutationError::TrimPastOppositeEnd);
+    }
+    
+    let delta = split_pts - pts_in;
+    
+    let params = ClipInsertParams {
+        track_id: store.track_ids[idx],
+        source_id: store.source_ids[idx],
+        pts_in: split_pts,
+        pts_out: pts_out,
+        source_in: store.source_in[idx] + delta,
+        layer_order: store.layer_order[idx],
+        opacity: store.opacity[idx],
+        transform: store.transform[idx],
+        speed: store.speed[idx],
+        pitch: store.pitch[idx],
+    };
+    
+    store.pts_out[idx] = split_pts;
+    
+    insert_clip(store, params)
+}
+
+pub fn duplicate_clip(
+    store: &mut TimelineStore,
+    id:    ClipId,
+) -> Result<ClipId, MutationError> {
+    let idx = store.index_of(id).ok_or(MutationError::ClipNotFound(id))?;
+    
+    let duration = store.pts_out[idx] - store.pts_in[idx];
+    
+    let params = ClipInsertParams {
+        track_id: store.track_ids[idx],
+        source_id: store.source_ids[idx],
+        pts_in: store.pts_out[idx],
+        pts_out: store.pts_out[idx] + duration,
+        source_in: store.source_in[idx],
+        layer_order: store.layer_order[idx],
+        opacity: store.opacity[idx],
+        transform: store.transform[idx],
+        speed: store.speed[idx],
+        pitch: store.pitch[idx],
+    };
+    
+    insert_clip_overwrite(store, params)
+}
+
 pub fn set_opacity(
     store:   &mut TimelineStore,
     id:      ClipId,
