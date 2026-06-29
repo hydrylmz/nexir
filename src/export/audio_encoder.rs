@@ -37,17 +37,9 @@ impl AudioMuxEncoder {
             }
 
             avcodec_ctx_set_bit_rate(ctx, job.audio_bitrate as i64);
-
-            let sr_key = std::ffi::CString::new("sample_rate").unwrap();
-            av_opt_set_int(ctx as *mut _, sr_key.as_ptr(), 48000, 1);
-            
-            let cl_key = std::ffi::CString::new("channel_layout").unwrap();
-            let cl_str = std::ffi::CString::new("stereo").unwrap();
-            av_opt_set(ctx as *mut _, cl_key.as_ptr(), cl_str.as_ptr(), 1);
-
-            let fmt_key = std::ffi::CString::new("sample_fmt").unwrap();
-            let fmt_str = std::ffi::CString::new("fltp").unwrap();
-            av_opt_set(ctx as *mut _, fmt_key.as_ptr(), fmt_str.as_ptr(), 1);
+            avcodec_ctx_set_sample_rate(ctx, 48000);
+            avcodec_ctx_set_ch_layout(ctx, AV_CH_LAYOUT_STEREO);
+            avcodec_ctx_set_sample_fmt(ctx, AV_SAMPLE_FMT_FLTP);
 
             let enc_tb = AVRational { num: 1, den: 48000 };
             avcodec_ctx_set_time_base(ctx, enc_tb);

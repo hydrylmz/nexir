@@ -4,6 +4,9 @@ use crate::io::ffi::avutil::{AVFrame, AVPacket, AVRational};
 extern "C" {
     pub fn avcodec_find_encoder(id: std::ffi::c_uint) -> *const crate::io::ffi::avcodec::AVCodec;
     pub fn avcodec_ctx_set_bit_rate(ctx: *mut AVCodecContext, bitrate: i64);
+    pub fn avcodec_ctx_set_sample_rate(ctx: *mut AVCodecContext, sample_rate: i32);
+    pub fn avcodec_ctx_set_ch_layout(ctx: *mut AVCodecContext, ch_mask: u64);
+    pub fn avcodec_ctx_set_sample_fmt(ctx: *mut AVCodecContext, fmt: i32);
     pub fn avcodec_ctx_set_dimensions(ctx: *mut AVCodecContext, width: i32, height: i32);
     pub fn avcodec_ctx_set_pix_fmt(ctx: *mut AVCodecContext, pix_fmt: i32);
     pub fn avcodec_ctx_set_time_base(ctx: *mut AVCodecContext, tb: AVRational);

@@ -10,6 +10,9 @@ void avcodec_ctx_set_dimensions(AVCodecContext* ctx, int w, int h) { ctx->width 
 void avcodec_ctx_set_pix_fmt(AVCodecContext* ctx, enum AVPixelFormat fmt) { ctx->pix_fmt = fmt; }
 void avcodec_ctx_set_gop_size(AVCodecContext* ctx, int gop) { ctx->gop_size = gop; }
 void avcodec_ctx_set_bit_rate(AVCodecContext* ctx, int64_t br) { ctx->bit_rate = br; }
+void avcodec_ctx_set_sample_rate(AVCodecContext* ctx, int sr) { ctx->sample_rate = sr; }
+void avcodec_ctx_set_ch_layout(AVCodecContext* ctx, uint64_t ch_mask) { av_channel_layout_from_mask(&ctx->ch_layout, ch_mask); }
+void avcodec_ctx_set_sample_fmt(AVCodecContext* ctx, int fmt) { ctx->sample_fmt = fmt; }
 void avcodec_set_hw_device_ctx(AVCodecContext* ctx, AVBufferRef* hw) { ctx->hw_device_ctx = hw; }
 void avcodec_set_thread_count(AVCodecContext* ctx, int c) { ctx->thread_count = c; }
 
