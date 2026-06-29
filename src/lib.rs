@@ -1,5 +1,6 @@
 pub mod timeline;
 pub mod project;
+pub mod project_file;
 pub mod render;
 pub mod colour;
 pub mod io;

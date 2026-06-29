@@ -9,7 +9,7 @@ use crate::timeline::{
 use std::path::PathBuf;
 
 /// Project-level settings (resolution, framerate, timebase).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProjectSettings {
     pub width: u32,
     pub height: u32,
@@ -142,6 +142,9 @@ impl Project {
         let layer      = self.tracks.index_of(new_track).unwrap_or(0) as u16;
         let opacity    = self.clips.opacity_at(idx);
         let transform  = *self.clips.transform_at(idx);
+        let volume     = self.clips.volume_at(idx);
+        let pan        = self.clips.pan_at(idx);
+        let audio_muted = self.clips.audio_muted_at(idx);
         let speed      = self.clips.speed_at(idx);
         let pitch      = self.clips.pitch_at(idx);
         remove_clip(&mut self.clips, id)?;
@@ -154,6 +157,9 @@ impl Project {
             layer_order: layer,
             opacity,
             transform,
+            volume,
+            pan,
+            audio_muted,
             speed,
             pitch,
         })
