@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::timeline::ids::SourceId;
 use crate::timeline::rational::Rational;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VideoStreamInfo {
     pub width:       u32,
     pub height:      u32,
@@ -13,7 +13,7 @@ pub struct VideoStreamInfo {
     pub duration_pts: i64,       
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioStreamInfo {
     pub sample_rate: u32,   
     pub channels:    u8,
@@ -21,7 +21,7 @@ pub struct AudioStreamInfo {
     pub duration_pts: i64,  
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PixelFormat {
     Yuv420p,
     Yuv422p,
@@ -31,7 +31,7 @@ pub enum PixelFormat {
     Rgba16f,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ColorSpace {
     Bt601,
     Bt709,
@@ -39,7 +39,7 @@ pub enum ColorSpace {
     Srgb,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SampleFormat {
     F32Planar,
     F32Interleaved,
@@ -47,13 +47,14 @@ pub enum SampleFormat {
 }
 
 /// SoA source registry — all arrays parallel, indexed by SourceId.
+#[derive(Debug, Clone)]
 pub struct SourceRegistry {
-    ids:        Vec<SourceId>,
-    paths:      Vec<Arc<PathBuf>>,
-    video_info: Vec<Option<VideoStreamInfo>>,
-    audio_info: Vec<Option<AudioStreamInfo>>,
-    proxy_ids:  Vec<Option<SourceId>>,
-    next_id:    u32,
+    pub(crate) ids:        Vec<SourceId>,
+    pub(crate) paths:      Vec<Arc<PathBuf>>,
+    pub(crate) video_info: Vec<Option<VideoStreamInfo>>,
+    pub(crate) audio_info: Vec<Option<AudioStreamInfo>>,
+    pub(crate) proxy_ids:  Vec<Option<SourceId>>,
+    pub(crate) next_id:    u32,
 }
 
 impl Default for SourceRegistry {

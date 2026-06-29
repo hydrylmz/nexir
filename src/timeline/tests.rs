@@ -58,6 +58,9 @@ mod tests {
             layer_order: 0,
             opacity: 1.0,
             transform: ClipTransform::identity(),
+            volume: 1.0,
+            pan: 0.0,
+            audio_muted: false,
             speed: 1.0,
             pitch: 0.0,
         };
@@ -70,6 +73,9 @@ mod tests {
             layer_order: 1,
             opacity: 1.0,
             transform: ClipTransform::identity(),
+            volume: 1.0,
+            pan: 0.0,
+            audio_muted: false,
             speed: 1.0,
             pitch: 0.0,
         };
@@ -82,6 +88,9 @@ mod tests {
             layer_order: 2,
             opacity: 1.0,
             transform: ClipTransform::identity(),
+            volume: 1.0,
+            pan: 0.0,
+            audio_muted: false,
             speed: 1.0,
             pitch: 0.0,
         };
@@ -128,17 +137,17 @@ mod tests {
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
             pts_in: 300, pts_out: 400, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
-            speed: 1.0, pitch: 0.0,
+            volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let p2 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
             pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
-            speed: 1.0, pitch: 0.0,
+            volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let p3 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
             pts_in: 200, pts_out: 300, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
-            speed: 1.0, pitch: 0.0,
+            volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         insert_clip(&mut store, p1).unwrap();
         insert_clip(&mut store, p2).unwrap();
@@ -153,12 +162,12 @@ mod tests {
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
             pts_in: 50, pts_out: 200, source_in: 1000, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
-            speed: 1.0, pitch: 0.0,
+            volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let p2 = ClipInsertParams {
             track_id: TrackId(1), source_id: SourceId(1),
             pts_in: 50, pts_out: 200, source_in: 1000, layer_order: 1, opacity: 1.0, transform: ClipTransform::identity(),
-            speed: 2.0, pitch: 0.0,
+            volume: 1.0, pan: 0.0, audio_muted: false, speed: 2.0, pitch: 0.0,
         };
         insert_clip(&mut store, p1).unwrap();
         insert_clip(&mut store, p2).unwrap();
@@ -180,7 +189,7 @@ mod tests {
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
             pts_in: 0, pts_out: 100, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
-            speed: 1.0, pitch: 0.0,
+            volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let id = insert_clip(&mut store, p1).unwrap();
         let new_id = move_clip(&mut store, id, 500).unwrap();
@@ -196,7 +205,7 @@ mod tests {
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
             pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
-            speed: 1.0, pitch: 0.0,
+            volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let id = insert_clip(&mut store, p1).unwrap();
         let new_id = trim_clip_in(&mut store, id, 150).unwrap();
@@ -212,12 +221,12 @@ mod tests {
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
             pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
-            speed: 1.0, pitch: 0.0,
+            volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let p2 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
             pts_in: 200, pts_out: 300, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
-            speed: 1.0, pitch: 0.0,
+            volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let id = insert_clip(&mut store, p1).unwrap();
         insert_clip(&mut store, p2).unwrap();
@@ -242,7 +251,7 @@ mod tests {
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
             pts_in: 100, pts_out: 100, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
-            speed: 1.0, pitch: 0.0,
+            volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let result = insert_clip(&mut store, p1);
         assert!(matches!(result, Err(MutationError::InvalidDuration { .. })));

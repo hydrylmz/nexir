@@ -1,6 +1,6 @@
 // src/timeline/rational.rs
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Rational {
     pub num: i64,
     pub den: i64,

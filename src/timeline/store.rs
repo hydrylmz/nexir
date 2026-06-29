@@ -8,6 +8,7 @@ use crate::timeline::transform::ClipTransform;
 /// INVARIANT: all Vec fields have identical length at all times.
 /// INVARIANT: pts_in[i] <= pts_in[i+1] for all i  (sorted ascending).
 /// INVARIANT: pts_in[i] < pts_out[i] for all i    (clip duration > 0).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TimelineStore {
     // --- identity (rarely touched after insert) ---
     pub(crate) ids:          Vec<ClipId>,
@@ -23,6 +24,9 @@ pub struct TimelineStore {
     pub(crate) layer_order:  Vec<u16>,
     pub(crate) opacity:      Vec<f32>,
     pub(crate) transform:    Vec<ClipTransform>,
+    pub(crate) volume:       Vec<f32>,
+    pub(crate) pan:          Vec<f32>,
+    pub(crate) audio_muted:  Vec<bool>,
 
     // --- speed / pitch (cold path — set by inspector) ---
     /// Playback speed multiplier (1.0 = normal, 2.0 = double speed, 0.5 = half speed).
@@ -55,6 +59,9 @@ impl TimelineStore {
             layer_order: Vec::new(),
             opacity: Vec::new(),
             transform: Vec::new(),
+            volume: Vec::new(),
+            pan: Vec::new(),
+            audio_muted: Vec::new(),
             speed: Vec::new(),
             pitch: Vec::new(),
             effect_start: Vec::new(),
@@ -87,6 +94,9 @@ impl TimelineStore {
         assert_eq!(self.layer_order.len(), n);
         assert_eq!(self.opacity.len(), n);
         assert_eq!(self.transform.len(), n);
+        assert_eq!(self.volume.len(), n);
+        assert_eq!(self.pan.len(), n);
+        assert_eq!(self.audio_muted.len(), n);
         assert_eq!(self.speed.len(), n);
         assert_eq!(self.pitch.len(), n);
         assert_eq!(self.effect_start.len(), n);
@@ -151,6 +161,30 @@ impl TimelineStore {
 
     pub fn set_opacity_at(&mut self, idx: usize, opacity: f32) {
         self.opacity[idx] = opacity;
+    }
+
+    pub fn volume_at(&self, idx: usize) -> f32 {
+        self.volume[idx]
+    }
+
+    pub fn set_volume_at(&mut self, idx: usize, volume: f32) {
+        self.volume[idx] = volume;
+    }
+
+    pub fn pan_at(&self, idx: usize) -> f32 {
+        self.pan[idx]
+    }
+
+    pub fn set_pan_at(&mut self, idx: usize, pan: f32) {
+        self.pan[idx] = pan;
+    }
+
+    pub fn audio_muted_at(&self, idx: usize) -> bool {
+        self.audio_muted[idx]
+    }
+
+    pub fn set_audio_muted_at(&mut self, idx: usize, muted: bool) {
+        self.audio_muted[idx] = muted;
     }
 
     pub fn speed_at(&self, idx: usize) -> f32 {

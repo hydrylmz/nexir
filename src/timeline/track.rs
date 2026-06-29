@@ -2,7 +2,7 @@
 
 use crate::timeline::ids::TrackId;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub id:        TrackId,
     pub kind:      TrackKind,
@@ -13,7 +13,7 @@ pub struct Track {
     pub height_px: u16,       
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TrackKind {
     Video,
     Audio {
@@ -49,6 +49,7 @@ impl Track {
 
 /// Container for all tracks, maintaining insertion order for layer compositing.
 /// The z-order of video tracks is: tracks[0] is bottom, tracks[last] is top.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrackList {
     tracks: Vec<Track>,
     next_id: u8,  

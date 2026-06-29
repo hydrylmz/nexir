@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 /// 2D affine transform parameters for a clip.
 /// Must stay exactly 32 bytes (8 × f32) for GPU upload.
 /// repr(C) + Pod guarantees: safe to memcpy into a wgpu buffer.
-#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable, serde::Serialize, serde::Deserialize)]
 #[repr(C)]
 pub struct ClipTransform {
     /// Canvas-space translation of the anchor point, in pixels.
@@ -104,7 +104,7 @@ impl ClipTransform {
 /// 64 bytes = 16 × f32 = one cache line.
 /// The interpretation of `data` depends on the `EffectKind` of the owning effect.
 /// The WGSL shader reads this as a `uniform` block of 16 floats.
-#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable, serde::Serialize, serde::Deserialize)]
 #[repr(C, align(16))]
 pub struct EffectParams {
     /// Raw float parameters. Layout is per-effect:
