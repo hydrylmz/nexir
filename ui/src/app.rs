@@ -10,12 +10,14 @@ use nexir::render::compute::ComputePipelineCache;
 use nexir::timeline::query::query_active;
 use nexir::io::demuxer::Demuxer;
 use nexir::render::shader::registry::BuiltinShader;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use crate::layout::inspector::InspectorState;
 use crate::layout::media_pool::MediaPoolState;
 use crate::layout::timeline::TimelineState;
 use crate::history::HistoryState;
 use nexir::audio::audio_decoder::AudioDecoder;
+use nexir::project_file::ProjectFile;
 use nexir::audio::output_stream::AudioOutputStream;
 use nexir::audio::ring_buffer::AudioRingBuffer;
 use nexir::sync::master_clock::MasterClock;
@@ -30,6 +32,7 @@ use nexir::render::graph::RenderGraphCompiler;
 use nexir::render::nodes::yuv_upload::YuvUploadNode;
 use nexir::render::nodes::composite::CompositeNode;
 use nexir::render::resource::ResourceId;
+use nexir::export::progress::ProgressReceiver;
 
 pub struct PreviewState {
     pub texture:      Option<wgpu::Texture>,
@@ -77,6 +80,17 @@ pub struct NexirApp {
     audio_speed:       f32,
     audio_pitch:       f32,
     audio_was_playing: bool,
+
+    // Project file management
+    current_project_path: Option<PathBuf>,
+
+    // GPU device (shared for export)
+    device: Arc<GpuDevice>,
+
+    // Export state
+    export_progress: Option<ProgressReceiver>,
+    export_status: Option<String>,
+    export_progress_pct: f32,
 }
 
 pub struct AppResponse {
@@ -84,7 +98,7 @@ pub struct AppResponse {
 }
 
 impl NexirApp {
-    pub fn new(device: &GpuDevice, window: &Window) -> Self {
+    pub fn new(device: Arc<GpuDevice>, window: &Window) -> Self {
         let egui_ctx = Context::default();
 
         let mut style = (*egui_ctx.style()).clone();
@@ -101,7 +115,7 @@ impl NexirApp {
             egui_ctx.clone(), egui::ViewportId::ROOT, window,
             Some(window.scale_factor() as f32), None,
         );
-        let egui_renderer = Renderer::new(device.device.as_ref(), device.surface_format, None, 1);
+        let egui_renderer = Renderer::new(device.device.as_ref(), *device.surface_format.lock().unwrap(), None, 1);
 
         let mut project = Project::new("Untitled Project");
         let _ = project.add_video_track("Video 1");
@@ -211,12 +225,17 @@ impl NexirApp {
             audio_shutdown,
             audio_seek,
             audio_path: None,
+            current_project_path: None,
             audio_volume: 1.0,
             audio_pan: 0.0,
             audio_muted: false,
             audio_speed: 1.0,
             audio_pitch: 0.0,
             audio_was_playing: false,
+            device,
+            export_progress: None,
+            export_status: None,
+            export_progress_pct: 0.0,
         }
     }
 
@@ -244,24 +263,46 @@ impl NexirApp {
             self.timeline.selected_clip = None;
         }
 
-        egui::TopBottomPanel::top("top_bar").show(&self.egui_ctx, |ui| {
-            if let Some(action) = crate::layout::top_bar::draw(ui, self.history.can_undo(), self.history.can_redo()) {
-                match action {
-                    crate::layout::top_bar::TopBarAction::Undo => {
-                        if self.history.undo(&mut self.project) {
-                            self.timeline.clear_interaction();
-                            self.timeline.selected_clip = None;
-                        }
-                    }
-                    crate::layout::top_bar::TopBarAction::Redo => {
-                        if self.history.redo(&mut self.project) {
-                            self.timeline.clear_interaction();
-                            self.timeline.selected_clip = None;
-                        }
+        let top_bar_action = {
+            let can_undo = self.history.can_undo();
+            let can_redo = self.history.can_redo();
+            let mut action: Option<crate::layout::top_bar::TopBarAction> = None;
+            egui::TopBottomPanel::top("top_bar").show(&self.egui_ctx, |ui| {
+                action = crate::layout::top_bar::draw(ui, can_undo, can_redo);
+            });
+            action
+        };
+        if let Some(action) = top_bar_action {
+            match action {
+                crate::layout::top_bar::TopBarAction::Undo => {
+                    if self.history.undo(&mut self.project) {
+                        self.timeline.clear_interaction();
+                        self.timeline.selected_clip = None;
                     }
                 }
+                crate::layout::top_bar::TopBarAction::Redo => {
+                    if self.history.redo(&mut self.project) {
+                        self.timeline.clear_interaction();
+                        self.timeline.selected_clip = None;
+                    }
+                }
+                crate::layout::top_bar::TopBarAction::NewProject => {
+                    self.new_project();
+                }
+                crate::layout::top_bar::TopBarAction::OpenProject => {
+                    self.open_project();
+                }
+                crate::layout::top_bar::TopBarAction::Save => {
+                    self.save_project();
+                }
+                crate::layout::top_bar::TopBarAction::SaveAs => {
+                    self.save_project_as();
+                }
+                crate::layout::top_bar::TopBarAction::Export => {
+                    self.start_export();
+                }
             }
-        });
+        }
 
         egui::TopBottomPanel::bottom("timeline")
             .resizable(true)
@@ -457,10 +498,10 @@ impl NexirApp {
                         let project_tb = nexir::timeline::rational::Rational { num: 1, den: 90_000 };
                         
                         let path_clone = path.clone();
-                        eprintln!("[app] Starting audio decoder for {:?} (speed: {}, pitch: {})", path_clone, speed, pitch);
+                        eprintln!("[app] Starting audio decoder for {:?} (volume: {}, pan: {}, muted: {}, speed: {}, pitch: {})", path_clone, volume, pan, audio_muted, speed, pitch);
                         std::thread::spawn(move || {
                             match AudioDecoder::new(
-                                &path_clone, ring, clock, project_tb, shutdown, seek, speed, pitch
+                                &path_clone, ring, clock, project_tb, shutdown, seek, volume, pan, audio_muted, speed, pitch
                             ) {
                                 Ok(mut decoder) => decoder.run(),
                                 Err(e) => eprintln!("Failed to open audio decoder for {:?}: {:?}", path_clone, e),
@@ -502,7 +543,268 @@ impl NexirApp {
             self.audio_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         }
 
+        // ── Export progress polling ──────────────────────────────────────────
+        if let Some(ref progress_rx) = self.export_progress {
+            if let Some(update) = progress_rx.try_recv() {
+                let pct = if update.total_frames > 0 {
+                    update.frames_done as f64 / update.total_frames as f64 * 100.0
+                } else {
+                    0.0
+                };
+                self.export_progress_pct = (pct / 100.0) as f32;
+                self.export_status = Some(format!(
+                    "Export: {:.0}% ({} / {} frames, {:.1} fps)",
+                    pct, update.frames_done, update.total_frames, update.fps
+                ));
+                if update.phase == nexir::export::progress::ExportPhase::Done {
+                    self.export_progress = None;
+                    self.export_progress_pct = 1.0;
+                    self.export_status = Some("Export complete!".to_string());
+                } else if let nexir::export::progress::ExportPhase::Failed(ref err) = update.phase {
+                    self.export_progress = None;
+                    self.export_status = Some(format!("Export failed: {}", err));
+                }
+            }
+        }
+
+        // ── Export progress UI ───────────────────────────────────────────────
+        if let Some(ref status) = self.export_status.clone() {
+            let is_active = self.export_progress.is_some();
+            egui::Window::new("Export")
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .collapsible(false)
+                .resizable(false)
+                .show(&self.egui_ctx, |ui| {
+                    ui.label(status);
+                    if is_active {
+                        ui.add(egui::ProgressBar::new(self.export_progress_pct).show_percentage());
+                    } else {
+                        if ui.button("Close").clicked() {
+                            self.export_status = None;
+                        }
+                    }
+                });
+        }
+
         viewport_size
+    }
+
+    // ─────────────────────────────────────────────
+    // Project file management
+    // ─────────────────────────────────────────────
+
+    /// Stop any running audio decoder and reset audio state.
+    fn stop_audio(&mut self) {
+        self.audio_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.audio_path = None;
+        self.audio_ring.clear();
+        self.audio_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.audio_was_playing = false;
+        self.timeline.playing = false;
+    }
+
+    /// Reset the project to a blank slate, clearing history.
+    fn new_project(&mut self) {
+        self.stop_audio();
+        self.project = Project::new("Untitled Project");
+        let _ = self.project.add_video_track("Video 1");
+        let _ = self.project.add_video_track("Video 2");
+        let _ = self.project.add_audio_track("Audio 1");
+        self.current_project_path = None;
+        self.history = crate::history::HistoryState::default();
+        self.timeline.clear_interaction();
+        self.timeline.selected_clip = None;
+        self.media_pool = crate::layout::media_pool::MediaPoolState::default();
+    }
+
+    /// Show a file-open dialog and load a .nexp project.
+    fn open_project(&mut self) {
+        let file = rfd::FileDialog::new()
+            .add_filter("Nexir Project", &["nexp"])
+            .set_title("Open Project")
+            .pick_file();
+
+        if let Some(path) = file {
+            match ProjectFile::load(&path) {
+                Ok(project) => {
+                    self.stop_audio();
+                    self.project = project;
+                    self.current_project_path = Some(path);
+                    self.history = crate::history::HistoryState::default();
+                    self.timeline.clear_interaction();
+                    self.timeline.selected_clip = None;
+                    self.media_pool = crate::layout::media_pool::MediaPoolState::default();
+                }
+                Err(e) => {
+                    log::error!("Failed to load project: {:?}", e);
+                }
+            }
+        }
+    }
+
+    /// Save to the current path, or prompt if none set.
+    fn save_project(&mut self) {
+        if let Some(ref path) = self.current_project_path {
+            if let Err(e) = ProjectFile::save(path, &self.project) {
+                log::error!("Failed to save project: {:?}", e);
+            }
+        } else {
+            self.save_project_as();
+        }
+    }
+
+    /// Always show a file-save dialog, then save.
+    fn save_project_as(&mut self) {
+        let file = rfd::FileDialog::new()
+            .add_filter("Nexir Project", &["nexp"])
+            .set_title("Save Project As")
+            .save_file();
+
+        if let Some(path) = file {
+            // Ensure the path ends with .nexp
+            let path = if path.extension().map_or(true, |ext| ext != "nexp") {
+                path.with_extension("nexp")
+            } else {
+                path
+            };
+            if let Err(e) = ProjectFile::save(&path, &self.project) {
+                log::error!("Failed to save project: {:?}", e);
+            } else {
+                self.current_project_path = Some(path);
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Export
+    // ─────────────────────────────────────────────
+
+    /// Compile a render graph from the current scheduled frame.
+    /// Returns (CompiledGraph, nodes, rtt_id) for use with ExportEngine.
+    fn compile_export_graph(
+        &self,
+        device: &GpuDevice,
+        frame: &nexir::render::frame_state::FrameState,
+        canvas_width: u32,
+        canvas_height: u32,
+    ) -> Result<(nexir::render::graph::CompiledGraph, Vec<Box<dyn nexir::render::graph::RenderNode>>, ResourceId), nexir::render::graph::GraphError> {
+        let mut compiler = RenderGraphCompiler::new();
+        let mut id_counter = 2; // 0=FINAL_COLOR, 1=SCREEN
+
+        let mut comp_node = CompositeNode::new(
+            device,
+            &self.shaders,
+            ResourceId::FINAL_COLOR,
+            8, // max clips
+            wgpu::TextureFormat::Rgba16Float,
+        );
+
+        for clip in &frame.clips {
+            let tier = (clip.texture_slot >> 16) as u8;
+            let index = (clip.texture_slot & 0xFFFF) as u16;
+            let slot_id = nexir::io::slot_pool::FrameSlotId { tier, index };
+
+            let y_id = ResourceId::next(&mut id_counter);
+            let uv_id = ResourceId::next(&mut id_counter);
+
+            let upload_node = YuvUploadNode::new(
+                device, 0, clip.clip_width, clip.clip_height, y_id, uv_id,
+            );
+
+            // Upload YUV data from the slot pool into staging buffers
+            self.io_layer.pool.with_buffer_read(slot_id, |data| {
+                upload_node.upload_frame(device, data, clip.is_nv12);
+            });
+
+            compiler.add_node(Box::new(upload_node));
+
+            // Add YuvToRgb node
+            let rgba_id = ResourceId::next(&mut id_counter);
+            compiler.add_node(Box::new(nexir::render::nodes::yuv_to_rgb::YuvToRgbNode::new(
+                device, &self.shaders, &self.compute_cache,
+                y_id, uv_id, rgba_id,
+                clip.clip_width, clip.clip_height,
+                nexir::timeline::source::ColorSpace::Bt709,
+                true, // limited range
+            )));
+
+            // Provide RGBA texture to compositor
+            comp_node.input_textures.push(rgba_id);
+        }
+
+        compiler.add_node(Box::new(comp_node));
+
+        let graph = compiler.compile(canvas_width, canvas_height)?;
+        // NOTE: nodes are stored unused in ExportRenderer (dead_code), so pass empty vec
+        Ok((graph, Vec::new(), ResourceId::FINAL_COLOR))
+    }
+
+    /// Open a save dialog and start an export job.
+    fn start_export(&mut self) {
+        use nexir::export::engine::ExportEngine;
+        use nexir::export::job::ExportJob;
+
+        let file = rfd::FileDialog::new()
+            .add_filter("MP4 Video", &["mp4"])
+            .set_title("Export Video")
+            .save_file();
+
+        let path = match file {
+            Some(p) => {
+                let p = if p.extension().map_or(true, |ext| ext != "mp4") {
+                    p.with_extension("mp4")
+                } else {
+                    p
+                };
+                p
+            }
+            None => return,
+        };
+
+        // Build export job from current project state
+        let project_tb = Rational { num: 1, den: 90_000 };
+        let fps = Rational { num: 30, den: 1 };
+        let total_duration = self.project.frame_to_pts(self.project.duration_frames());
+        let width = 1920;
+        let height = 1080;
+
+        let job = ExportJob::preset_web_h264(
+            path, 0, total_duration, width, height, fps, project_tb,
+        );
+
+        // Schedule a frame at the playhead to get the current render graph
+        let playhead_pts = self.project.frame_to_pts(self.timeline.playhead_frame);
+        let frame = self.frame_scheduler.schedule_frame(
+            playhead_pts,
+            &self.project.clips,
+            &self.project.sources.read().unwrap(),
+        );
+
+        let (graph, nodes, rtt_id) = match self.compile_export_graph(&self.device, &frame, width, height) {
+            Ok(v) => v,
+            Err(e) => {
+                self.export_status = Some(format!("Export failed: graph compile error: {:?}", e));
+                return;
+            }
+        };
+
+        let engine = ExportEngine::new(
+            Arc::clone(&self.device),
+            job,
+            Arc::new(self.frame_scheduler.clone()),
+            Arc::new(std::sync::RwLock::new(self.project.clips.clone())),
+            Arc::new(std::sync::RwLock::new(self.project.sources.read().unwrap().clone())),
+        );
+
+        match engine.start(graph, nodes, rtt_id) {
+            Ok(rx) => {
+                self.export_progress = Some(rx);
+                self.export_status = Some("Export started...".to_string());
+            }
+            Err(e) => {
+                self.export_status = Some(format!("Export failed: {:?}", e));
+            }
+        }
     }
 
     pub fn render(&mut self, device: &GpuDevice, surface: &wgpu::Surface, window: &Window, viewport_size: egui::Vec2) {
@@ -557,55 +859,9 @@ impl NexirApp {
 
         if !frame.clips.is_empty() {
             if let Some(ref preview_texture) = self.preview.texture {
-                let mut compiler = RenderGraphCompiler::new();
-                let mut id_counter = 2; // 0=FINAL_COLOR, 1=SCREEN
-
-                let mut comp_node = CompositeNode::new(
-                    device,
-                    &self.shaders,
-                    ResourceId::FINAL_COLOR,
-                    8, // max clips
-                    wgpu::TextureFormat::Rgba16Float
-                );
-
-                for clip in &frame.clips {
-                    let tier = (clip.texture_slot >> 16) as u8;
-                    let index = (clip.texture_slot & 0xFFFF) as u16;
-                    let slot_id = nexir::io::slot_pool::FrameSlotId { tier, index };
-
-                    let y_id = ResourceId::next(&mut id_counter);
-                    let uv_id = ResourceId::next(&mut id_counter);
-
-                    let upload_node = YuvUploadNode::new(
-                        device, 0, clip.clip_width, clip.clip_height, y_id, uv_id
-                    );
-
-                    // Upload YUV data from the slot pool into staging buffers
-                    self.io_layer.pool.with_buffer_read(slot_id, |data| {
-                        upload_node.upload_frame(device, data, clip.is_nv12);
-                    });
-                    
-                    compiler.add_node(Box::new(upload_node));
-
-                    // Add YuvToRgb node
-                    let rgba_id = ResourceId::next(&mut id_counter);
-                    compiler.add_node(Box::new(nexir::render::nodes::yuv_to_rgb::YuvToRgbNode::new(
-                        device, &self.shaders, &self.compute_cache,
-                        y_id, uv_id, rgba_id,
-                        clip.clip_width, clip.clip_height,
-                        nexir::timeline::source::ColorSpace::Bt709,
-                        true, // limited range
-                    )));
-
-                    // Provide RGBA texture to compositor
-                    comp_node.input_textures.push(rgba_id);
-                }
-
-                compiler.add_node(Box::new(comp_node));
-
-                if let Ok(graph) = compiler.compile(self.preview.width, self.preview.height) {
+                if let Ok((graph, _nodes, rtt_id)) = self.compile_export_graph(device, &frame, self.preview.width, self.preview.height) {
                     graph.execute_with_callback(&mut encoder, device, &frame, |enc, ctx| {
-                        let final_res = ctx.get(ResourceId::FINAL_COLOR);
+                        let final_res = ctx.get(rtt_id);
                         
                         let preview_view = preview_texture.create_view(&wgpu::TextureViewDescriptor::default());
 

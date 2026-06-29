@@ -6,6 +6,7 @@ use nexir::render::device::GpuDevice;
 use log::info;
 
 mod app;
+mod history;
 pub mod layout;
 
 fn main() {
@@ -22,13 +23,16 @@ fn main() {
     let size = window.inner_size();
 
     // Initialize the engine and GPU device
-    let (mut device, surface) = pollster::block_on(async {
+    let (device, surface) = pollster::block_on(async {
         GpuDevice::new_with_surface(window.clone().into(), size.width, size.height)
             .await
             .expect("Failed to initialize GPU device")
     });
 
-    let mut app_state = app::NexirApp::new(&device, &window);
+    device.configure_surface(&surface, size.width, size.height);
+    let device = Arc::new(device);
+
+    let mut app_state = app::NexirApp::new(Arc::clone(&device), &window);
 
     event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Poll);
@@ -49,7 +53,7 @@ fn main() {
                     }
                     WindowEvent::RedrawRequested => {
                         let viewport_size = app_state.update(&window);
-                        app_state.render(&device, &surface, &window, viewport_size);
+                        app_state.render(&*device, &surface, &window, viewport_size);
                     }
                     _ => {}
                 }

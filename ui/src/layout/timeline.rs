@@ -5,6 +5,7 @@ use nexir::timeline::ids::{ClipId, TrackId};
 use nexir::timeline::mutation::{ClipInsertParams, remove_clip};
 use nexir::timeline::transform::ClipTransform;
 use crate::layout::media_pool::MediaEntry;
+use crate::history::HistoryState;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ResizeEdge {
@@ -40,6 +41,13 @@ pub struct ViewportResize {
     pub start_transform: ClipTransform,
 }
 
+#[derive(Clone, Copy)]
+pub struct ViewportMove {
+    pub clip_id: ClipId,
+    pub start_pointer: egui::Pos2,
+    pub start_transform: ClipTransform,
+}
+
 /// Timeline UI state owned by `NexirApp`.
 pub struct TimelineState {
     pub playhead_frame: i64,
@@ -53,6 +61,7 @@ pub struct TimelineState {
     /// Active clip resize state.
     resize: Option<ClipResize>,
     viewport_resize: Option<ViewportResize>,
+    viewport_move: Option<ViewportMove>,
 }
 
 impl Default for TimelineState {
@@ -67,13 +76,17 @@ impl Default for TimelineState {
             drag: None,
             resize: None,
             viewport_resize: None,
+            viewport_move: None,
         }
     }
 }
 
 impl TimelineState {
     pub fn is_interacting_with_clip(&self) -> bool {
-        self.drag.is_some() || self.resize.is_some() || self.viewport_resize.is_some()
+        self.drag.is_some()
+            || self.resize.is_some()
+            || self.viewport_resize.is_some()
+            || self.viewport_move.is_some()
     }
 
     pub fn start_viewport_resize(
@@ -98,9 +111,43 @@ impl TimelineState {
     pub fn finish_viewport_resize(&mut self) {
         self.viewport_resize = None;
     }
+
+    pub fn start_viewport_move(
+        &mut self,
+        clip_id: ClipId,
+        start_pointer: egui::Pos2,
+        start_transform: ClipTransform,
+    ) {
+        self.viewport_move = Some(ViewportMove {
+            clip_id,
+            start_pointer,
+            start_transform,
+        });
+    }
+
+    pub fn viewport_move(&self) -> Option<ViewportMove> {
+        self.viewport_move
+    }
+
+    pub fn finish_viewport_move(&mut self) {
+        self.viewport_move = None;
+    }
+
+    pub fn clear_interaction(&mut self) {
+        self.drag = None;
+        self.resize = None;
+        self.viewport_resize = None;
+        self.viewport_move = None;
+    }
 }
 
-pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragging_item: &mut Option<MediaEntry>) {
+pub fn draw(
+    ui: &mut Ui,
+    project: &mut Project,
+    state: &mut TimelineState,
+    dragging_item: &mut Option<MediaEntry>,
+    history: &mut HistoryState,
+) {
     // ── Space to toggle play/pause ────────────────────────────────────
     if ui.input(|i| i.key_pressed(egui::Key::Space)) {
         state.playing = !state.playing;
@@ -111,6 +158,7 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
     if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
         if let Some(idx) = state.selected_clip {
             let clip_id = project.clips.clip_id_at(idx);
+            history.record(project);
             let _ = remove_clip(&mut project.clips, clip_id);
             state.selected_clip = None;
         }
@@ -650,11 +698,13 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
             for mutation in pending_track_mutations {
                 match mutation {
                     TrackMutation::ToggleMute(id) => {
+                        history.record(project);
                         if let Some(track) = project.tracks.get_mut(id) {
                             track.mute = !track.mute;
                         }
                     }
                     TrackMutation::ToggleSolo(id) => {
+                        history.record(project);
                         if let Some(track) = project.tracks.get_mut(id) {
                             track.solo = !track.solo;
                         }
@@ -667,16 +717,19 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
                 state.selected_clip = None;
                 match action {
                     ClipAction::Delete(id) => {
+                        history.record(project);
                         let _ = remove_clip(&mut project.clips, id);
                         if state.drag.as_ref().map_or(false, |d| d.clip_id == id) {
                             state.drag = None;
                         }
                     }
                     ClipAction::Duplicate(id) => {
+                        history.record(project);
                         let _ = nexir::timeline::mutation::duplicate_clip(&mut project.clips, id);
                     }
                     ClipAction::SplitAtPlayhead(id) => {
                         let playhead_pts = project.frame_to_pts(state.playhead_frame);
+                        history.record(project);
                         let _ = nexir::timeline::mutation::split_clip(&mut project.clips, id, playhead_pts);
                     }
                 }
@@ -867,6 +920,7 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
                     }
                     let pts_in  = project.frame_to_pts(pending_drop.drop_frame);
                     let pts_out = pts_in + duration;
+                    history.record(project);
                     let _ = project.insert_clip_overwrite(ClipInsertParams {
                         track_id,
                         source_id,
@@ -876,6 +930,9 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
                         layer_order: 0,
                         opacity:     1.0,
                         transform:   ClipTransform::identity(),
+                        volume:      1.0,
+                        pan:         0.0,
+                        audio_muted: false,
                         speed:       1.0,
                         pitch:       0.0,
                     });
@@ -886,6 +943,7 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
             if let Some(rsz) = pending_clip_resize {
                 if let Some(idx) = project.clips.index_of(rsz.clip_id) {
                     let min_dur = project.frame_to_pts(1);
+                    history.record(project);
                     match rsz.edge {
                         ResizeEdge::Left => {
                             let pts_out = project.clips.pts_out_at(idx);
@@ -910,8 +968,10 @@ pub fn draw(ui: &mut Ui, project: &mut Project, state: &mut TimelineState, dragg
                     .map(|i| project.clips.track_id_at(i));
 
                 let result = if orig_track == Some(mv.new_track) {
+                    history.record(project);
                     project.move_clip(mv.clip_id, new_pts_in)
                 } else {
+                    history.record(project);
                     project.move_clip_to_track(mv.clip_id, mv.new_track, new_pts_in)
                 };
 

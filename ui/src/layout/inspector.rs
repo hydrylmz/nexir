@@ -1,5 +1,6 @@
 use egui::{Ui, RichText, Color32};
 use nexir::project::Project;
+use crate::history::HistoryState;
 
 pub struct InspectorState {
     // Local edit copies — written back to the project on change
@@ -8,6 +9,9 @@ pub struct InspectorState {
     pub pos_y:    f32,
     pub rotation: f32,
     pub opacity:  f32,
+    pub volume:   f32,
+    pub pan:      f32,
+    pub audio_muted: bool,
     pub speed:    f32,
     pub pitch:    f32,
 
@@ -24,6 +28,9 @@ impl Default for InspectorState {
             pos_y:    0.0,
             rotation: 0.0,
             opacity:  100.0,
+            volume:   100.0,
+            pan:      0.0,
+            audio_muted: false,
             speed:    1.0,
             pitch:    0.0,
             last_loaded_clip: None,
@@ -31,7 +38,13 @@ impl Default for InspectorState {
     }
 }
 
-pub fn draw(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, selected_clip: Option<usize>) {
+pub fn draw(
+    ui: &mut Ui,
+    state: &mut InspectorState,
+    project: &mut Project,
+    selected_clip: Option<usize>,
+    history: &mut HistoryState,
+) {
     ui.heading(RichText::new("Inspector").color(Color32::WHITE));
     ui.separator();
     ui.add_space(4.0);
@@ -40,11 +53,17 @@ pub fn draw(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, sele
     egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
         .show(ui, |ui| {
-        draw_inner(ui, state, project, selected_clip);
+        draw_inner(ui, state, project, selected_clip, history);
     });
 }
 
-fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, selected_clip: Option<usize>) {
+fn draw_inner(
+    ui: &mut Ui,
+    state: &mut InspectorState,
+    project: &mut Project,
+    selected_clip: Option<usize>,
+    history: &mut HistoryState,
+) {
 
     // ── Sync local state when selection changes ──────────────────────────
     if selected_clip != state.last_loaded_clip || selected_clip.is_some() {
@@ -55,6 +74,9 @@ fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, se
             state.scale    = t.scale[0];          // uniform scale (X)
             state.rotation = t.rotation.to_degrees();
             state.opacity  = project.clips.opacity_at(idx) * 100.0;
+            state.volume   = project.clips.volume_at(idx) * 100.0;
+            state.pan      = project.clips.pan_at(idx) * 100.0;
+            state.audio_muted = project.clips.audio_muted_at(idx);
             state.speed    = project.clips.speed_at(idx);
             state.pitch    = project.clips.pitch_at(idx);
         } else {
@@ -174,6 +196,9 @@ fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, se
                 }
             });
             // Write edited values back into the clip store
+            if transform_changed || opacity_changed {
+                history.record(project);
+            }
             if transform_changed {
                 let t = project.clips.transform_at(idx);
                 let mut new_t = *t;
@@ -189,9 +214,61 @@ fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, se
             ui.add_space(6.0);
 
             // ── Audio ─────────────────────────────────────────────────────
+            let mut audio_changed = false;
             ui.collapsing("🔊  Audio", |ui| {
-                ui.label("Audio properties (coming soon).");
+                egui::Grid::new("audio_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Mute");
+                        audio_changed |= ui.checkbox(&mut state.audio_muted, "").changed();
+                        ui.end_row();
+
+                        ui.label("Volume");
+                        audio_changed |= ui.add(
+                            egui::Slider::new(&mut state.volume, 0.0..=200.0)
+                                .suffix("%")
+                                .fixed_decimals(0),
+                        ).changed();
+                        ui.end_row();
+
+                        ui.label("Pan");
+                        audio_changed |= ui.add(
+                            egui::Slider::new(&mut state.pan, -100.0..=100.0)
+                                .suffix("%")
+                                .fixed_decimals(0),
+                        ).changed();
+                        ui.end_row();
+                    });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new("Left").small()).clicked() {
+                        state.pan = -100.0;
+                        audio_changed = true;
+                    }
+                    if ui.add(egui::Button::new("Center").small()).clicked() {
+                        state.pan = 0.0;
+                        audio_changed = true;
+                    }
+                    if ui.add(egui::Button::new("Right").small()).clicked() {
+                        state.pan = 100.0;
+                        audio_changed = true;
+                    }
+                    if ui.add(egui::Button::new("Reset").small()).clicked() {
+                        state.volume = 100.0;
+                        state.pan = 0.0;
+                        state.audio_muted = false;
+                        audio_changed = true;
+                    }
+                });
             });
+            if audio_changed {
+                history.record(project);
+                project.clips.set_volume_at(idx, (state.volume / 100.0).clamp(0.0, 2.0));
+                project.clips.set_pan_at(idx, (state.pan / 100.0).clamp(-1.0, 1.0));
+                project.clips.set_audio_muted_at(idx, state.audio_muted);
+            }
 
             ui.add_space(6.0);
 
@@ -210,6 +287,7 @@ fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, se
                                     .suffix("x")
                                     .logarithmic(true),
                             ).changed() {
+                                history.record(project);
                                 project.clips.set_speed_at(idx, state.speed);
                             }
                             ui.end_row();
@@ -220,6 +298,7 @@ fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, se
                                     .suffix(" st")
                                     .fixed_decimals(1),
                             ).changed() {
+                                history.record(project);
                                 project.clips.set_pitch_at(idx, state.pitch);
                             }
                             ui.end_row();
@@ -232,6 +311,7 @@ fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, se
                         for (i, &preset) in [0.25_f32, 0.5, 1.0, 1.5, 2.0, 4.0].iter().enumerate() {
                             let btn = egui::Button::new(format!("{}×", preset)).small();
                             if ui.add(btn).clicked() {
+                                history.record(project);
                                 state.speed = preset;
                                 project.clips.set_speed_at(idx, preset);
                             }
@@ -245,6 +325,7 @@ fn draw_inner(ui: &mut Ui, state: &mut InspectorState, project: &mut Project, se
                         for &semitones in &[-12_i32, -7, -5, 0, 5, 7, 12] {
                             let label = if semitones == 0 { "0".to_string() } else { format!("{:+}", semitones) };
                             if ui.add(egui::Button::new(format!("{} st", label)).small()).clicked() {
+                                history.record(project);
                                 state.pitch = semitones as f32;
                                 project.clips.set_pitch_at(idx, semitones as f32);
                             }
