@@ -167,6 +167,12 @@ impl CompiledGraph {
         &mut self.nodes
     }
 
+    /// Consume the graph and return the owned nodes.
+    /// Used by ExportEngine which needs both the compiled graph and node ownership.
+    pub fn into_nodes(self) -> Vec<Box<dyn RenderNode>> {
+        self.nodes
+    }
+
     /// Execute the compiled graph for one frame.
     pub fn execute(
         &self,

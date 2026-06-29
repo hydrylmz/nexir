@@ -6,6 +6,7 @@ use crate::scheduler::island::{build_islands, Island};
 use crate::io::io_layer::IoLayer;
 use crate::render::frame_state::{FrameState, ClipRenderEntry};
 
+#[derive(Clone)]
 pub struct FrameScheduler {
     io_layer:    Arc<IoLayer>,
     canvas_w:    u32,

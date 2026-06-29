@@ -1,6 +1,6 @@
 // src/render/device.rs
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Owns the wgpu instance, adapter, device, and queue.
 /// Clone-safe via Arc internals. Pass `&GpuDevice` everywhere — never clone the device.
@@ -12,7 +12,8 @@ pub struct GpuDevice {
     /// Best texture format supported by the adapter for RGBA16Float rendering.
     pub hdr_format: wgpu::TextureFormat,
     /// Surface format (the swapchain's pixel format, always SDR).
-    pub surface_format: wgpu::TextureFormat,
+    /// Uses Mutex for interior mutability so GpuDevice can be shared behind Arc across threads.
+    pub surface_format: Mutex<wgpu::TextureFormat>,
 }
 
 impl GpuDevice {
@@ -63,7 +64,7 @@ impl GpuDevice {
             device: Arc::new(device),
             queue: Arc::new(queue),
             hdr_format,
-            surface_format,
+            surface_format: Mutex::new(surface_format),
         })
     }
 
@@ -110,13 +111,13 @@ impl GpuDevice {
         };
 
         // Initialize our struct with a dummy surface format, then call configure_surface to set it properly
-        let mut gpu_device = Self {
+        let gpu_device = Self {
             instance,
             adapter,
             device: Arc::new(device),
             queue: Arc::new(queue),
             hdr_format,
-            surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            surface_format: Mutex::new(wgpu::TextureFormat::Bgra8UnormSrgb),
         };
 
         gpu_device.configure_surface(&surface, window_width, window_height);
@@ -126,7 +127,7 @@ impl GpuDevice {
 
     /// Configure (or reconfigure) the swapchain for a given surface and size.
     pub fn configure_surface(
-        &mut self,
+        &self,
         surface: &wgpu::Surface,
         width:   u32,
         height:  u32,
@@ -151,7 +152,7 @@ impl GpuDevice {
         });
 
         // Step 3: Update format
-        self.surface_format = chosen_format;
+        *self.surface_format.lock().unwrap() = chosen_format;
     }
 
     /// Begin a frame: create a CommandEncoder.

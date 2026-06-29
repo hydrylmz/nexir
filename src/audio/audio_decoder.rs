@@ -38,6 +38,9 @@ pub struct AudioDecoder {
     project_tb: Rational,
     shutdown:   Arc<AtomicBool>,
     seek_request: Arc<Mutex<Option<(i64, i64)>>>, // (source_pts, timeline_pts)
+    volume:     f32,
+    pan:        f32,
+    muted:      bool,
     samples_written: u64,
     stream_tb:  Rational,
     path:       std::path::PathBuf,
@@ -53,6 +56,9 @@ impl AudioDecoder {
         project_tb: Rational,
         shutdown:   Arc<AtomicBool>,
         seek_request: Arc<Mutex<Option<(i64, i64)>>>,
+        volume:     f32,
+        pan:        f32,
+        muted:      bool,
         speed:      f32,
         pitch:      f32,
     ) -> Result<Self, AudioError> {
@@ -129,6 +135,9 @@ impl AudioDecoder {
             project_tb,
             shutdown,
             seek_request,
+            volume,
+            pan,
+            muted,
             samples_written: 0,
             stream_tb,
             path: path.to_path_buf(),
@@ -266,6 +275,19 @@ impl AudioDecoder {
             interleaved.push(out_buf[1][i]);
         }
 
+        // ── Apply volume, pan, mute DSP ──────────────────────────────────
+        if self.muted {
+            interleaved.fill(0.0);
+        } else {
+            let angle = (self.pan + 1.0) * std::f32::consts::PI / 4.0; // 0 (full left) → π/2 (full right)
+            let left_gain  = self.volume * angle.cos();
+            let right_gain = self.volume * angle.sin();
+            for frame in interleaved.chunks_exact_mut(2) {
+                frame[0] *= left_gain;
+                frame[1] *= right_gain;
+            }
+        }
+
         self.ring.write(&interleaved);
         self.samples_written += written_usize as u64;
         println!("[audio] dec: pushed {} frames (total: {} elements), ring available: {}", written_usize, interleaved.len(), self.ring.available_read());
@@ -297,6 +319,18 @@ impl AudioDecoder {
             for i in 0..written_usize {
                 interleaved.push(out_buf[0][i]);
                 interleaved.push(out_buf[1][i]);
+            }
+            // Apply volume/pan/mute DSP
+            if self.muted {
+                interleaved.fill(0.0);
+            } else {
+                let angle = (self.pan + 1.0) * std::f32::consts::PI / 4.0;
+                let left_gain  = self.volume * angle.cos();
+                let right_gain = self.volume * angle.sin();
+                for frame in interleaved.chunks_exact_mut(2) {
+                    frame[0] *= left_gain;
+                    frame[1] *= right_gain;
+                }
             }
             self.ring.write(&interleaved);
         }
