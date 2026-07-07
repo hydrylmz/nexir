@@ -58,3 +58,24 @@ int avcodec_ctx_get_channels(AVCodecContext* ctx) { return ctx->ch_layout.nb_cha
 int avcodec_ctx_get_sample_fmt(AVCodecContext* ctx) { return ctx->sample_fmt; }
 uint64_t avcodec_ctx_get_channel_layout(AVCodecContext* ctx) { return ctx->ch_layout.u.mask; }
 
+void av_frame_set_width(AVFrame* f, int w) { f->width = w; }
+void av_frame_set_height(AVFrame* f, int h) { f->height = h; }
+void av_frame_set_format(AVFrame* f, int fmt) { f->format = fmt; }
+
+void av_frame_set_nb_samples(AVFrame* f, int samples) { f->nb_samples = samples; }
+void av_frame_set_sample_rate(AVFrame* f, int rate) { f->sample_rate = rate; }
+void av_frame_set_ch_layout(AVFrame* f, uint64_t ch_mask) {
+    av_channel_layout_from_mask(&f->ch_layout, ch_mask);
+}
+
+int av_stream_get_index(AVStream* st) { return st->index; }
+
+int avformat_open_output_pb(AVFormatContext* s, const char* url, int flags) {
+    return avio_open(&s->pb, url, flags);
+}
+
+void av_packet_set_stream_index(AVPacket* pkt, int idx) {
+    pkt->stream_index = idx;
+}
+
+

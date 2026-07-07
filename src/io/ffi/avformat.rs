@@ -66,17 +66,19 @@ unsafe extern "C" {
         s:            *mut AVFormatContext,
         stream_index: std::ffi::c_int,
         timestamp:    i64,
-        flags:        std::ffi::c_int,
+        flags:            std::ffi::c_int,
     ) -> std::ffi::c_int;
+}
 
-    /// Get the number of streams in a format context.
-    pub fn avformat_nb_streams(ctx: *const AVFormatContext) -> std::ffi::c_uint;
-
+extern "C" {
     /// Access the stream array at the given index.
     pub fn avformat_get_stream(
         ctx:   *const AVFormatContext,
         index: std::ffi::c_uint,
     ) -> *mut AVStream;
+
+    /// Get the number of streams in a format context.
+    pub fn avformat_nb_streams(ctx: *const AVFormatContext) -> std::ffi::c_uint;
 
     /// Get the time_base of a stream (ticks per second as a rational).
     pub fn avstream_get_time_base(stream: *const AVStream) -> AVRational;

@@ -64,7 +64,6 @@ fn audio_callback(
     clock:  &MasterClock,
 ) {
     let read_elements = ring.read(output);
-    println!("[audio] cpal: requested {}, read {}", output.len(), read_elements);
     clock.advance_samples(read_elements / 2);
 }
 

@@ -14,8 +14,7 @@ pub const AV_CH_LAYOUT_MONO:   u64 = 0x0000_0004;
 pub const AV_CH_LAYOUT_STEREO: u64 = 0x0000_0003;
 pub const AV_CH_LAYOUT_5_1:    u64 = 0x0000_003F;
 
-#[link(name = "swresample")]
-unsafe extern "C" {
+extern "C" {
     /// Allocate and configure a resampler context.
     pub fn swr_alloc_set_opts(
         s:               *mut SwrContext,  // NULL = allocate new
@@ -28,6 +27,10 @@ unsafe extern "C" {
         log_offset:      i32,
         log_ctx:         *mut std::ffi::c_void,
     ) -> *mut SwrContext;
+}
+
+#[link(name = "swresample")]
+unsafe extern "C" {
 
     /// Initialise the resampler (must be called before swr_convert).
     pub fn swr_init(s: *mut SwrContext) -> std::ffi::c_int;

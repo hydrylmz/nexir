@@ -2,8 +2,8 @@ use std::sync::Mutex;
 use std::ffi::CString;
 use crate::export::job::ExportJob;
 use crate::export::ffi::muxer_ffi::*;
-use crate::io::ffi::avutil::{AVPacket, AVRational};
-use crate::io::ffi::avformat::AVFormatContext;
+use crate::io::ffi::avutil::{AVPacket, AVRational, av_packet_set_stream_index};
+use crate::io::ffi::avformat::{AVFormatContext, avformat_get_stream, avstream_get_time_base};
 
 pub struct Muxer {
     inner: Mutex<MuxerInner>,
@@ -13,9 +13,7 @@ struct MuxerInner {
     ctx:             *mut AVFormatContext,
     video_stream_idx: i32,
     audio_stream_idx: i32,
-    #[allow(dead_code)]
     video_tb:        AVRational,
-    #[allow(dead_code)]
     audio_tb:        AVRational,
 }
 
@@ -51,7 +49,7 @@ impl Muxer {
             }
             avcodec_parameters_from_context(avstream_get_codecpar_mut(v_stream), video_encoder.codec_ctx());
             avstream_set_time_base(v_stream, video_tb);
-            let video_stream_idx = (*v_stream).index;
+            let video_stream_idx = av_stream_get_index(v_stream);
 
             let a_stream = avformat_new_stream(ctx, std::ptr::null());
             if a_stream.is_null() {
@@ -59,9 +57,9 @@ impl Muxer {
             }
             avcodec_parameters_from_context(avstream_get_codecpar_mut(a_stream), audio_encoder.codec_ctx());
             avstream_set_time_base(a_stream, audio_tb);
-            let audio_stream_idx = (*a_stream).index;
+            let audio_stream_idx = av_stream_get_index(a_stream);
 
-            let ret = avio_open(&mut (*ctx).pb, output_path.as_ptr(), AVIO_FLAG_WRITE);
+            let ret = avformat_open_output_pb(ctx, output_path.as_ptr(), AVIO_FLAG_WRITE);
             if ret < 0 {
                 return Err(MuxError::OpenFile("Failed to open avio".into()));
             }
@@ -97,11 +95,17 @@ impl Muxer {
     ) -> Result<(), MuxError> {
         let inner = self.inner.lock().unwrap();
         unsafe {
-            (*pkt).stream_index = if is_video {
+            let stream_idx = if is_video {
                 inner.video_stream_idx
             } else {
                 inner.audio_stream_idx
             };
+            av_packet_set_stream_index(pkt, stream_idx);
+
+            let src_tb = if is_video { inner.video_tb } else { inner.audio_tb };
+            let stream = avformat_get_stream(inner.ctx, stream_idx as std::ffi::c_uint);
+            let dst_tb = avstream_get_time_base(stream);
+            av_packet_rescale_ts(pkt, src_tb, dst_tb);
 
             let ret = av_interleaved_write_frame(inner.ctx, pkt);
             if ret < 0 {

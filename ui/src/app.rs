@@ -54,8 +54,8 @@ pub struct NexirApp {
     pub timeline:     TimelineState,
     pub history:      HistoryState,
     pub project:      Project,
-    pub shaders:      ShaderRegistry,
-    pub compute_cache: ComputePipelineCache,
+    pub shaders:      Arc<ShaderRegistry>,
+    pub compute_cache: Arc<ComputePipelineCache>,
 
     // Backend rendering state
     io_layer:         Arc<IoLayer>,
@@ -122,8 +122,8 @@ impl NexirApp {
         let _ = project.add_video_track("Video 2");
         let _ = project.add_audio_track("Audio 1");
 
-        let shaders = ShaderRegistry::compile_all(&device).unwrap();
-        let compute_cache = ComputePipelineCache::new();
+        let shaders = Arc::new(ShaderRegistry::compile_all(&device).unwrap());
+        let compute_cache = Arc::new(ComputePipelineCache::new());
 
         // Initialize Backend Systems
         let project_tb = Rational { num: 1, den: 90_000 };
@@ -713,7 +713,7 @@ impl NexirApp {
 
             // Upload YUV data from the slot pool into staging buffers
             self.io_layer.pool.with_buffer_read(slot_id, |data| {
-                upload_node.upload_frame(device, data, clip.is_nv12);
+                upload_node.upload_frame(data, clip.is_nv12, clip.clip_width, clip.clip_height);
             });
 
             compiler.add_node(Box::new(upload_node));
@@ -772,31 +772,31 @@ impl NexirApp {
             path, 0, total_duration, width, height, fps, project_tb,
         );
 
-        // Schedule a frame at the playhead to get the current render graph
-        let playhead_pts = self.project.frame_to_pts(self.timeline.playhead_frame);
-        let frame = self.frame_scheduler.schedule_frame(
-            playhead_pts,
-            &self.project.clips,
-            &self.project.sources.read().unwrap(),
-        );
-
-        let (graph, nodes, rtt_id) = match self.compile_export_graph(&self.device, &frame, width, height) {
-            Ok(v) => v,
-            Err(e) => {
-                self.export_status = Some(format!("Export failed: graph compile error: {:?}", e));
-                return;
-            }
-        };
-
+        // Build a completely fresh IoLayer for export — no shared demuxer/decoder
+        // state with the live playback path. The prefetch channel receiver is
+        // dropped immediately; blocking decode is used throughout export.
+        let export_pool  = Arc::new(FrameSlotPool::new(&self.device));
+        let export_cache = Arc::new(FrameCache::new(export_pool.clone(), 8));
+        let (export_prefetch_tx, _export_prefetch_rx) =
+            std::sync::mpsc::sync_channel::<PrefetchRequest>(1);
+        let export_io = Arc::new(IoLayer::new(
+            self.device.device.clone(),
+            export_pool,
+            export_cache,
+            self.project.sources.clone(),
+            export_prefetch_tx,
+            project_tb,
+        ));
+        let export_scheduler = Arc::new(FrameScheduler::new(export_io, width, height));
         let engine = ExportEngine::new(
             Arc::clone(&self.device),
             job,
-            Arc::new(self.frame_scheduler.clone()),
+            export_scheduler,
             Arc::new(std::sync::RwLock::new(self.project.clips.clone())),
             Arc::new(std::sync::RwLock::new(self.project.sources.read().unwrap().clone())),
         );
 
-        match engine.start(graph, nodes, rtt_id) {
+        match engine.start(Arc::clone(&self.shaders), Arc::clone(&self.compute_cache)) {
             Ok(rx) => {
                 self.export_progress = Some(rx);
                 self.export_status = Some("Export started...".to_string());

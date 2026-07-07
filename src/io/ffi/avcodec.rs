@@ -27,20 +27,6 @@ unsafe extern "C" {
         par:   *const AVCodecParameters,
     ) -> std::ffi::c_int;
 
-    /// Get the codec parameters from an AVStream.
-    pub fn avstream_get_codecpar(
-        stream: *const super::avformat::AVStream,
-    ) -> *mut AVCodecParameters;
-
-    /// Get the codec_id from codec parameters.
-    pub fn avcodecpar_get_codec_id(par: *const AVCodecParameters) -> std::ffi::c_uint;
-
-    /// Get width from codec parameters.
-    pub fn avcodecpar_get_width(par: *const AVCodecParameters) -> std::ffi::c_int;
-
-    /// Get height from codec parameters.
-    pub fn avcodecpar_get_height(par: *const AVCodecParameters) -> std::ffi::c_int;
-
     /// Open a codec context for decoding. Call after `avcodec_parameters_to_context`.
     pub fn avcodec_open2(
         avctx:   *mut AVCodecContext,
@@ -67,6 +53,22 @@ unsafe extern "C" {
 
     /// Flush all buffered frames. Call after seeking.
     pub fn avcodec_flush_buffers(avctx: *mut AVCodecContext);
+}
+
+extern "C" {
+    /// Get the codec parameters from an AVStream.
+    pub fn avstream_get_codecpar(
+        stream: *const super::avformat::AVStream,
+    ) -> *mut AVCodecParameters;
+
+    /// Get the codec_id from codec parameters.
+    pub fn avcodecpar_get_codec_id(par: *const AVCodecParameters) -> std::ffi::c_uint;
+
+    /// Get width from codec parameters.
+    pub fn avcodecpar_get_width(par: *const AVCodecParameters) -> std::ffi::c_int;
+
+    /// Get height from codec parameters.
+    pub fn avcodecpar_get_height(par: *const AVCodecParameters) -> std::ffi::c_int;
 
     /// Set the hardware device context before `avcodec_open2`.
     pub fn avcodec_set_hw_device_ctx(

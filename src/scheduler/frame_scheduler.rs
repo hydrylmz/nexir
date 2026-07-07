@@ -26,6 +26,10 @@ impl FrameScheduler {
         }
     }
 
+    pub fn io_layer(&self) -> &Arc<IoLayer> {
+        &self.io_layer
+    }
+
     pub fn schedule_frame(
         &self, 
         pts: i64, 

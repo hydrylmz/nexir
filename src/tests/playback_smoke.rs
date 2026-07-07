@@ -28,8 +28,8 @@ mod playback_smoke {
         
         for _ in 0..30 {
             let pkt = demuxer.next_video_packet().unwrap().expect("unexpected EOF");
-            if let Some(pts) = decoder.decode_into(&pkt, &mut buf, None).unwrap() {
-                pts_log.push(pts);
+            if let Some(res) = decoder.decode_into(&pkt, &mut buf, None).unwrap() {
+                pts_log.push(res.0);
             }
         }
 
@@ -66,7 +66,7 @@ mod playback_smoke {
 
     #[test]
     fn slot_pool_acquire_release_cycle() {
-        let device = Arc::new(pollster::block_on(GpuDevice::new_headless()));
+        let device = Arc::new(pollster::block_on(GpuDevice::new_headless()).expect("GpuDevice::new_headless failed"));
         let pool = FrameSlotPool::new(&device);
 
         // Tier 0 is <= 3_110_400. 
@@ -95,7 +95,7 @@ mod playback_smoke {
 
     #[test]
     fn frame_cache_eviction_releases_slot() {
-        let device = Arc::new(pollster::block_on(GpuDevice::new_headless()));
+        let device = Arc::new(pollster::block_on(GpuDevice::new_headless()).expect("GpuDevice::new_headless failed"));
         let pool = Arc::new(FrameSlotPool::new(&device));
         let cache = FrameCache::new(pool.clone(), 4);
         
@@ -105,7 +105,7 @@ mod playback_smoke {
         // Insert 4 frames
         for i in 0..4 {
             let slot = pool.acquire(req_size).unwrap();
-            cache.insert(source_id, i * 1000, slot);
+            cache.insert(source_id, i * 1000, slot, true);
         }
 
         assert_eq!(cache.len(), 4);
@@ -114,7 +114,7 @@ mod playback_smoke {
         
         // Insert 5th frame
         let slot5 = pool.acquire(req_size).unwrap();
-        cache.insert(source_id, 4000, slot5);
+        cache.insert(source_id, 4000, slot5, true);
 
         assert_eq!(cache.len(), 4);
         

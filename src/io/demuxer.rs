@@ -330,11 +330,13 @@ pub enum DemuxError {
     Alloc,
 }
 
-// Additional accessor FFI not in avformat.rs (packet fields)
 #[link(name = "avformat")]
 unsafe extern "C" {
+    fn av_packet_ref(dst: *mut AVPacket, src: *const AVPacket) -> i32;
+}
+
+extern "C" {
     fn av_packet_stream_index(pkt: *const AVPacket) -> i32;
     fn av_packet_pts(pkt: *const AVPacket) -> i64;
     fn av_packet_duration(pkt: *const AVPacket) -> i64;
-    fn av_packet_ref(dst: *mut AVPacket, src: *const AVPacket) -> i32;
 }

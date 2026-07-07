@@ -10,6 +10,9 @@ mod history;
 pub mod layout;
 
 fn main() {
+    if std::env::var("RUST_LOG").is_err() {
+        unsafe { std::env::set_var("RUST_LOG", "info,nexir=debug,ui=debug,wgpu_core=warn,wgpu_hal=warn,naga=warn"); }
+    }
     env_logger::init();
     info!("Starting Nexir UI");
 

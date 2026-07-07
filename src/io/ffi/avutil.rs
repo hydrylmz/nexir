@@ -100,6 +100,10 @@ unsafe extern "C" {
 
     /// Unreference packet data (for packets obtained from `av_read_frame`).
     pub fn av_packet_unref(pkt: *mut AVPacket);
+}
+
+extern "C" {
+    pub fn av_packet_set_stream_index(pkt: *mut AVPacket, idx: std::ffi::c_int);
 
     /// Get the PTS of an AVFrame (in stream timebase ticks).
     /// Returns `AV_NOPTS_VALUE` (i64::MIN) if PTS is unknown.
@@ -129,6 +133,17 @@ unsafe extern "C" {
 
     /// Get sample rate of the audio frame.
     pub fn av_frame_get_sample_rate(frame: *const AVFrame) -> std::ffi::c_int;
+
+    pub fn av_frame_set_width(frame: *mut AVFrame, width: std::ffi::c_int);
+    pub fn av_frame_set_height(frame: *mut AVFrame, height: std::ffi::c_int);
+    pub fn av_frame_set_format(frame: *mut AVFrame, format: std::ffi::c_int);
+    pub fn av_frame_set_nb_samples(frame: *mut AVFrame, samples: std::ffi::c_int);
+    pub fn av_frame_set_sample_rate(frame: *mut AVFrame, sample_rate: std::ffi::c_int);
+    pub fn av_frame_set_ch_layout(frame: *mut AVFrame, ch_mask: u64);
+}
+
+#[link(name = "avutil")]
+unsafe extern "C" {
 
     /// Rescale a PTS from one timebase to another using 64-bit integer arithmetic.
     ///

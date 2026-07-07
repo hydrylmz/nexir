@@ -66,9 +66,9 @@ mod interop_correctness {
 
         // Step 2 — Decode 10 frames via Phase 4 CPU path (interop: None).
         let cpu_frames = {
-            let mut demuxer = crate::io::demuxer::Demuxer::open(&test_file)
+            let mut demuxer = crate::io::demuxer::Demuxer::open(std::path::Path::new(&test_file))
                 .expect("failed to open test file (CPU path)");
-            let stream = demuxer.video_stream().cloned()
+            let stream = demuxer.video_stream.clone()
                 .expect("no video stream (CPU path)");
             let mut decoder = crate::io::decoder::Decoder::open(&stream, stream.codecpar, true)
                 .expect("failed to open decoder (CPU path)");
@@ -91,9 +91,9 @@ mod interop_correctness {
 
         // Step 3 — Decode the same 10 frames via Phase 7 GPU interop path.
         let interop_frames = {
-            let mut demuxer = crate::io::demuxer::Demuxer::open(&test_file)
+            let mut demuxer = crate::io::demuxer::Demuxer::open(std::path::Path::new(&test_file))
                 .expect("failed to open test file (interop path)");
-            let stream = demuxer.video_stream().cloned()
+            let stream = demuxer.video_stream.clone()
                 .expect("no video stream (interop path)");
             let width  = stream.width.unwrap_or(1920);
             let height = stream.height.unwrap_or(1080);
@@ -131,15 +131,15 @@ mod interop_correctness {
                             &wgpu::CommandEncoderDescriptor { label: Some("Y Readback Enc") }
                         );
                         encoder.copy_texture_to_buffer(
-                            wgpu::TexelCopyTextureInfo {
+                            wgpu::ImageCopyTexture {
                                 texture: &target.y_texture,
                                 mip_level: 0,
                                 origin: wgpu::Origin3d::ZERO,
                                 aspect: wgpu::TextureAspect::All,
                             },
-                            wgpu::TexelCopyBufferInfo {
+                            wgpu::ImageCopyBuffer {
                                 buffer: &y_buffer,
-                                layout: wgpu::TexelCopyBufferLayout {
+                                layout: wgpu::ImageDataLayout {
                                     offset: 0,
                                     bytes_per_row: Some(width),
                                     rows_per_image: Some(height),

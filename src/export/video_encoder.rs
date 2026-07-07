@@ -6,8 +6,11 @@ use crate::io::ffi::avcodec::{
     avcodec_alloc_context3, avcodec_free_context,
     avcodec_open2,
 };
-use crate::io::ffi::avutil::{av_packet_alloc, av_packet_free, av_packet_unref,
-                               AVRational};
+use crate::io::ffi::avutil::{
+    av_packet_alloc, av_packet_free, av_packet_unref, AVRational,
+    av_frame_get_width, av_frame_get_height, av_frame_get_data, av_frame_get_linesize,
+    av_frame_set_width, av_frame_set_height, av_frame_set_format,
+};
 
 pub mod swscale_ffi {
     #[repr(C)] pub struct SwsContext { _opaque: [u8; 0] }
@@ -111,8 +114,8 @@ impl VideoEncoder {
             let yuv_buffer = av_malloc(buf_size as usize);
             
             let ret = av_image_fill_arrays(
-                (*yuv_frame).data.as_mut_ptr(),
-                (*yuv_frame).linesize.as_mut_ptr(),
+                av_frame_get_data(yuv_frame) as *mut *mut u8,
+                av_frame_get_linesize(yuv_frame) as *mut std::ffi::c_int,
                 yuv_buffer,
                 out_pix_fmt,
                 job.width as i32,
@@ -122,9 +125,9 @@ impl VideoEncoder {
             if ret < 0 {
                 return Err(EncodeError::Alloc);
             }
-            (*yuv_frame).width = job.width as i32;
-            (*yuv_frame).height = job.height as i32;
-            (*yuv_frame).format = out_pix_fmt;
+            av_frame_set_width(yuv_frame, job.width as i32);
+            av_frame_set_height(yuv_frame, job.height as i32);
+            av_frame_set_format(yuv_frame, out_pix_fmt);
 
             let sws = swscale_ffi::sws_getContext(
                 job.width as i32, job.height as i32, swscale_ffi::AV_PIX_FMT_RGBA,
@@ -156,9 +159,9 @@ impl VideoEncoder {
             // Need a way to extract width. FFmpeg AVCodecContext has a width field. We don't have bindings for that inside AVCodecContext.
             // Oh, I can just use frame.data.len() / 4 / height? Wait, job width! I'll store width/height on VideoEncoder.
             // Let's modify: actually I can use (*self.yuv_frame).width.
-            (*self.yuv_frame).width as u32
+            av_frame_get_width(self.yuv_frame) as u32
         };
-        let height = unsafe { (*self.yuv_frame).height as u32 };
+        let height = unsafe { av_frame_get_height(self.yuv_frame) as u32 };
         let rgba8 = self.rgba16_to_rgba8(&frame.data, width, height);
 
         unsafe {
@@ -173,8 +176,8 @@ impl VideoEncoder {
                 src_linesize.as_ptr(),
                 0,
                 height as i32,
-                (*self.yuv_frame).data.as_ptr() as *const *mut u8,
-                (*self.yuv_frame).linesize.as_ptr(),
+                av_frame_get_data(self.yuv_frame),
+                av_frame_get_linesize(self.yuv_frame),
             );
 
             av_frame_set_pts(self.yuv_frame, self.frame_count);

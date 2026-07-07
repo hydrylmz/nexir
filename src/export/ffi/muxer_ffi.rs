@@ -35,6 +35,11 @@ extern "C" {
         flags: std::ffi::c_int,
     ) -> std::ffi::c_int;
 
+    pub fn av_stream_get_index(stream: *mut AVStream) -> std::ffi::c_int;
+    pub fn avformat_open_output_pb(s: *mut AVFormatContext, url: *const std::ffi::c_char, flags: std::ffi::c_int) -> std::ffi::c_int;
+    pub fn av_packet_rescale_ts(pkt: *mut AVPacket, tb_src: AVRational, tb_dst: AVRational);
+
+
     pub fn av_interleaved_write_frame(
         s:   *mut AVFormatContext,
         pkt: *mut AVPacket,

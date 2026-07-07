@@ -1,8 +1,12 @@
 use crate::export::job::ExportJob;
 use crate::export::video_encoder::EncodeError;
-use crate::io::ffi::avutil::{AVFrame, AVPacket, AVRational, av_frame_alloc,
-                               av_frame_free, av_packet_alloc, av_packet_free,
-                               av_packet_unref};
+use crate::io::ffi::avutil::{
+    AVFrame, AVPacket, AVRational, av_frame_alloc, av_frame_free,
+    av_packet_alloc, av_packet_free, av_packet_unref,
+    av_frame_set_nb_samples, av_frame_set_sample_rate, av_frame_set_format,
+    av_frame_set_ch_layout, av_frame_get_data,
+};
+use crate::export::ffi::encoder_ffi::av_frame_set_pts;
 use crate::io::ffi::avcodec::{avcodec_alloc_context3,
                                 avcodec_free_context, avcodec_open2};
 use crate::audio::ffi::avresample::{swr_alloc_set_opts, swr_free,
@@ -71,10 +75,10 @@ impl AudioMuxEncoder {
             let enc_frame = av_frame_alloc();
             let packet = av_packet_alloc();
 
-            (*enc_frame).nb_samples = frame_size as i32;
-            (*enc_frame).format = AV_SAMPLE_FMT_FLTP;
-            (*enc_frame).channel_layout = AV_CH_LAYOUT_STEREO as u64;
-            (*enc_frame).sample_rate = 48000;
+            av_frame_set_nb_samples(enc_frame, frame_size as i32);
+            av_frame_set_format(enc_frame, AV_SAMPLE_FMT_FLTP);
+            av_frame_set_ch_layout(enc_frame, AV_CH_LAYOUT_STEREO as u64);
+            av_frame_set_sample_rate(enc_frame, 48000);
             av_frame_get_buffer(enc_frame, 0);
 
             Ok(Self {
@@ -111,6 +115,52 @@ impl AudioMuxEncoder {
 
     pub fn codec_ctx(&self) -> *const crate::io::ffi::avcodec::AVCodecContext {
         self.ctx as *const _
+    }
+
+    /// Number of samples per frame expected by the encoder (e.g. 1024 for AAC).
+    pub fn frame_size(&self) -> usize {
+        self.frame_size
+    }
+
+    /// Feed exactly `frame_size` planar f32 samples (left + right) into the encoder.
+    /// `pts` is the frame presentation timestamp in encoder timebase (samples @ 48 kHz).
+    /// Drains any produced packets via `packet_sink`.
+    ///
+    /// `left` and `right` must each have exactly `self.frame_size` elements.
+    pub fn encode_pcm_chunk(
+        &mut self,
+        left:        &[f32],
+        right:       &[f32],
+        pts:         i64,
+        packet_sink: &mut dyn FnMut(*mut AVPacket),
+    ) -> Result<(), EncodeError> {
+        debug_assert_eq!(left.len(), self.frame_size);
+        debug_assert_eq!(right.len(), self.frame_size);
+        unsafe {
+            // Write planar samples into enc_frame buffers.
+            let data = av_frame_get_data(self.enc_frame) as *mut *mut u8;
+            let plane0 = (*data) as *mut f32;
+            let plane1 = (*data.add(1)) as *mut f32;
+            std::ptr::copy_nonoverlapping(left.as_ptr(),  plane0, self.frame_size);
+            std::ptr::copy_nonoverlapping(right.as_ptr(), plane1, self.frame_size);
+
+            av_frame_set_pts(self.enc_frame, pts);
+
+            let ret = avcodec_send_frame(self.ctx, self.enc_frame);
+            if ret < 0 {
+                return Err(EncodeError::Open(format!("avcodec_send_frame audio: {}", ret)));
+            }
+
+            loop {
+                let ret = avcodec_receive_packet(self.ctx, self.packet);
+                if ret < 0 {
+                    break;
+                }
+                packet_sink(self.packet);
+                av_packet_unref(self.packet);
+            }
+        }
+        Ok(())
     }
 }
 
