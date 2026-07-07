@@ -82,8 +82,35 @@ impl From<ProjectFile> for Project {
         // We do a simple push loop to keep `next_id` consistent.
         for idx in 0..pf.sources.ids.len() {
             let path = pf.sources.paths[idx].clone();
-            let vi   = pf.sources.video_info[idx].clone();
-            let ai   = pf.sources.audio_info[idx].clone();
+            let mut vi = pf.sources.video_info[idx].clone();
+            let mut ai = pf.sources.audio_info[idx].clone();
+            
+            // If the project file was generated externally without stream info, reprobe it now
+            if vi.is_none() || ai.is_none() {
+                if let Ok(demuxer) = crate::io::demuxer::Demuxer::open(&path) {
+                    let project_tb = crate::timeline::rational::Rational { num: 1, den: 90_000 };
+                    
+                    if vi.is_none() {
+                        vi = demuxer.video_stream.as_ref().map(|s| crate::timeline::source::VideoStreamInfo {
+                            width:        s.width.unwrap_or(1920),
+                            height:       s.height.unwrap_or(1080),
+                            frame_rate:   s.frame_rate.unwrap_or(crate::timeline::rational::Rational { num: 30, den: 1 }),
+                            pixel_fmt:    crate::timeline::source::PixelFormat::Yuv420p,
+                            color_space:  crate::timeline::source::ColorSpace::Bt709,
+                            duration_pts: project_tb.from_pts(s.duration, s.time_base),
+                        });
+                    }
+                    if ai.is_none() {
+                        ai = demuxer.audio_stream.as_ref().map(|s| crate::timeline::source::AudioStreamInfo {
+                            sample_rate:  48000, // standard default
+                            channels:     2,
+                            sample_fmt:   crate::timeline::source::SampleFormat::F32Interleaved,
+                            duration_pts: project_tb.from_pts(s.duration, s.time_base),
+                        });
+                    }
+                }
+            }
+
             let pid  = pf.sources.proxy_ids[idx];
             let sid  = registry.register(path, vi, ai);
             if let Some(proxy) = pid {

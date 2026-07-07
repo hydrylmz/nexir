@@ -94,8 +94,6 @@ impl YuvUploadNode {
         let w = frame_width.min(self.width);
         let h = frame_height.min(self.height);
 
-        log::debug!("[upload] slot={} frame={}x{} node_max={}x{}",
-            self.clip_slot, frame_width, frame_height, self.width, self.height);
 
         let y_size        = (frame_width * frame_height) as usize;
         let uv_plane_size = ((frame_width / 2) * (frame_height / 2)) as usize;

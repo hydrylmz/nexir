@@ -92,4 +92,16 @@ impl FrameCache {
     pub fn len(&self) -> usize {
         self.index.len()
     }
+
+    /// Evict all cached frames, releasing their slots back to the pool.
+    pub fn clear_all(&self) {
+        let mut lru = self.lru.lock().unwrap();
+        lru.clear();
+        let keys: Vec<CacheKey> = self.index.iter().map(|kv| *kv.key()).collect();
+        for key in keys {
+            if let Some((_, slot_info)) = self.index.remove(&key) {
+                self.pool.release(slot_info.0);
+            }
+        }
+    }
 }

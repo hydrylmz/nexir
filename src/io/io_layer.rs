@@ -47,6 +47,23 @@ impl IoLayer {
         }
     }
 
+    /// Clear all stale decoder/demuxer/cache state.
+    /// Must be called when the project's SourceRegistry changes (new/open project).
+    pub fn reset_for_new_project(&self, new_source_reg: &std::sync::Arc<std::sync::RwLock<SourceRegistry>>) {
+        // Replace the contents of our source_reg with the new one
+        let new_reg = new_source_reg.read().unwrap();
+        let mut our_reg = self.source_reg.write().unwrap();
+        *our_reg = new_reg.clone();
+        drop(our_reg);
+        drop(new_reg);
+
+        // Clear stale demuxers and decoders (they reference old source files)
+        self.demuxers.clear();
+        self.decoders.clear();
+        self.last_decoded_pts.clear();
+        self.cache.clear_all();
+    }
+
     pub fn get_or_decode(
         &self,
         source_id: SourceId,
@@ -74,16 +91,6 @@ impl IoLayer {
             return Some(slot);
         }
 
-        let required = self.source_reg.read().unwrap().frame_size_bytes(source_id).ok()?;
-        let mut slot = self.pool.acquire(required);
-        while slot.is_none() {
-            if !self.cache.evict_one() {
-                break;
-            }
-            slot = self.pool.acquire(required);
-        }
-        let slot = slot?;
-
         let demuxer_arc = self.get_or_open_demuxer(source_id)?;
         let decoder_arc = self.get_or_open_decoder(source_id, &demuxer_arc)?;
 
@@ -108,6 +115,17 @@ impl IoLayer {
                 self.project_tb.rescale_pts(pts, stream_tb)
             }
         };
+
+        // Acquire slot AFTER early returns to avoid leaking on seek/open failures
+        let required = self.source_reg.read().unwrap().frame_size_bytes(source_id).ok()?;
+        let mut slot = self.pool.acquire(required);
+        while slot.is_none() {
+            if !self.cache.evict_one() {
+                break;
+            }
+            slot = self.pool.acquire(required);
+        }
+        let slot = slot?;
 
         let mut final_is_nv12 = false;
         let mut decoded_anything = false;

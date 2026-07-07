@@ -191,8 +191,14 @@ impl TimelineStore {
         self.speed[idx]
     }
 
-    pub fn set_speed_at(&mut self, idx: usize, speed: f32) {
-        self.speed[idx] = speed;
+    pub fn set_speed_at(&mut self, idx: usize, new_speed: f32) {
+        let old_speed = self.speed[idx];
+        if (old_speed - new_speed).abs() > 1e-4 {
+            let duration = self.pts_out[idx] - self.pts_in[idx];
+            let new_duration = (duration as f64 * (old_speed as f64 / new_speed as f64)) as i64;
+            self.pts_out[idx] = self.pts_in[idx] + new_duration;
+            self.speed[idx] = new_speed;
+        }
     }
 
     pub fn pitch_at(&self, idx: usize) -> f32 {

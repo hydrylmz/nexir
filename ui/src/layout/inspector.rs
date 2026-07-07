@@ -13,7 +13,6 @@ pub struct InspectorState {
     pub pan:      f32,
     pub audio_muted: bool,
     pub speed:    f32,
-    pub pitch:    f32,
 
     /// The clip store-index we last loaded values from.
     /// Used to detect when the selection changes so we can reload.
@@ -32,7 +31,6 @@ impl Default for InspectorState {
             pan:      0.0,
             audio_muted: false,
             speed:    1.0,
-            pitch:    0.0,
             last_loaded_clip: None,
         }
     }
@@ -78,7 +76,6 @@ fn draw_inner(
             state.pan      = project.clips.pan_at(idx) * 100.0;
             state.audio_muted = project.clips.audio_muted_at(idx);
             state.speed    = project.clips.speed_at(idx);
-            state.pitch    = project.clips.pitch_at(idx);
         } else {
             *state = InspectorState::default();
         }
@@ -112,9 +109,9 @@ fn draw_inner(
                 );
             });
             ui.add_space(6.0);
-            ui.collapsing("⚡  Speed & Pitch", |ui| {
+            ui.collapsing("⚡  Speed", |ui| {
                 ui.label(
-                    RichText::new("Select a clip to edit speed and pitch.")
+                    RichText::new("Select a clip to edit speed.")
                         .color(Color32::from_rgb(100, 100, 100))
                         .italics(),
                 );
@@ -272,12 +269,12 @@ fn draw_inner(
 
             ui.add_space(6.0);
 
-            // ── Speed & Pitch ──────────────────────────────────────────────
-            let speed_resp = egui::CollapsingHeader::new("⚡  Speed & Pitch")
+            // ── Speed ────────────────────────────────────────────────────────
+            let speed_resp = egui::CollapsingHeader::new("⚡  Speed")
                 .default_open(true)
-                .id_source("speed_pitch_header")
+                .id_source("speed_header")
                 .show(ui, |ui| {
-                    egui::Grid::new("speed_pitch_grid")
+                    egui::Grid::new("speed_grid")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
                         .show(ui, |ui| {
@@ -289,17 +286,6 @@ fn draw_inner(
                             ).changed() {
                                 history.record(project);
                                 project.clips.set_speed_at(idx, state.speed);
-                            }
-                            ui.end_row();
-
-                            ui.label("Pitch");
-                            if ui.add(
-                                egui::Slider::new(&mut state.pitch, -12.0..=12.0)
-                                    .suffix(" st")
-                                    .fixed_decimals(1),
-                            ).changed() {
-                                history.record(project);
-                                project.clips.set_pitch_at(idx, state.pitch);
                             }
                             ui.end_row();
                         });
@@ -319,18 +305,7 @@ fn draw_inner(
                         }
                     });
                     ui.add_space(4.0);
-                    // Pitch presets
-                    ui.label(RichText::new("Pitch presets:").color(Color32::from_rgb(160, 160, 160)).small());
-                    ui.horizontal(|ui| {
-                        for &semitones in &[-12_i32, -7, -5, 0, 5, 7, 12] {
-                            let label = if semitones == 0 { "0".to_string() } else { format!("{:+}", semitones) };
-                            if ui.add(egui::Button::new(format!("{} st", label)).small()).clicked() {
-                                history.record(project);
-                                state.pitch = semitones as f32;
-                                project.clips.set_pitch_at(idx, semitones as f32);
-                            }
-                        }
-                    });
+
                 });
             let _ = speed_resp;
 

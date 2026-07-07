@@ -503,7 +503,7 @@ impl NexirApp {
                             match AudioDecoder::new(
                                 &path_clone, ring, clock, project_tb, shutdown, seek, volume, pan, audio_muted, speed, pitch
                             ) {
-                                Ok(mut decoder) => decoder.run(),
+                                Ok(decoder) => decoder.run(),
                                 Err(e) => eprintln!("Failed to open audio decoder for {:?}: {:?}", path_clone, e),
                             }
                         });
@@ -610,6 +610,10 @@ impl NexirApp {
         let _ = self.project.add_video_track("Video 1");
         let _ = self.project.add_video_track("Video 2");
         let _ = self.project.add_audio_track("Audio 1");
+        // Sync IoLayer: copy new (empty) registry into IoLayer's shared Arc,
+        // then point the project to use that same Arc so future registrations are visible.
+        self.io_layer.reset_for_new_project(&self.project.sources);
+        self.project.sources = self.io_layer.source_reg.clone();
         self.current_project_path = None;
         self.history = crate::history::HistoryState::default();
         self.timeline.clear_interaction();
@@ -626,8 +630,12 @@ impl NexirApp {
 
         if let Some(path) = file {
             match ProjectFile::load(&path) {
-                Ok(project) => {
+                Ok(mut project) => {
                     self.stop_audio();
+                    // Sync IoLayer: copy loaded registry into IoLayer's shared Arc,
+                    // then point the project to use that same Arc.
+                    self.io_layer.reset_for_new_project(&project.sources);
+                    project.sources = self.io_layer.source_reg.clone();
                     self.project = project;
                     self.current_project_path = Some(path);
                     self.history = crate::history::HistoryState::default();

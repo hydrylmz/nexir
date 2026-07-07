@@ -678,7 +678,10 @@ pub fn draw(
                         let clip_name = sources.path(source_id)
                             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                             .unwrap_or_else(|| format!("Clip {}", idx));
-                        ui.painter().text(
+                        
+                        let text_clip_rect = clip_rect.shrink(2.0); // Slight padding
+                        let clipped_painter = ui.painter().with_clip_rect(text_clip_rect);
+                        clipped_painter.text(
                             clip_rect.min + egui::vec2(5.0, clip_rect.height() * 0.5),
                             Align2::LEFT_CENTER,
                             clip_name,

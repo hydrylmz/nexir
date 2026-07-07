@@ -189,7 +189,7 @@ impl ExportEngine {
         use crate::io::ffi::avutil::AVERROR_EOF;
 
         // Collect clips with audio that overlap the export range, sorted by timeline position
-        let clip_list: Vec<(crate::timeline::ids::SourceId, i64, i64, i64)> = {
+        let clip_list: Vec<(crate::timeline::ids::SourceId, i64, i64, i64, f32)> = {
             let store = timeline.read().unwrap();
             let srcs  = sources.read().unwrap();
             let n = store.len();
@@ -199,6 +199,7 @@ impl ExportEngine {
                 let t_out = store.pts_out_at(i);
                 let src   = store.source_id_at(i);
                 let s_in  = store.source_in_at(i);
+                let speed = store.speed_at(i);
                 // Skip clips outside export range
                 if t_out <= job.pts_in || t_in >= job.pts_out {
                     continue;
@@ -207,10 +208,10 @@ impl ExportEngine {
                 if srcs.audio_info(src).is_err() {
                     continue;
                 }
-                clips.push((src, t_in, t_out, s_in));
+                clips.push((src, t_in, t_out, s_in, speed));
             }
             // Sort by timeline in-point
-            clips.sort_by_key(|&(_, t_in, _, _)| t_in);
+            clips.sort_by_key(|&(_, t_in, _, _, _)| t_in);
             clips
         };
 
@@ -230,7 +231,7 @@ impl ExportEngine {
         let mut swr_left:  Vec<f32> = vec![0.0; swr_out_capacity];
         let mut swr_right: Vec<f32> = vec![0.0; swr_out_capacity];
 
-        for (src_id, clip_t_in, clip_t_out, src_material_in) in clip_list {
+        for (src_id, clip_t_in, clip_t_out, src_material_in, speed) in clip_list {
             let path = {
                 let srcs = sources.read().unwrap();
                 match srcs.path(src_id) {
@@ -255,7 +256,7 @@ impl ExportEngine {
             };
 
             // Set up SwrContext for this source
-            let (in_ch_layout, in_sample_fmt, in_sample_rate) = unsafe {
+            let (in_ch_layout, in_sample_fmt, mut in_sample_rate) = unsafe {
                 let ctx = decoder.ctx();
                 let sr   = avcodec_ctx_get_sample_rate(ctx);
                 let mut cl = avcodec_ctx_get_channel_layout(ctx);
@@ -266,6 +267,9 @@ impl ExportEngine {
                 }
                 (cl as i64, fmt as i32, sr as i32)
             };
+
+            // Adjust input sample rate to stretch/squash the audio according to speed
+            in_sample_rate = (in_sample_rate as f32 * speed).round() as i32;
 
             let swr = unsafe {
                 let s = swr_alloc_set_opts(
@@ -290,8 +294,8 @@ impl ExportEngine {
             let eff_t_out = clip_t_out.min(job.pts_out);
 
             // Translate effective timeline range to source material range (90 kHz project TB)
-            let src_seek_pts   = src_material_in + (eff_t_in  - clip_t_in);
-            let src_end_pts    = src_material_in + (eff_t_out - clip_t_in);
+            let src_seek_pts   = src_material_in + ((eff_t_in  - clip_t_in) as f64 * speed as f64).round() as i64;
+            let src_end_pts    = src_material_in + ((eff_t_out - clip_t_in) as f64 * speed as f64).round() as i64;
 
             // Seek demuxer to just before the start of required audio
             let _ = demuxer.seek(src_seek_pts, job.project_tb);
