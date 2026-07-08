@@ -16,6 +16,8 @@ pub mod swscale_ffi {
     #[repr(C)] pub struct SwsContext { _opaque: [u8; 0] }
 
     extern "C" {
+        pub fn get_av_pix_fmt_rgbaf16le() -> std::ffi::c_int;
+
         pub fn sws_getContext(
             srcW: std::ffi::c_int, srcH: std::ffi::c_int, srcFormat: std::ffi::c_int,
             dstW: std::ffi::c_int, dstH: std::ffi::c_int, dstFormat: std::ffi::c_int,
@@ -40,10 +42,6 @@ pub mod swscale_ffi {
 
     pub const AV_PIX_FMT_RGBA:       i32 = 26;
     pub const AV_PIX_FMT_RGBA64:     i32 = 105;
-    /// IEEE-754 half-precision packed RGBA 16:16:16:16 little-endian.
-    /// Matches wgpu::TextureFormat::Rgba16Float readback byte layout exactly —
-    /// allows skipping the per-frame rgba16_to_rgba8 CPU conversion entirely.
-    pub const AV_PIX_FMT_RGBAF16LE:  i32 = 162;
     pub const SWS_BILINEAR:          i32 = 4;
 }
 
@@ -138,18 +136,9 @@ impl VideoEncoder {
             av_frame_set_format(yuv_frame, out_pix_fmt);
 
             // Prefer RGBAF16LE so the GPU readback bytes can be fed to sws_scale
-            // without any CPU-side conversion (rgba16_to_rgba8 is eliminated).
-            // If the runtime swscale build doesn't know RGBAF16LE, fall back to
-            // RGBA (8-bit) and keep the conversion path.
-            let sws_src_fmt = swscale_ffi::AV_PIX_FMT_RGBAF16LE;
-            let sws = swscale_ffi::sws_getContext(
-                job.width as i32, job.height as i32, sws_src_fmt,
-                job.width as i32, job.height as i32, out_pix_fmt,
-                swscale_ffi::SWS_BILINEAR,
-                std::ptr::null(), std::ptr::null(), std::ptr::null()
-            );
-            // If RGBAF16LE isn't available, fall back to RGBA8 (conversion done on encode).
-            let (sws, sws_use_f16) = if sws.is_null() {
+            // without any CPU-side conversion.
+            let sws_src_fmt = swscale_ffi::get_av_pix_fmt_rgbaf16le();
+            let (sws, sws_use_f16) = if sws_src_fmt == -1 {
                 let fallback = swscale_ffi::sws_getContext(
                     job.width as i32, job.height as i32, swscale_ffi::AV_PIX_FMT_RGBA,
                     job.width as i32, job.height as i32, out_pix_fmt,
@@ -158,7 +147,23 @@ impl VideoEncoder {
                 );
                 (fallback, false)
             } else {
-                (sws, true)
+                let sws = swscale_ffi::sws_getContext(
+                    job.width as i32, job.height as i32, sws_src_fmt,
+                    job.width as i32, job.height as i32, out_pix_fmt,
+                    swscale_ffi::SWS_BILINEAR,
+                    std::ptr::null(), std::ptr::null(), std::ptr::null()
+                );
+                if sws.is_null() {
+                    let fallback = swscale_ffi::sws_getContext(
+                        job.width as i32, job.height as i32, swscale_ffi::AV_PIX_FMT_RGBA,
+                        job.width as i32, job.height as i32, out_pix_fmt,
+                        swscale_ffi::SWS_BILINEAR,
+                        std::ptr::null(), std::ptr::null(), std::ptr::null()
+                    );
+                    (fallback, false)
+                } else {
+                    (sws, true)
+                }
             };
 
             let packet = av_packet_alloc();

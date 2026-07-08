@@ -17,6 +17,69 @@ pub struct GpuDevice {
 }
 
 impl GpuDevice {
+    fn select_best_adapter(
+        instance: &wgpu::Instance,
+        compatible_surface: Option<&wgpu::Surface<'_>>,
+    ) -> Option<wgpu::Adapter> {
+        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+        for adapter in &adapters {
+            let info = adapter.get_info();
+            log::info!("Found GPU Adapter: {} (Vendor: 0x{:X}, Backend: {:?})", info.name, info.vendor, info.backend);
+        }
+
+        let mut chosen_idx = None;
+
+        // Pass 1: NVIDIA + Preferred backend (Dx12 on Windows, Vulkan on Linux)
+        for (i, adapter) in adapters.iter().enumerate() {
+            let info = adapter.get_info();
+            if info.vendor == 0x10DE {
+                let is_preferred = if cfg!(target_os = "windows") {
+                    info.backend == wgpu::Backend::Dx12
+                } else if cfg!(target_os = "linux") {
+                    info.backend == wgpu::Backend::Vulkan
+                } else {
+                    true
+                };
+                if is_preferred {
+                    if let Some(surf) = compatible_surface {
+                        if adapter.is_surface_supported(surf) {
+                            chosen_idx = Some(i);
+                            break;
+                        }
+                    } else {
+                        chosen_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Pass 2: NVIDIA + Any backend
+        if chosen_idx.is_none() {
+            for (i, adapter) in adapters.iter().enumerate() {
+                let info = adapter.get_info();
+                if info.vendor == 0x10DE {
+                    if let Some(surf) = compatible_surface {
+                        if adapter.is_surface_supported(surf) {
+                            chosen_idx = Some(i);
+                            break;
+                        }
+                    } else {
+                        chosen_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(idx) = chosen_idx {
+            let mut adapters_mut = adapters;
+            return Some(adapters_mut.remove(idx));
+        }
+
+        None
+    }
+
     /// Create a GpuDevice without any window (for headless/test use).
     pub async fn new_headless() -> Result<Self, DeviceError> {
         // Step 1: Create wgpu instance
@@ -25,16 +88,8 @@ impl GpuDevice {
             ..Default::default()
         });
 
-        // Step 2: Request adapter (Prefer NVIDIA)
-        let mut chosen_adapter = None;
-        for adapter in instance.enumerate_adapters(wgpu::Backends::all()) {
-            let info = adapter.get_info();
-            log::info!("Found GPU Adapter: {} (Vendor: 0x{:X})", info.name, info.vendor);
-            if info.vendor == 0x10DE {
-                chosen_adapter = Some(adapter);
-                break;
-            }
-        }
+        // Step 2: Request adapter
+        let chosen_adapter = Self::select_best_adapter(&instance, None);
 
         let adapter = match chosen_adapter {
             Some(a) => a,
@@ -45,7 +100,7 @@ impl GpuDevice {
             }).await.ok_or(DeviceError::NoAdapter)?
         };
 
-        log::info!("Selected GPU Adapter: {} (Vendor: 0x{:X})", adapter.get_info().name, adapter.get_info().vendor);
+        log::info!("Selected GPU Adapter: {} (Vendor: 0x{:X}, Backend: {:?})", adapter.get_info().name, adapter.get_info().vendor, adapter.get_info().backend);
 
         // Step 3: Request device and queue
         let (device, queue) = adapter.request_device(
@@ -98,16 +153,7 @@ impl GpuDevice {
         // so we can request an adapter compatible with this surface.
         let surface = instance.create_surface(target).map_err(|_| DeviceError::SurfaceIncompatible)?;
 
-        let mut chosen_adapter = None;
-        for adapter in instance.enumerate_adapters(wgpu::Backends::all()) {
-            let info = adapter.get_info();
-            log::info!("Found GPU Adapter: {} (Vendor: 0x{:X})", info.name, info.vendor);
-            // In wgpu, check if adapter is compatible with surface
-            if info.vendor == 0x10DE {
-                chosen_adapter = Some(adapter);
-                break;
-            }
-        }
+        let chosen_adapter = Self::select_best_adapter(&instance, Some(&surface));
 
         let adapter = match chosen_adapter {
             Some(a) => a,
@@ -118,7 +164,7 @@ impl GpuDevice {
             }).await.ok_or(DeviceError::NoAdapter)?
         };
 
-        log::info!("Selected GPU Adapter: {} (Vendor: 0x{:X})", adapter.get_info().name, adapter.get_info().vendor);
+        log::info!("Selected GPU Adapter: {} (Vendor: 0x{:X}, Backend: {:?})", adapter.get_info().name, adapter.get_info().vendor, adapter.get_info().backend);
 
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {

@@ -3,6 +3,15 @@
 #include <libavformat/avformat.h>
 #include <libswresample/swresample.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/pixfmt.h>
+
+int get_av_pix_fmt_rgbaf16le() {
+#ifdef AV_PIX_FMT_RGBAF16LE
+    return AV_PIX_FMT_RGBAF16LE;
+#else
+    return -1;
+#endif
+}
 
 void avcodec_ctx_set_time_base(AVCodecContext* ctx, AVRational tb) { ctx->time_base = tb; }
 void avcodec_ctx_set_flags(AVCodecContext* ctx, int flags) { ctx->flags |= flags; }
