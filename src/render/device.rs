@@ -80,11 +80,26 @@ impl GpuDevice {
         None
     }
 
+    /// The preferred wgpu backend for this OS.
+    /// On Windows we force DX12 because CUDA/NVENC interop uses D3D12Win32Handle —
+    /// a Vulkan surface cannot be shared with a DX12 CUDA interop context.
+    /// On Linux Vulkan is preferred for the same reason (VkExternalMemoryFd).
+    fn preferred_backends() -> wgpu::Backends {
+        if cfg!(target_os = "windows") {
+            wgpu::Backends::DX12
+        } else if cfg!(target_os = "linux") {
+            wgpu::Backends::VULKAN
+        } else {
+            wgpu::Backends::all()
+        }
+    }
+
     /// Create a GpuDevice without any window (for headless/test use).
     pub async fn new_headless() -> Result<Self, DeviceError> {
-        // Step 1: Create wgpu instance
+        // Step 1: Create wgpu instance — use the OS-preferred backend so that
+        // CUDA/NVENC interop works (DX12 on Windows, Vulkan on Linux).
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: Self::preferred_backends(),
             ..Default::default()
         });
 
@@ -145,7 +160,9 @@ impl GpuDevice {
         window_height: u32,
     ) -> Result<(Self, wgpu::Surface<'window>), DeviceError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            // Use OS-preferred backend so the surface and adapter share the same
+            // backend, enabling CUDA/NVENC interop (DX12 on Windows).
+            backends: Self::preferred_backends(),
             ..Default::default()
         });
 

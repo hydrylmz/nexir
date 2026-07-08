@@ -89,13 +89,18 @@ impl VideoEncoder {
 
             match job.quality {
                 VideoQuality::Crf(crf) => {
+                    // IMPORTANT: set preset BEFORE crf — libx264 resets its parameters
+                    // (including crf) when the preset is applied, so preset must come first.
+                    let preset_str = job.cpu_preset.as_str();
+                    let preset_val = std::ffi::CString::new(preset_str).unwrap();
+                    let preset_key = std::ffi::CString::new("preset").unwrap();
+                    let preset_ret = av_opt_set(ctx as *mut _, preset_key.as_ptr(), preset_val.as_ptr(), 1);
+                    log::info!("[encoder] x264 preset='{}' av_opt_set returned {}", preset_str, preset_ret);
+
                     let crf_str = std::ffi::CString::new(crf.to_string()).unwrap();
                     let crf_key = std::ffi::CString::new("crf").unwrap();
-                    av_opt_set(ctx as *mut _, crf_key.as_ptr(), crf_str.as_ptr(), 1);
-                    
-                    let preset_val = std::ffi::CString::new(job.cpu_preset.as_str()).unwrap();
-                    let preset_key = std::ffi::CString::new("preset").unwrap();
-                    av_opt_set(ctx as *mut _, preset_key.as_ptr(), preset_val.as_ptr(), 1);
+                    let crf_ret = av_opt_set(ctx as *mut _, crf_key.as_ptr(), crf_str.as_ptr(), 1);
+                    log::info!("[encoder] x264 crf={} av_opt_set returned {}", crf, crf_ret);
                 }
                 VideoQuality::TargetBitrate(bps) => {
                     avcodec_ctx_set_bit_rate(ctx, bps as i64);
