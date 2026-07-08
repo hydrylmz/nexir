@@ -1,5 +1,5 @@
 
-use crate::export::job::{ExportJob, VideoQuality, Container};
+use crate::export::job::{ExportJob, VideoQuality, Container, VideoCodec};
 use crate::export::renderer::RawFrame;
 use crate::export::ffi::encoder_ffi::*;
 use crate::io::ffi::avcodec::{
@@ -270,10 +270,16 @@ pub enum EncodeError {
 pub enum VideoEncoderBackend {
     /// Phase 6 path: CPU readback → sws_scale → libx264/libx265/ProRes via FFmpeg.
     /// Used when CUDA interop is unavailable, OR the job's codec is not H.264/HEVC
-    /// (NVENC in Phase 7 scope only covers H.264; ProRes/VP9 always use this path).
+    /// (NVENC in Phase 7 scope only covers H.264/HEVC; ProRes/VP9 always use this path).
     FfmpegCpu(VideoEncoder),
     /// Phase 7 path: zero-copy CUDA/NVENC — RTT texture → ABGR10 repack → NVENC.
-    CudaNvenc(crate::interop::encode_interop::EncodeInterop),
+    /// `param_enc` is a minimal libx264 context opened solely to provide
+    /// `AVCodecContext` parameters for `Muxer::open` stream header setup.
+    /// It performs no actual encoding.
+    CudaNvenc {
+        enc:       crate::interop::encode_interop::EncodeInterop,
+        param_enc: VideoEncoder,
+    },
 }
 
 impl VideoEncoderBackend {
@@ -287,18 +293,27 @@ impl VideoEncoderBackend {
         cuda_ctx:   Option<&crate::interop::cuda_context::CudaContext>,
         device:     &crate::render::device::GpuDevice,
     ) -> Result<Self, EncodeError> {
-        if capability.is_available()
-            && job.video_codec == crate::export::job::VideoCodec::H264
-        {
+        // NVENC supports H.264 and HEVC (H.265). ProRes and VP9 always use the
+        // software FFmpeg path since NVENC doesn't meaningfully accelerate them.
+        let nvenc_eligible = matches!(
+            job.video_codec,
+            VideoCodec::H264 | VideoCodec::H265,
+        );
+        if capability.is_available() && nvenc_eligible {
             if let Some(ctx) = cuda_ctx {
                 let enc = crate::interop::encode_interop::EncodeInterop::open(
                     ctx,
                     device,
                     job,
                     capability.transport,
+                    job.video_codec,
                 )
                 .map_err(|e| EncodeError::Interop(format!("{:?}", e)))?;
-                return Ok(Self::CudaNvenc(enc));
+                // Open a minimal CPU encoder solely to supply AVCodecContext
+                // parameters to Muxer::open (stream header setup). No frames
+                // will be encoded through it.
+                let param_enc = VideoEncoder::open(job)?;
+                return Ok(Self::CudaNvenc { enc, param_enc });
             }
         }
         // Fallback: Phase 6 FFmpeg encoder, unchanged.
@@ -320,7 +335,7 @@ impl VideoEncoderBackend {
         match self {
             Self::FfmpegCpu(enc) => enc.encode_frame(frame, packet_sink),
 
-            Self::CudaNvenc(enc) => {
+            Self::CudaNvenc { enc, .. } => {
                 // Encode via NVENC directly.
                 let (bytes, pts) = enc.encode_frame(frame.pts)
                     .map_err(|e| EncodeError::Interop(format!("{:?}", e)))?;
@@ -365,8 +380,30 @@ impl VideoEncoderBackend {
         packet_sink: &mut dyn FnMut(*mut crate::io::ffi::avutil::AVPacket),
     ) -> Result<(), EncodeError> {
         match self {
-            Self::FfmpegCpu(enc)  => enc.flush(packet_sink),
-            Self::CudaNvenc(_enc) => Ok(()), // NVENC flushes implicitly on session destroy
+            Self::FfmpegCpu(enc)              => enc.flush(packet_sink),
+            Self::CudaNvenc { .. }            => Ok(()), // NVENC flushes implicitly on session destroy
+        }
+    }
+
+    /// Returns a raw pointer to the `AVCodecContext` for use by `Muxer::open`
+    /// when writing stream header parameters (codec_id, width, height, extradata).
+    ///
+    /// For `FfmpegCpu` this is the live encoder context.
+    /// For `CudaNvenc` this delegates to the `param_enc` minimal FFmpeg context
+    /// that was opened alongside the NVENC session purely for this purpose.
+    /// The muxer copies the parameters immediately via `avcodec_parameters_from_context`
+    /// and never stores the raw pointer beyond `Muxer::open`.
+    pub fn codec_ctx(&self) -> *const crate::io::ffi::avcodec::AVCodecContext {
+        match self {
+            Self::FfmpegCpu(enc)              => enc.codec_ctx(),
+            Self::CudaNvenc { param_enc, .. } => param_enc.codec_ctx(),
+        }
+    }
+
+    pub fn nvenc_interop(&self) -> Option<&crate::interop::encode_interop::EncodeInterop> {
+        match self {
+            Self::CudaNvenc { enc, .. } => Some(enc),
+            _ => None,
         }
     }
 }

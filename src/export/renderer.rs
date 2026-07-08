@@ -18,6 +18,20 @@ use crate::export::progress::{ProgressSender, ExportPhase};
 use crate::render::shader::registry::ShaderRegistry;
 use crate::render::compute::ComputePipelineCache;
 use crate::render::frame_state::FrameState;
+use crate::export::video_encoder::VideoEncoderBackend;
+use crate::export::muxer::Muxer;
+use crate::interop::encode_interop::Abgr10RepackNode;
+
+pub enum ExportBackend {
+    Cpu {
+        readback: FrameReadback,
+    },
+    GpuNvenc {
+        video_enc: VideoEncoderBackend,
+        muxer:     Arc<Muxer>,
+        repack:    Abgr10RepackNode,
+    },
+}
 
 /// Maximum number of clips composited in a single export frame.
 const MAX_CLIPS: usize = 8;
@@ -35,7 +49,7 @@ struct ClipSignature {
 pub struct ExportRenderer {
     device:         Arc<GpuDevice>,
     scheduler:      Arc<FrameScheduler>,
-    readback:       FrameReadback,
+    pub backend:    ExportBackend,
     job:            Arc<ExportJob>,
     timeline:       Arc<std::sync::RwLock<TimelineStore>>,
     sources:        Arc<std::sync::RwLock<SourceRegistry>>,
@@ -61,17 +75,15 @@ impl ExportRenderer {
         sources:       Arc<std::sync::RwLock<SourceRegistry>>,
         shaders:       Arc<ShaderRegistry>,
         compute_cache: Arc<ComputePipelineCache>,
-    ) -> Result<Self, RenderError> {
+        backend:       ExportBackend,
+    ) -> Self {
         log::info!("[export] ExportRenderer::new — canvas {}x{}, {} total frames",
             job.width, job.height, job.total_frames());
 
-        let readback = FrameReadback::new(&device, job.width, job.height)
-            .map_err(RenderError::ReadbackInit)?;
-
-        Ok(Self {
+        Self {
             device,
             scheduler,
-            readback,
+            backend,
             job,
             timeline,
             sources,
@@ -81,7 +93,7 @@ impl ExportRenderer {
             cached_sig:     Vec::new(),
             upload_indices: Vec::new(),
             frames_done:    0,
-        })
+        }
     }
 
     /// Compute the clip signature for `frame`.
@@ -222,16 +234,93 @@ impl ExportRenderer {
         log::info!("[export] render_segment {} — frames {}..{}",
             segment.index, segment.frame_start, segment.frame_end);
 
-        let mut active_slot   = 0usize;
-        let mut pending_frame: Option<usize> = None;
+        let is_cpu = matches!(self.backend, ExportBackend::Cpu { .. });
 
-        for frame_idx in segment.frame_start..=segment.frame_end {
+        if is_cpu {
+            let mut active_slot   = 0usize;
+            let mut pending_frame: Option<usize> = None;
 
+            for frame_idx in segment.frame_start..=segment.frame_end {
+                // ── Render the current frame ──────────────────────────────────────
+                if frame_idx < segment.frame_end {
+                    let pts = self.job.frame_pts(frame_idx);
 
-            // ── Render the current frame ──────────────────────────────────────
-            if frame_idx < segment.frame_end {
+                    let frame_state = self.scheduler.schedule_frame(
+                        pts,
+                        &self.timeline.read().unwrap(),
+                        &self.sources.read().unwrap(),
+                    );
+
+                    // Recompile graph if clip dimensions changed (or on first frame).
+                    self.ensure_graph(&frame_state)?;
+
+                    // Copy YUV data from slot-pool buffers into wgpu staging buffers.
+                    // This is non-blocking (queue.write_buffer internally) — no GPU stall.
+                    self.upload_frame_data(&frame_state);
+
+                    let mut encoder = self.device.begin_frame();
+                    let rtt_id      = ResourceId::FINAL_COLOR;
+
+                    let graph = self.cached_graph.as_mut().unwrap();
+                    
+                    if let ExportBackend::Cpu { readback } = &mut self.backend {
+                        graph.execute_with_callback(
+                            &mut encoder,
+                            &self.device,
+                            &frame_state,
+                            |enc, ctx| {
+                                let ctx = std::panic::AssertUnwindSafe(ctx);
+                                if let Ok(res) = std::panic::catch_unwind(|| ctx.get(rtt_id)) {
+                                    readback.record_copy(enc, res.texture, active_slot);
+                                } else {
+                                    log::error!("[export] frame {frame_idx}: FINAL_COLOR missing from RenderContext!");
+                                }
+                            },
+                        );
+                    }
+
+                    self.device.submit(encoder);
+
+                    // Non-blocking poll — lets the GPU start without blocking this thread.
+                    self.device.device.poll(wgpu::Maintain::Poll);
+                }
+
+                // ── Read back the previous frame ──────────────────────────────────
+                if let Some(prev_idx) = pending_frame {
+                    let prev_slot = 1 - active_slot;
+
+                    if let ExportBackend::Cpu { readback } = &mut self.backend {
+                        let view = readback.map_read(prev_slot, &self.device)
+                            .map_err(|e| {
+                                log::error!("[export] map_read failed for frame {prev_idx}: {e}");
+                                RenderError::GpuTimeout
+                            })?;
+
+                        let bytes = readback.strip_padding(&view);
+                        drop(view);
+                        readback.unmap(prev_slot);
+
+                        queue.push(QueueItem::Frame(RawFrame {
+                            frame_index: prev_idx,
+                            pts:  self.job.frame_pts(prev_idx),
+                            data: bytes,
+                        }));
+                    }
+
+                    self.frames_done += 1;
+                    progress.report(self.frames_done, ExportPhase::Rendering);
+                }
+
+                active_slot   = 1 - active_slot;
+                pending_frame = if frame_idx < segment.frame_end { Some(frame_idx) } else { None };
+            }
+
+            log::info!("[export] render_segment {} done", segment.index);
+            queue.push(QueueItem::SegmentDone { segment_index: segment.index });
+        } else {
+            // GPU NVENC path
+            for frame_idx in segment.frame_start..segment.frame_end {
                 let pts = self.job.frame_pts(frame_idx);
-
 
                 let frame_state = self.scheduler.schedule_frame(
                     pts,
@@ -239,73 +328,73 @@ impl ExportRenderer {
                     &self.sources.read().unwrap(),
                 );
 
-
                 // Recompile graph if clip dimensions changed (or on first frame).
                 self.ensure_graph(&frame_state)?;
 
                 // Copy YUV data from slot-pool buffers into wgpu staging buffers.
-                // This is non-blocking (queue.write_buffer internally) — no GPU stall.
                 self.upload_frame_data(&frame_state);
-
 
                 let mut encoder = self.device.begin_frame();
                 let rtt_id      = ResourceId::FINAL_COLOR;
 
                 let graph = self.cached_graph.as_mut().unwrap();
-                graph.execute_with_callback(
-                    &mut encoder,
-                    &self.device,
-                    &frame_state,
-                    |enc, ctx| {
-                        let ctx = std::panic::AssertUnwindSafe(ctx);
-                        if let Ok(res) = std::panic::catch_unwind(|| ctx.get(rtt_id)) {
-                            self.readback.record_copy(enc, res.texture, active_slot);
-                        } else {
-                            log::error!("[export] frame {frame_idx}: FINAL_COLOR missing from RenderContext!");
-                        }
-                    },
-                );
+                let width = self.job.width;
+                let height = self.job.height;
+                let device_ref = &self.device;
 
-                self.device.submit(encoder);
+                if let ExportBackend::GpuNvenc { video_enc, repack, muxer } = &mut self.backend {
+                    let interop = video_enc.nvenc_interop().unwrap();
+                    let abgr10_texture = interop.abgr10_texture();
+                    let abgr10_view = abgr10_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+                    graph.execute_with_callback(
+                        &mut encoder,
+                        &self.device,
+                        &frame_state,
+                        |enc, ctx| {
+                            let ctx = std::panic::AssertUnwindSafe(ctx);
+                            if let Ok(res) = std::panic::catch_unwind(|| ctx.get(rtt_id)) {
+                                let in_view = res.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                                repack.record(
+                                    enc,
+                                    device_ref,
+                                    &in_view,
+                                    &abgr10_view,
+                                    width,
+                                    height,
+                                );
+                            } else {
+                                log::error!("[export] frame {frame_idx}: FINAL_COLOR missing from RenderContext!");
+                            }
+                        },
+                    );
 
-                // Non-blocking poll — lets the GPU start without blocking this thread.
-                self.device.device.poll(wgpu::Maintain::Poll);
-            }
+                    self.device.submit(encoder);
+                    
+                    // Wait for GPU execution to complete.
+                    self.device.device.poll(wgpu::Maintain::Wait);
 
-            // ── Read back the previous frame ──────────────────────────────────
-            if let Some(prev_idx) = pending_frame {
-                let prev_slot = 1 - active_slot;
-
-
-                let view = self.readback.map_read(prev_slot, &self.device)
-                    .map_err(|e| {
-                        log::error!("[export] map_read failed for frame {prev_idx}: {e}");
+                    // Encode GPU frame inline
+                    let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
+                        muxer.write_packet(pkt, true).unwrap();
+                    };
+                    let raw_frame = RawFrame {
+                        frame_index: frame_idx,
+                        pts,
+                        data: Vec::new(),
+                    };
+                    video_enc.encode_frame(&raw_frame, &mut sink).map_err(|e| {
+                        log::error!("[export] encode_frame failed: {:?}", e);
                         RenderError::GpuTimeout
                     })?;
-
-                let bytes = self.readback.strip_padding(&view);
-                drop(view);
-                self.readback.unmap(prev_slot);
-
-
-
-                queue.push(QueueItem::Frame(RawFrame {
-                    frame_index: prev_idx,
-                    pts:  self.job.frame_pts(prev_idx),
-                    data: bytes,
-                }));
+                }
 
                 self.frames_done += 1;
                 progress.report(self.frames_done, ExportPhase::Rendering);
             }
 
-            active_slot   = 1 - active_slot;
-            pending_frame = if frame_idx < segment.frame_end { Some(frame_idx) } else { None };
+            log::info!("[export] render_segment {} done (NVENC inline)", segment.index);
         }
-
-        log::info!("[export] render_segment {} done", segment.index);
-        queue.push(QueueItem::SegmentDone { segment_index: segment.index });
 
         Ok(())
     }

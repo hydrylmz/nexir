@@ -195,7 +195,17 @@ impl TimelineStore {
         let old_speed = self.speed[idx];
         if (old_speed - new_speed).abs() > 1e-4 {
             let duration = self.pts_out[idx] - self.pts_in[idx];
-            let new_duration = (duration as f64 * (old_speed as f64 / new_speed as f64)) as i64;
+            let old_speed_scaled = (old_speed * 10_000.0).round() as i64;
+            let new_speed_scaled = (new_speed * 10_000.0).round() as i64;
+            let new_duration = if new_speed_scaled != 0 {
+                let numer = duration as i128 * old_speed_scaled as i128;
+                let den = new_speed_scaled as i128;
+                let scaled = numer;
+                if scaled >= 0 { ((scaled + den / 2) / den) as i64 }
+                else           { ((scaled - den / 2) / den) as i64 }
+            } else {
+                duration
+            };
             self.pts_out[idx] = self.pts_in[idx] + new_duration;
             self.speed[idx] = new_speed;
         }

@@ -6,7 +6,7 @@ use crate::interop::cuda_context::{CudaContext, CudaError};
 use crate::interop::external_texture::ExternalTexture;
 use crate::interop::ffi::nvenc::*;
 use crate::render::device::GpuDevice;
-use crate::export::job::ExportJob;
+use crate::export::job::{ExportJob, VideoCodec};
 
 /// A wgpu compute node that repacks RGBA16Float (already tone-mapped)
 /// into ABGR10 format that NVENC accepts directly.
@@ -173,7 +173,13 @@ const NV_ENC_CODEC_H264_GUID: [u8; 16] = [
     0x62, 0x27, 0xC8, 0x6B, 0x63, 0x4E, 0xa4, 0x4c,
     0xAA, 0x85, 0x1E, 0x50, 0xF3, 0x21, 0xF6, 0xBF,
 ];
+// HEVC GUID: {790CDC88-4522-4d7b-9425-BDA9975F7603}
+const NV_ENC_CODEC_HEVC_GUID: [u8; 16] = [
+    0x88, 0xCD, 0x0C, 0x79, 0x22, 0x45, 0x7B, 0x4d,
+    0x94, 0x25, 0xBD, 0xA9, 0x97, 0x5F, 0x76, 0x03,
+];
 // P4 preset GUID: {FC0A8D3E-45F3-4cf8-878F-7B9A9C7A6A97}
+// Supported for both H.264 and HEVC.
 const NV_ENC_PRESET_P4_GUID: [u8; 16] = [
     0x3E, 0x8D, 0x0A, 0xFC, 0xF3, 0x45, 0xF8, 0x4c,
     0x87, 0x8F, 0x7B, 0x9A, 0x9C, 0x7A, 0x6A, 0x97,
@@ -182,11 +188,15 @@ const NV_ENC_PRESET_P4_GUID: [u8; 16] = [
 impl EncodeInterop {
     /// Open an NVENC session against the shared CUDA context and register the
     /// ABGR10 interop texture as NVENC's input resource.
+    ///
+    /// `codec` controls whether to initialise an H.264 or HEVC session;
+    /// both codecs use the same ABGR10 input format and P4 preset.
     pub fn open(
         cuda_ctx:  &CudaContext,
         device:    &GpuDevice,
         job:       &ExportJob,
         transport: crate::interop::capability::InteropTransport,
+        codec:     VideoCodec,
     ) -> Result<Self, EncodeInteropError> {
         // Step 1 — Load the NVENC function table via the API instance creator.
         // NVENC uses a vtable-style C API: NvEncodeAPICreateInstance fills a
@@ -205,16 +215,44 @@ impl EncodeInterop {
         // using offsets specified by the NVENC SDK header. For this scaffold we demonstrate
         // the pattern; the actual field layout must match nvEncodeAPI.h exactly.
         // We cast to function pointers at the known offsets (pointer-sized slots after version field).
+        // NVENC API Function Table Layout
+        //
+        // NvEncodeAPICreateInstance fills an NV_ENCODE_API_FUNCTION_LIST struct — a
+        // versioned C struct where the first field is a u32 version and all subsequent
+        // fields are function pointers in the order declared in nvEncodeAPI.h (NVENC SDK 12.x).
+        //
+        // The offsets below are SLOT INDICES into the function-pointer array (i.e.,
+        // `*base.add(N)` where `base` is a pointer to the first function-pointer slot
+        // immediately after the u32 version field). They MUST match the field order in
+        // nvEncodeAPI.h exactly:
+        //
+        //   Slot 1  — nvEncOpenEncodeSessionEx
+        //   Slot 2  — nvEncInitializeEncoder
+        //   Slot 8  — nvEncRegisterResource
+        //   Slot 9  — nvEncMapInputResource
+        //   Slot 11 — nvEncEncodePicture
+        //   Slot 14 — nvEncLockBitstream
+        //   Slot 15 — nvEncUnlockBitstream
+        //   Slot 22 — nvEncDestroyEncoder
+        //
+        // ⚠️  SDK VERSION WARNING: These offsets are correct for NVENC SDK API v14,
+        // which ships with CUDA 12.x drivers. If the NV_ENCODE_API_FUNCTION_LIST struct
+        // layout changes in a future major SDK version, these offsets MUST be updated to
+        // match the new nvEncodeAPI.h. Verify against the official NVENC SDK headers.
+        //
+        // A safer long-term approach is to generate Rust bindings directly from
+        // nvEncodeAPI.h via bindgen, which would make field access by name rather than
+        // by raw pointer offset.
         let base = function_list as *const usize;
         let funcs = unsafe {
-            let open_off    = 1usize; // Offset of nvEncOpenEncodeSessionEx
-            let init_off    = 2usize;
-            let reg_off     = 8usize;
-            let map_off     = 9usize;
-            let enc_off     = 11usize;
-            let lock_off    = 14usize;
-            let unlock_off  = 15usize;
-            let destroy_off = 22usize;
+            let open_off    = 1usize; // nvEncOpenEncodeSessionEx
+            let init_off    = 2usize; // nvEncInitializeEncoder
+            let reg_off     = 8usize; // nvEncRegisterResource
+            let map_off     = 9usize; // nvEncMapInputResource
+            let enc_off     = 11usize; // nvEncEncodePicture
+            let lock_off    = 14usize; // nvEncLockBitstream
+            let unlock_off  = 15usize; // nvEncUnlockBitstream
+            let destroy_off = 22usize; // nvEncDestroyEncoder
 
             NvencFunctions {
                 open_session:      std::mem::transmute(*base.add(open_off)),
@@ -243,9 +281,16 @@ impl EncodeInterop {
         }
 
         // Step 3 — Initialise the encoder (codec, preset, dimensions, frame rate).
+        // Select the NVENC codec GUID based on the requested output codec.
+        let encode_guid = match codec {
+            VideoCodec::H265 => NV_ENC_CODEC_HEVC_GUID,
+            _ => NV_ENC_CODEC_H264_GUID, // H264, ProRes, VP9 fall through to H264 GUID
+                                          // (ProRes/VP9 should never reach NVENC path, but
+                                          //  this is a safe default rather than unreachable!())
+        };
         let mut init_params = NvEncInitializeParams {
             version:          NV_ENC_INITIALIZE_PARAMS_VER,
-            encode_guid:      NV_ENC_CODEC_H264_GUID,
+            encode_guid,
             preset_guid:      NV_ENC_PRESET_P4_GUID,
             encode_width:     job.width,
             encode_height:    job.height,

@@ -5,7 +5,7 @@
 #include <libavutil/channel_layout.h>
 
 void avcodec_ctx_set_time_base(AVCodecContext* ctx, AVRational tb) { ctx->time_base = tb; }
-void avcodec_ctx_set_flags(AVCodecContext* ctx, int flags) { ctx->flags = flags; }
+void avcodec_ctx_set_flags(AVCodecContext* ctx, int flags) { ctx->flags |= flags; }
 void avcodec_ctx_set_dimensions(AVCodecContext* ctx, int w, int h) { ctx->width = w; ctx->height = h; }
 void avcodec_ctx_set_pix_fmt(AVCodecContext* ctx, enum AVPixelFormat fmt) { ctx->pix_fmt = fmt; }
 void avcodec_ctx_set_gop_size(AVCodecContext* ctx, int gop) { ctx->gop_size = gop; }
@@ -78,4 +78,21 @@ void av_packet_set_stream_index(AVPacket* pkt, int idx) {
     pkt->stream_index = idx;
 }
 
-
+int avformat_write_header_shim(AVFormatContext *s, AVDictionary **options) {
+    for (int i = 0; i < s->nb_streams; i++) {
+        AVStream* st = s->streams[i];
+        fprintf(stderr, "[shim] Stream %d: codec_type=%d, codec_id=%d, w=%d, h=%d, sr=%d, channels=%d, extradata_size=%d, time_base=%d/%d\n",
+            i, st->codecpar->codec_type, st->codecpar->codec_id,
+            st->codecpar->width, st->codecpar->height,
+            st->codecpar->sample_rate, st->codecpar->ch_layout.nb_channels,
+            st->codecpar->extradata_size,
+            st->time_base.num, st->time_base.den);
+    }
+    int ret = avformat_write_header(s, options);
+    if (ret < 0) {
+        char errbuf[128];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        fprintf(stderr, "[shim] avformat_write_header failed: %d (%s)\n", ret, errbuf);
+    }
+    return ret;
+}

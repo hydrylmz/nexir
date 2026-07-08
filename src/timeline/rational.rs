@@ -14,7 +14,9 @@ impl Rational {
     pub const TIMEBASE_1US: Self = Self { num: 1, den: 1_000_000 };
 
     pub fn new(mut num: i64, mut den: i64) -> Self {
-        let _g = Self::gcd(num.abs(), den.abs());
+        let g = Self::gcd(num.abs(), den.abs());
+        num /= g;
+        den /= g;
         if den < 0 {
             num = -num;
             den = -den;
@@ -92,6 +94,18 @@ impl Rational {
     pub fn to_f64_secs(self) -> f64 {
         self.num as f64 / self.den as f64
     }
+}
+
+/// Scale a PTS offset by a speed factor using integer arithmetic.
+/// `speed` is stored as f32 in the store; we convert to a rational approximation
+/// with a denominator of 10_000 to avoid floating-point round-trip errors.
+pub fn speed_scale_pts(offset: i64, speed: f32) -> i64 {
+    let num = (speed * 10_000.0).round() as i64;
+    let den = 10_000i64;
+    // Round-half-away-from-zero
+    let scaled = offset * num;
+    if scaled >= 0 { (scaled + den / 2) / den }
+    else           { (scaled - den / 2) / den }
 }
 
 impl std::fmt::Display for Rational {

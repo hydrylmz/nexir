@@ -1,3 +1,4 @@
+pub mod export_settings;
 pub mod inspector;
 pub mod media_pool;
 pub mod timeline;

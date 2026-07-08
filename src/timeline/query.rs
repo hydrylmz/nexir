@@ -20,8 +20,7 @@ pub fn query_active(
     for i in 0..boundary {
         if store.pts_out_at(i) > query_pts {
             let offset = query_pts - store.pts_in_at(i);
-            let speed = store.speed_at(i) as f64;
-            let source_pts = (offset as f64 * speed).round() as i64 + store.source_in_at(i);
+            let source_pts = crate::timeline::rational::speed_scale_pts(offset, store.speed_at(i)) + store.source_in_at(i);
             out.push(ActiveClip { store_index: i, source_pts });
         }
     }

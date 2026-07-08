@@ -3,7 +3,7 @@ use crate::export::job::ExportJob;
 use crate::export::partitioner::SegmentPartitioner;
 use crate::export::renderer::ExportRenderer;
 use crate::export::queue::{EncoderQueue, QueueItem};
-use crate::export::video_encoder::VideoEncoder;
+use crate::export::video_encoder::{VideoEncoder, VideoEncoderBackend};
 use crate::export::audio_encoder::AudioMuxEncoder;
 use crate::export::muxer::Muxer;
 use crate::export::progress::{progress_channel, ProgressReceiver, ProgressSender};
@@ -14,24 +14,33 @@ use crate::timeline::store::TimelineStore;
 use crate::timeline::source::SourceRegistry;
 use crate::render::shader::registry::ShaderRegistry;
 use crate::render::compute::ComputePipelineCache;
+use crate::interop::capability::InteropCapability;
+use crate::interop::cuda_context::CudaContext;
+use crate::render::resource::ResourceId;
 
 pub struct ExportEngine {
-    device:     Arc<GpuDevice>,
-    job:        Arc<ExportJob>,
-    scheduler:  Arc<FrameScheduler>,
-    timeline:   Arc<std::sync::RwLock<TimelineStore>>,
-    sources:    Arc<std::sync::RwLock<SourceRegistry>>,
+    device:      Arc<GpuDevice>,
+    job:         Arc<ExportJob>,
+    scheduler:   Arc<FrameScheduler>,
+    timeline:    Arc<std::sync::RwLock<TimelineStore>>,
+    sources:     Arc<std::sync::RwLock<SourceRegistry>>,
+    capability:  InteropCapability,
+    cuda_ctx:    Option<Arc<CudaContext>>,
+    force_cpu:   bool,
 }
 
 impl ExportEngine {
     pub fn new(
-        device:    Arc<GpuDevice>,
-        job:       ExportJob,
-        scheduler: Arc<FrameScheduler>,
-        timeline:  Arc<std::sync::RwLock<TimelineStore>>,
-        sources:   Arc<std::sync::RwLock<SourceRegistry>>,
+        device:     Arc<GpuDevice>,
+        job:        ExportJob,
+        scheduler:  Arc<FrameScheduler>,
+        timeline:   Arc<std::sync::RwLock<TimelineStore>>,
+        sources:    Arc<std::sync::RwLock<SourceRegistry>>,
+        capability: InteropCapability,
+        cuda_ctx:   Option<Arc<CudaContext>>,
+        force_cpu:  bool,
     ) -> Self {
-        Self { device, job: Arc::new(job), scheduler, timeline, sources }
+        Self { device, job: Arc::new(job), scheduler, timeline, sources, capability, cuda_ctx, force_cpu }
     }
 
     pub fn start(
@@ -43,7 +52,24 @@ impl ExportEngine {
 
         let (prog_tx, prog_rx) = progress_channel(self.job.total_frames());
 
-        let video_enc = VideoEncoder::open(&self.job).map_err(ExportError::EncoderOpen)?;
+        // Select NVENC (GPU) or libx264/libx265 (CPU) encoder based on hardware
+        // availability and user preference. force_cpu overrides auto-detection.
+        let video_enc = if self.force_cpu {
+            log::info!("[export] backend: FfmpegCpu (forced by user)");
+            VideoEncoderBackend::FfmpegCpu(VideoEncoder::open(&self.job).map_err(ExportError::EncoderOpen)?)
+        } else {
+            let backend = VideoEncoderBackend::select(
+                &self.job,
+                &self.capability,
+                self.cuda_ctx.as_ref().map(|c| c.as_ref()),
+                &self.device,
+            ).map_err(ExportError::EncoderOpen)?;
+            match &backend {
+                VideoEncoderBackend::CudaNvenc { .. } => log::info!("[export] backend: CudaNvenc (NVENC)"),
+                VideoEncoderBackend::FfmpegCpu(_)     => log::info!("[export] backend: FfmpegCpu (NVENC not available, fallback)"),
+            }
+            backend
+        };
         let audio_enc = AudioMuxEncoder::open(&self.job).map_err(ExportError::EncoderOpen)?;
 
         let enc_video_tb = AVRational { num: self.job.frame_rate.den as i32, den: self.job.frame_rate.num as i32 };
@@ -51,6 +77,26 @@ impl ExportEngine {
 
         let muxer = Arc::new(Muxer::open(&self.job, &video_enc, &audio_enc, enc_video_tb, enc_audio_tb)
             .map_err(ExportError::MuxerOpen)?);
+
+        let is_gpu = matches!(video_enc, VideoEncoderBackend::CudaNvenc { .. });
+        let mut video_enc_opt = Some(video_enc);
+
+        let backend = if is_gpu {
+            let repack = crate::interop::encode_interop::Abgr10RepackNode::new(
+                &self.device,
+                ResourceId::FINAL_COLOR,
+                ResourceId::FINAL_COLOR,
+            );
+            crate::export::renderer::ExportBackend::GpuNvenc {
+                video_enc: video_enc_opt.take().unwrap(),
+                muxer: Arc::clone(&muxer),
+                repack,
+            }
+        } else {
+            let readback = crate::export::readback::FrameReadback::new(&self.device, self.job.width, self.job.height)
+                .map_err(|e| ExportError::EncoderOpen(crate::export::video_encoder::EncodeError::Interop(e)))?;
+            crate::export::renderer::ExportBackend::Cpu { readback }
+        };
 
         let queue = Arc::new(EncoderQueue::new());
         let timeline_clone = Arc::clone(&self.timeline);
@@ -64,12 +110,15 @@ impl ExportEngine {
         let shaders_clone = Arc::clone(&shaders);
         let compute_cache_clone = Arc::clone(&compute_cache);
 
-        // Spawn encoder thread (video)
-        let prog_tx_enc = prog_tx.clone();
-        let muxer_for_video = Arc::clone(&muxer);
-        std::thread::Builder::new().name("ve-encoder".into()).spawn(move || {
-            Self::encoder_thread(queue_clone, video_enc, muxer_for_video, prog_tx_enc);
-        }).map_err(ExportError::ThreadSpawn)?;
+        // Spawn encoder thread (video) if FfmpegCpu is active
+        if !is_gpu {
+            let video_enc = video_enc_opt.take().unwrap();
+            let prog_tx_enc = prog_tx.clone();
+            let muxer_for_video = Arc::clone(&muxer);
+            std::thread::Builder::new().name("ve-encoder".into()).spawn(move || {
+                Self::encoder_thread(queue_clone, video_enc, muxer_for_video, prog_tx_enc);
+            }).map_err(ExportError::ThreadSpawn)?;
+        }
 
         // Spawn audio encode thread — decodes audio from source clips and muxes it.
         let job_clone2       = Arc::clone(&self.job);
@@ -81,11 +130,14 @@ impl ExportEngine {
         }).map_err(ExportError::ThreadSpawn)?;
 
         // Spawn render/dispatch thread
+        let muxer_for_dispatch = Arc::clone(&muxer);
         std::thread::Builder::new().name("ve-export-dispatch".into()).spawn(move || {
             log::info!("[export] dispatch thread started, {} segment(s)", segments.len());
 
             // Keep a clone for the panic-recovery path (the inner `move` closure owns `queue`).
             let queue_err = Arc::clone(&queue);
+            let is_gpu_thread = is_gpu;
+            let muxer_for_dispatch_clone = Arc::clone(&muxer_for_dispatch);
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 let mut renderer = ExportRenderer::new(
@@ -96,7 +148,8 @@ impl ExportEngine {
                     Arc::clone(&sources_clone),
                     shaders_clone,
                     compute_cache_clone,
-                ).expect("ExportRenderer::new failed");
+                    backend,
+                );
 
                 for (i, seg) in segments.iter().enumerate() {
                     log::info!("[export] starting segment {i}/{}", segments.len());
@@ -106,6 +159,24 @@ impl ExportEngine {
                 }
                 queue.push(QueueItem::AllDone);
                 log::info!("[export] dispatch thread finished — AllDone sent");
+
+                if is_gpu_thread {
+                    // Flush the video encoder (NVENC EOS flush)
+                    if let crate::export::renderer::ExportBackend::GpuNvenc { ref mut video_enc, .. } = renderer.backend {
+                        let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
+                            muxer_for_dispatch_clone.write_packet(pkt, true).unwrap();
+                        };
+                        video_enc.flush(&mut sink).unwrap();
+                    }
+
+                    // Spin-wait until audio thread finishes and drops its Arc<Muxer>
+                    while Arc::strong_count(&muxer_for_dispatch_clone) > 1 {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    if let Ok(m) = Arc::try_unwrap(muxer_for_dispatch_clone) {
+                        m.finalise().unwrap();
+                    }
+                }
             }));
 
             if let Err(e) = result {
@@ -126,10 +197,10 @@ impl ExportEngine {
     }
 
     fn encoder_thread(
-        queue:     Arc<EncoderQueue>,
-        mut video_enc: VideoEncoder,
-        muxer:     Arc<Muxer>,
-        prog_tx:   ProgressSender,
+        queue:         Arc<EncoderQueue>,
+        mut video_enc: VideoEncoderBackend,
+        muxer:         Arc<Muxer>,
+        prog_tx:       ProgressSender,
     ) {
         use crate::export::progress::ExportPhase;
         let mut frames_encoded = 0;
@@ -294,8 +365,8 @@ impl ExportEngine {
             let eff_t_out = clip_t_out.min(job.pts_out);
 
             // Translate effective timeline range to source material range (90 kHz project TB)
-            let src_seek_pts   = src_material_in + ((eff_t_in  - clip_t_in) as f64 * speed as f64).round() as i64;
-            let src_end_pts    = src_material_in + ((eff_t_out - clip_t_in) as f64 * speed as f64).round() as i64;
+            let src_seek_pts   = src_material_in + crate::timeline::rational::speed_scale_pts(eff_t_in - clip_t_in, speed);
+            let src_end_pts    = src_material_in + crate::timeline::rational::speed_scale_pts(eff_t_out - clip_t_in, speed);
 
             // Seek demuxer to just before the start of required audio
             let _ = demuxer.seek(src_seek_pts, job.project_tb);

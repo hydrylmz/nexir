@@ -2,6 +2,7 @@ use std::sync::Mutex;
 use std::ffi::CString;
 use crate::export::job::ExportJob;
 use crate::export::ffi::muxer_ffi::*;
+use crate::export::video_encoder::VideoEncoderBackend;
 use crate::io::ffi::avutil::{AVPacket, AVRational, av_packet_set_stream_index};
 use crate::io::ffi::avformat::{AVFormatContext, avformat_get_stream, avstream_get_time_base};
 
@@ -23,7 +24,7 @@ unsafe impl Sync for Muxer {}
 impl Muxer {
     pub fn open(
         job:           &ExportJob,
-        video_encoder: &crate::export::video_encoder::VideoEncoder,
+        video_encoder: &VideoEncoderBackend,
         audio_encoder: &crate::export::audio_encoder::AudioMuxEncoder,
         video_tb:      AVRational,
         audio_tb:      AVRational,
@@ -64,9 +65,9 @@ impl Muxer {
                 return Err(MuxError::OpenFile("Failed to open avio".into()));
             }
 
-            let ret = avformat_write_header(ctx, std::ptr::null_mut());
+            let ret = crate::export::ffi::muxer_ffi::avformat_write_header_shim(ctx, std::ptr::null_mut());
             if ret < 0 {
-                return Err(MuxError::WriteHeader("Failed to write header".into()));
+                return Err(MuxError::WriteHeader(format!("Failed to write header: error {}", ret)));
             }
 
             if job.container == crate::export::job::Container::Mp4 {

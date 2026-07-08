@@ -24,7 +24,7 @@ extern "C" {
 
     pub fn avstream_set_time_base(stream: *mut AVStream, tb: AVRational);
 
-    pub fn avformat_write_header(
+    pub fn avformat_write_header_shim(
         s:       *mut AVFormatContext,
         options: *mut *mut AVDictionary,
     ) -> std::ffi::c_int;

@@ -1,2 +1,2 @@
-﻿[build]
-rustflags = ["-C", "link-arg=/DELAYLOAD:cuda.dll", "-C", "link-arg=/DELAYLOAD:nvEncodeAPI64.dll", "-C", "link-arg=delayimp.lib"]
+[build]
+rustflags = ["-C", "link-arg=/DELAYLOAD:cuda.dll", "-C", "link-arg=/DELAYLOAD:nvEncodeAPI64.dll", "-C", "link-arg=/DELAYLOAD:nvenc.dll", "-C", "link-arg=delayimp.lib"]

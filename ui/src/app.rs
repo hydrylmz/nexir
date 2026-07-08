@@ -33,6 +33,9 @@ use nexir::render::nodes::yuv_upload::YuvUploadNode;
 use nexir::render::nodes::composite::CompositeNode;
 use nexir::render::resource::ResourceId;
 use nexir::export::progress::ProgressReceiver;
+use nexir::interop::capability::InteropCapability;
+use nexir::interop::cuda_context::CudaContext;
+use crate::layout::export_settings::ExportSettings;
 
 pub struct PreviewState {
     pub texture:      Option<wgpu::Texture>,
@@ -91,6 +94,11 @@ pub struct NexirApp {
     export_progress: Option<ProgressReceiver>,
     export_status: Option<String>,
     export_progress_pct: f32,
+    export_settings_open: bool,
+    export_pending_path: Option<PathBuf>,
+    export_settings: ExportSettings,
+    interop_capability: InteropCapability,
+    cuda_ctx: Option<Arc<CudaContext>>,
 }
 
 pub struct AppResponse {
@@ -201,6 +209,8 @@ impl NexirApp {
             Arc::clone(&audio_clock),
         ).map_err(|e| eprintln!("[audio] Failed to open output: {:?}", e)).ok();
 
+        let interop_capability = InteropCapability::probe(&device);
+
         Self {
             egui_ctx,
             egui_state,
@@ -236,6 +246,11 @@ impl NexirApp {
             export_progress: None,
             export_status: None,
             export_progress_pct: 0.0,
+            export_settings_open: false,
+            export_pending_path: None,
+            export_settings: ExportSettings::default(),
+            interop_capability,
+            cuda_ctx: None,
         }
     }
 
@@ -299,7 +314,7 @@ impl NexirApp {
                     self.save_project_as();
                 }
                 crate::layout::top_bar::TopBarAction::Export => {
-                    self.start_export();
+                    self.open_export_settings();
                 }
             }
         }
@@ -585,6 +600,21 @@ impl NexirApp {
                     }
                 });
         }
+        // ── Export settings panel ────────────────────────────────────────────
+        if self.export_settings_open {
+            if let Some(ref path) = self.export_pending_path.clone() {
+                let do_export = crate::layout::export_settings::draw(
+                    &self.egui_ctx,
+                    &mut self.export_settings_open,
+                    &mut self.export_settings,
+                    &self.interop_capability,
+                    path,
+                );
+                if do_export {
+                    self.start_export();
+                }
+            }
+        }
 
         viewport_size
     }
@@ -747,26 +777,34 @@ impl NexirApp {
         Ok((graph, Vec::new(), ResourceId::FINAL_COLOR))
     }
 
+    fn open_export_settings(&mut self) {
+        let file = rfd::FileDialog::new()
+            .add_filter("Video Files", &["mp4", "mkv", "mov"])
+            .set_title("Export Video")
+            .save_file();
+
+        if let Some(path) = file {
+            self.export_pending_path = Some(path);
+            self.export_settings_open = true;
+        }
+    }
+
     /// Open a save dialog and start an export job.
     fn start_export(&mut self) {
         use nexir::export::engine::ExportEngine;
         use nexir::export::job::ExportJob;
 
-        let file = rfd::FileDialog::new()
-            .add_filter("MP4 Video", &["mp4"])
-            .set_title("Export Video")
-            .save_file();
-
-        let path = match file {
-            Some(p) => {
-                let p = if p.extension().map_or(true, |ext| ext != "mp4") {
-                    p.with_extension("mp4")
-                } else {
-                    p
-                };
-                p
-            }
+        let path = match self.export_pending_path.take() {
+            Some(p) => p,
             None => return,
+        };
+
+        // Ensure the path extension matches the container format from export_settings.
+        let ext = self.export_settings.container.format_name();
+        let path = if path.extension().map_or(true, |e| e != ext) {
+            path.with_extension(ext)
+        } else {
+            path
         };
 
         // Build export job from current project state
@@ -776,9 +814,33 @@ impl NexirApp {
         let width = 1920;
         let height = 1080;
 
-        let job = ExportJob::preset_web_h264(
-            path, 0, total_duration, width, height, fps, project_tb,
-        );
+        let job = ExportJob {
+            output_path: path,
+            container: self.export_settings.container,
+            video_codec: self.export_settings.video_codec,
+            audio_codec: self.export_settings.audio_codec,
+            quality: self.export_settings.video_quality(),
+            audio_bitrate: 192_000,
+            pts_in: 0,
+            pts_out: total_duration,
+            width,
+            height,
+            frame_rate: fps,
+            project_tb,
+            render_threads: num_cpus::get().max(2) / 2,
+        };
+
+        // NOTE (Encode Interop): Prepare CudaContext if hardware interop is available and not forced to CPU.
+        // This enables the zero-copy GPU path (wgpu -> CUDA -> NVENC), drastically improving export speed
+        // by avoiding CPU memory readbacks and providing hardware HEVC/H.264 encode capabilities.
+        let cuda_ctx = if self.interop_capability.is_available() && !self.export_settings.force_cpu {
+            if self.cuda_ctx.is_none() {
+                self.cuda_ctx = CudaContext::new(&self.interop_capability).ok().map(Arc::new);
+            }
+            self.cuda_ctx.clone()
+        } else {
+            None
+        };
 
         // Build a completely fresh IoLayer for export — no shared demuxer/decoder
         // state with the live playback path. The prefetch channel receiver is
@@ -802,6 +864,9 @@ impl NexirApp {
             export_scheduler,
             Arc::new(std::sync::RwLock::new(self.project.clips.clone())),
             Arc::new(std::sync::RwLock::new(self.project.sources.read().unwrap().clone())),
+            self.interop_capability.clone(),
+            cuda_ctx,
+            self.export_settings.force_cpu,
         );
 
         match engine.start(Arc::clone(&self.shaders), Arc::clone(&self.compute_cache)) {
