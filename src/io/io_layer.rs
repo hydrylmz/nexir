@@ -207,4 +207,23 @@ impl IoLayer {
         self.decoders.insert(resolved_id, arc.clone());
         Some(arc)
     }
+
+    /// Enqueue prefetch requests for every registered source at each of the
+    /// given PTS values.  Call this at the start of an export segment so the
+    /// prefetch worker can decode ahead while the GPU renders the first frame.
+    pub fn prime_export_prefetch(&self, pts_list: &[i64]) {
+        let source_ids: Vec<SourceId> = {
+            let reg = self.source_reg.read().unwrap();
+            reg.all_source_ids()
+        };
+        for &pts in pts_list {
+            for &sid in &source_ids {
+                let _ = self.prefetch_tx.try_send(PrefetchRequest {
+                    source_id: sid,
+                    pts,
+                    priority: 0,
+                });
+            }
+        }
+    }
 }

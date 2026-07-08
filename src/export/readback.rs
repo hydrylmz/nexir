@@ -8,13 +8,16 @@ pub struct FrameReadback {
     bytes_per_row: u32,
     #[allow(dead_code)]
     buffer_size:  u64,
+    /// Pre-allocated output buffer for strip_padding — avoids per-frame 16 MB allocation.
+    strip_buf:    Vec<u8>,
 }
 
 impl FrameReadback {
     pub fn new(device: &GpuDevice, width: u32, height: u32) -> Result<Self, String> {
-        let raw_bpr = width * 8u32;
+        let raw_bpr = width * 8u32; // 8 bytes/pixel for Rgba16Float
         let bytes_per_row = (raw_bpr + 255) & !255;
         let buffer_size = bytes_per_row as u64 * height as u64;
+        let strip_buf_size = (raw_bpr * height) as usize;
 
         let buf0 = device.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback_0"),
@@ -36,6 +39,7 @@ impl FrameReadback {
             height,
             bytes_per_row,
             buffer_size,
+            strip_buf: vec![0u8; strip_buf_size],
         })
     }
 
@@ -68,17 +72,24 @@ impl FrameReadback {
         });
     }
 
+    /// Map the readback buffer for slot `slot` and block until the GPU copy
+    /// identified by `sid` completes.  Using `WaitForSubmissionIndex` rather
+    /// than the blanket `Maintain::Wait` means we only stall on the specific
+    /// command buffer that wrote into this slot, not on any later renders.
     pub fn map_read<'a>(
         &'a self,
         slot:   usize,
         device: &GpuDevice,
+        sid:    wgpu::SubmissionIndex,
     ) -> Result<wgpu::BufferView<'a>, String> {
         let slice = self.buffers[slot].slice(..);
         
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |v| { tx.send(v).unwrap(); });
 
-        device.device.poll(wgpu::Maintain::Wait);
+        // Only wait for the specific submission that wrote this buffer, not all
+        // pending work (which would include the *next* frame's render commands).
+        device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
         
         if let Err(_) = rx.recv().map_err(|e| e.to_string())? {
             return Err("Failed to map buffer".to_string());
@@ -91,15 +102,17 @@ impl FrameReadback {
         self.buffers[slot].unmap();
     }
 
-    pub fn strip_padding(&self, padded_data: &[u8]) -> Vec<u8> {
+    /// Strip GPU row padding and write into the pre-allocated `strip_buf`.
+    /// Returns a slice into that buffer — zero allocation.
+    pub fn strip_padding<'a>(&'a mut self, padded_data: &[u8]) -> &'a [u8] {
         let raw_bpr = (self.width * 8) as usize;
         let pad_bpr = self.bytes_per_row as usize;
-        let mut out = Vec::with_capacity(raw_bpr * self.height as usize);
-        
         for r in 0..self.height as usize {
-            let src_start = r * pad_bpr;
-            out.extend_from_slice(&padded_data[src_start .. src_start + raw_bpr]);
+            let src = r * pad_bpr;
+            let dst = r * raw_bpr;
+            self.strip_buf[dst..dst + raw_bpr]
+                .copy_from_slice(&padded_data[src..src + raw_bpr]);
         }
-        out
+        &self.strip_buf
     }
 }

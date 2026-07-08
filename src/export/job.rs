@@ -68,6 +68,36 @@ pub enum VideoQuality {
     TargetBitrate(u64),
 }
 
+/// CPU encoder preset (speed vs compression ratio).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuPreset {
+    Ultrafast,
+    Superfast,
+    Veryfast,
+    Faster,
+    Fast,
+    Medium,
+    Slow,
+    Slower,
+    Veryslow,
+}
+
+impl CpuPreset {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ultrafast => "ultrafast",
+            Self::Superfast => "superfast",
+            Self::Veryfast  => "veryfast",
+            Self::Faster    => "faster",
+            Self::Fast      => "fast",
+            Self::Medium    => "medium",
+            Self::Slow      => "slow",
+            Self::Slower    => "slower",
+            Self::Veryslow  => "veryslow",
+        }
+    }
+}
+
 /// Complete description of an export job.
 #[derive(Debug, Clone)]
 pub struct ExportJob {
@@ -84,6 +114,7 @@ pub struct ExportJob {
     pub frame_rate:    Rational,
     pub project_tb:    Rational,
     pub render_threads: usize,
+    pub cpu_preset:    CpuPreset,
 }
 
 impl ExportJob {
@@ -148,6 +179,7 @@ impl ExportJob {
             frame_rate,
             project_tb,
             render_threads: num_cpus::get().max(2) / 2,
+            cpu_preset: CpuPreset::Medium,
         }
     }
 
@@ -172,6 +204,7 @@ impl ExportJob {
             frame_rate,
             project_tb,
             render_threads: num_cpus::get().max(2) / 2,
+            cpu_preset: CpuPreset::Medium,
         }
     }
 }

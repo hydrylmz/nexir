@@ -15,6 +15,7 @@ pub struct ExportSettings {
     pub container:    Container,
     pub crf:          u32,
     pub force_cpu:    bool,
+    pub cpu_preset:   nexir::export::job::CpuPreset,
 }
 
 impl Default for ExportSettings {
@@ -25,6 +26,7 @@ impl Default for ExportSettings {
             container:   Container::Mp4,
             crf:         23,
             force_cpu:   false,
+            cpu_preset:  nexir::export::job::CpuPreset::Medium,
         }
     }
 }
@@ -180,6 +182,23 @@ pub fn draw(
                 });
             }
 
+            // Always show the CPU Preset selector (even if NVENC is available, they might force CPU or it might fallback)
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("CPU Preset (Speed):").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_source("export_cpu_preset")
+                        .selected_text(preset_label(settings.cpu_preset))
+                        .show_ui(ui, |ui| {
+                            use nexir::export::job::CpuPreset::*;
+                            for &p in &[Ultrafast, Superfast, Veryfast, Faster, Fast, Medium, Slow, Slower, Veryslow] {
+                                if ui.selectable_label(settings.cpu_preset == p, preset_label(p)).clicked() {
+                                    settings.cpu_preset = p;
+                                }
+                            }
+                        });
+                });
+            });
+
             ui.separator();
 
             // ── Action buttons ────────────────────────────────────────────────
@@ -224,5 +243,20 @@ fn audio_codec_label(ac: AudioCodec) -> &'static str {
         AudioCodec::Aac  => "AAC",
         AudioCodec::Opus => "Opus",
         AudioCodec::Pcm  => "PCM (lossless)",
+    }
+}
+
+fn preset_label(p: nexir::export::job::CpuPreset) -> &'static str {
+    use nexir::export::job::CpuPreset::*;
+    match p {
+        Ultrafast => "Ultrafast",
+        Superfast => "Superfast",
+        Veryfast  => "Veryfast",
+        Faster    => "Faster",
+        Fast      => "Fast",
+        Medium    => "Medium",
+        Slow      => "Slow",
+        Slower    => "Slower",
+        Veryslow  => "Veryslow",
     }
 }

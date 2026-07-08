@@ -152,6 +152,12 @@ impl SourceRegistry {
     pub fn id_for_path(&self, path: &std::path::Path) -> Option<SourceId> {
         self.paths.iter().position(|p| p.as_ref() == path).map(|idx| self.ids[idx])
     }
+
+    /// Return a clone of all registered source IDs. Used by the export
+    /// pipeline to prime the prefetch queue before a render segment starts.
+    pub fn all_source_ids(&self) -> Vec<SourceId> {
+        self.ids.clone()
+    }
 }
 
 #[derive(Debug)]

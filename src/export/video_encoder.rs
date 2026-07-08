@@ -38,19 +38,27 @@ pub mod swscale_ffi {
         pub fn sws_freeContext(swsCtx: *mut SwsContext);
     }
 
-    pub const AV_PIX_FMT_RGBA:    i32 = 26;
-    pub const AV_PIX_FMT_RGBA64:  i32 = 105;
-    pub const SWS_BILINEAR:       i32 = 4;
+    pub const AV_PIX_FMT_RGBA:       i32 = 26;
+    pub const AV_PIX_FMT_RGBA64:     i32 = 105;
+    /// IEEE-754 half-precision packed RGBA 16:16:16:16 little-endian.
+    /// Matches wgpu::TextureFormat::Rgba16Float readback byte layout exactly —
+    /// allows skipping the per-frame rgba16_to_rgba8 CPU conversion entirely.
+    pub const AV_PIX_FMT_RGBAF16LE:  i32 = 162;
+    pub const SWS_BILINEAR:          i32 = 4;
 }
 
 pub struct VideoEncoder {
-    ctx:       *mut crate::io::ffi::avcodec::AVCodecContext,
-    sws:       *mut swscale_ffi::SwsContext,
-    yuv_frame: *mut crate::io::ffi::avutil::AVFrame,
-    packet:    *mut crate::io::ffi::avutil::AVPacket,
-    enc_tb:    AVRational,
+    ctx:         *mut crate::io::ffi::avcodec::AVCodecContext,
+    sws:         *mut swscale_ffi::SwsContext,
+    /// True when `sws` was created with AV_PIX_FMT_RGBAF16LE as input;
+    /// the raw GPU readback bytes are passed directly without conversion.
+    /// False means fallback RGBA8 path (rgba16_to_rgba8 is applied first).
+    sws_use_f16: bool,
+    yuv_frame:   *mut crate::io::ffi::avutil::AVFrame,
+    packet:      *mut crate::io::ffi::avutil::AVPacket,
+    enc_tb:      AVRational,
     frame_count: i64,
-    yuv_buffer: *mut u8,
+    yuv_buffer:  *mut u8,
 }
 
 unsafe impl Send for VideoEncoder {}
@@ -87,7 +95,7 @@ impl VideoEncoder {
                     let crf_key = std::ffi::CString::new("crf").unwrap();
                     av_opt_set(ctx as *mut _, crf_key.as_ptr(), crf_str.as_ptr(), 1);
                     
-                    let preset_val = std::ffi::CString::new("medium").unwrap();
+                    let preset_val = std::ffi::CString::new(job.cpu_preset.as_str()).unwrap();
                     let preset_key = std::ffi::CString::new("preset").unwrap();
                     av_opt_set(ctx as *mut _, preset_key.as_ptr(), preset_val.as_ptr(), 1);
                 }
@@ -129,18 +137,36 @@ impl VideoEncoder {
             av_frame_set_height(yuv_frame, job.height as i32);
             av_frame_set_format(yuv_frame, out_pix_fmt);
 
+            // Prefer RGBAF16LE so the GPU readback bytes can be fed to sws_scale
+            // without any CPU-side conversion (rgba16_to_rgba8 is eliminated).
+            // If the runtime swscale build doesn't know RGBAF16LE, fall back to
+            // RGBA (8-bit) and keep the conversion path.
+            let sws_src_fmt = swscale_ffi::AV_PIX_FMT_RGBAF16LE;
             let sws = swscale_ffi::sws_getContext(
-                job.width as i32, job.height as i32, swscale_ffi::AV_PIX_FMT_RGBA,
+                job.width as i32, job.height as i32, sws_src_fmt,
                 job.width as i32, job.height as i32, out_pix_fmt,
                 swscale_ffi::SWS_BILINEAR,
                 std::ptr::null(), std::ptr::null(), std::ptr::null()
             );
+            // If RGBAF16LE isn't available, fall back to RGBA8 (conversion done on encode).
+            let (sws, sws_use_f16) = if sws.is_null() {
+                let fallback = swscale_ffi::sws_getContext(
+                    job.width as i32, job.height as i32, swscale_ffi::AV_PIX_FMT_RGBA,
+                    job.width as i32, job.height as i32, out_pix_fmt,
+                    swscale_ffi::SWS_BILINEAR,
+                    std::ptr::null(), std::ptr::null(), std::ptr::null()
+                );
+                (fallback, false)
+            } else {
+                (sws, true)
+            };
 
             let packet = av_packet_alloc();
 
             Ok(Self {
                 ctx,
                 sws,
+                sws_use_f16,
                 yuv_frame,
                 packet,
                 enc_tb,
@@ -155,20 +181,25 @@ impl VideoEncoder {
         frame:       &RawFrame,
         packet_sink: &mut dyn FnMut(*mut crate::io::ffi::avutil::AVPacket),
     ) -> Result<(), EncodeError> {
-        let width = unsafe {
-            // Need a way to extract width. FFmpeg AVCodecContext has a width field. We don't have bindings for that inside AVCodecContext.
-            // Oh, I can just use frame.data.len() / 4 / height? Wait, job width! I'll store width/height on VideoEncoder.
-            // Let's modify: actually I can use (*self.yuv_frame).width.
-            av_frame_get_width(self.yuv_frame) as u32
-        };
+        let width  = unsafe { av_frame_get_width(self.yuv_frame)  as u32 };
         let height = unsafe { av_frame_get_height(self.yuv_frame) as u32 };
-        let rgba8 = self.rgba16_to_rgba8(&frame.data, width, height);
+
+        // Fast path: RGBAF16LE — feed raw GPU readback bytes directly (8 bytes/pixel).
+        // Slow fallback: RGBA8 — convert f16→u8 first (used when swscale
+        // was built without RGBAF16LE support, which is rare on FFmpeg ≥ 4.0).
+        let rgba8_tmp: Vec<u8>;
+        let (src_ptr, bytes_per_row) = if self.sws_use_f16 {
+            (frame.data.as_ptr(), width * 8)
+        } else {
+            rgba8_tmp = self.rgba16_to_rgba8(&frame.data, width, height);
+            (rgba8_tmp.as_ptr(), width * 4)
+        };
 
         unsafe {
             let mut src_data: [*const u8; 8] = [std::ptr::null(); 8];
-            src_data[0] = rgba8.as_ptr();
+            src_data[0] = src_ptr;
             let mut src_linesize: [std::ffi::c_int; 8] = [0; 8];
-            src_linesize[0] = (width * 4) as i32;
+            src_linesize[0] = bytes_per_row as i32;
 
             swscale_ffi::sws_scale(
                 self.sws,

@@ -25,12 +25,27 @@ impl GpuDevice {
             ..Default::default()
         });
 
-        // Step 2: Request adapter
-        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }).await.ok_or(DeviceError::NoAdapter)?;
+        // Step 2: Request adapter (Prefer NVIDIA)
+        let mut chosen_adapter = None;
+        for adapter in instance.enumerate_adapters(wgpu::Backends::all()) {
+            let info = adapter.get_info();
+            log::info!("Found GPU Adapter: {} (Vendor: 0x{:X})", info.name, info.vendor);
+            if info.vendor == 0x10DE {
+                chosen_adapter = Some(adapter);
+                break;
+            }
+        }
+
+        let adapter = match chosen_adapter {
+            Some(a) => a,
+            None => instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }).await.ok_or(DeviceError::NoAdapter)?
+        };
+
+        log::info!("Selected GPU Adapter: {} (Vendor: 0x{:X})", adapter.get_info().name, adapter.get_info().vendor);
 
         // Step 3: Request device and queue
         let (device, queue) = adapter.request_device(
@@ -83,11 +98,27 @@ impl GpuDevice {
         // so we can request an adapter compatible with this surface.
         let surface = instance.create_surface(target).map_err(|_| DeviceError::SurfaceIncompatible)?;
 
-        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        }).await.ok_or(DeviceError::NoAdapter)?;
+        let mut chosen_adapter = None;
+        for adapter in instance.enumerate_adapters(wgpu::Backends::all()) {
+            let info = adapter.get_info();
+            log::info!("Found GPU Adapter: {} (Vendor: 0x{:X})", info.name, info.vendor);
+            // In wgpu, check if adapter is compatible with surface
+            if info.vendor == 0x10DE {
+                chosen_adapter = Some(adapter);
+                break;
+            }
+        }
+
+        let adapter = match chosen_adapter {
+            Some(a) => a,
+            None => instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            }).await.ok_or(DeviceError::NoAdapter)?
+        };
+
+        log::info!("Selected GPU Adapter: {} (Vendor: 0x{:X})", adapter.get_info().name, adapter.get_info().vendor);
 
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -162,9 +193,11 @@ impl GpuDevice {
         })
     }
 
-    /// Submit a completed CommandEncoder to the GPU queue.
-    pub fn submit(&self, encoder: wgpu::CommandEncoder) {
-        self.queue.submit(std::iter::once(encoder.finish()));
+    /// Submit a completed CommandEncoder to the GPU queue. Returns the
+    /// submission index so callers can use `poll(WaitForSubmissionIndex(idx))`
+    /// to wait only for this specific batch of work rather than all pending work.
+    pub fn submit(&self, encoder: wgpu::CommandEncoder) -> wgpu::SubmissionIndex {
+        self.queue.submit(std::iter::once(encoder.finish()))
     }
 
     /// Allocate a GPU texture with standard parameters for this engine.

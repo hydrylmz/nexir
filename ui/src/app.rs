@@ -828,6 +828,7 @@ impl NexirApp {
             frame_rate: fps,
             project_tb,
             render_threads: num_cpus::get().max(2) / 2,
+            cpu_preset: self.export_settings.cpu_preset,
         };
 
         // NOTE (Encode Interop): Prepare CudaContext if hardware interop is available and not forced to CPU.

@@ -237,8 +237,16 @@ impl ExportRenderer {
         let is_cpu = matches!(self.backend, ExportBackend::Cpu { .. });
 
         if is_cpu {
-            let mut active_slot   = 0usize;
-            let mut pending_frame: Option<usize> = None;
+            let mut active_slot      = 0usize;
+            let mut pending_frame:   Option<usize>                  = None;
+            let mut pending_sid:     Option<wgpu::SubmissionIndex>  = None;
+
+            // Fix D: prime the prefetch queue with all frame PTS in this segment
+            // so the prefetch worker can decode ahead while the GPU renders.
+            let pts_list: Vec<i64> = (segment.frame_start..segment.frame_end)
+                .map(|fi| self.job.frame_pts(fi))
+                .collect();
+            self.scheduler.io_layer().prime_export_prefetch(&pts_list);
 
             for frame_idx in segment.frame_start..=segment.frame_end {
                 // ── Render the current frame ──────────────────────────────────────
@@ -279,26 +287,34 @@ impl ExportRenderer {
                         );
                     }
 
-                    self.device.submit(encoder);
+                    let sid = self.device.submit(encoder);
 
                     // Non-blocking poll — lets the GPU start without blocking this thread.
                     self.device.device.poll(wgpu::Maintain::Poll);
+
+                    pending_sid = Some(sid);
                 }
 
                 // ── Read back the previous frame ──────────────────────────────────
                 if let Some(prev_idx) = pending_frame {
                     let prev_slot = 1 - active_slot;
+                    let prev_sid  = pending_sid.take().expect("sid must accompany pending_frame");
 
                     if let ExportBackend::Cpu { readback } = &mut self.backend {
-                        let view = readback.map_read(prev_slot, &self.device)
+                        let view = readback.map_read(prev_slot, &self.device, prev_sid)
                             .map_err(|e| {
                                 log::error!("[export] map_read failed for frame {prev_idx}: {e}");
                                 RenderError::GpuTimeout
                             })?;
 
-                        let bytes = readback.strip_padding(&view);
+                        // Copy the mapped GPU bytes into a local Vec so we can
+                        // drop the view (which holds the immutable borrow on
+                        // `readback`) before calling strip_padding (which needs &mut).
+                        let padded: Vec<u8> = view.to_vec();
                         drop(view);
                         readback.unmap(prev_slot);
+
+                        let bytes = readback.strip_padding(&padded).to_owned();
 
                         queue.push(QueueItem::Frame(RawFrame {
                             frame_index: prev_idx,
