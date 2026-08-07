@@ -68,6 +68,7 @@ pub struct StreamInfo {
     pub frame_rate: Option<Rational>,
     pub width:      Option<u32>,
     pub height:     Option<u32>,
+    pub is_vfr:     bool,
     /// We need the raw codec parameters to initialize the decoder
     pub codecpar:   *mut crate::io::ffi::avcodec::AVCodecParameters,
 }
@@ -275,7 +276,21 @@ impl Demuxer {
             let stream   = avformat_get_stream(ctx, index as u32);
             let time_base = avstream_get_time_base(stream).to_rational();
             let avg_fr    = avstream_get_avg_frame_rate(stream);
-            let frame_rate = if avg_fr.is_valid() { Some(avg_fr.to_rational()) } else { None };
+            let r_fr      = crate::io::ffi::avformat::avstream_get_r_frame_rate(stream);
+            
+            let mut is_vfr = false;
+            let frame_rate = if r_fr.is_valid() && avg_fr.is_valid() {
+                if (r_fr.num as i64 * avg_fr.den as i64) != (avg_fr.num as i64 * r_fr.den as i64) {
+                    is_vfr = true;
+                }
+                Some(r_fr.to_rational())
+            } else if r_fr.is_valid() {
+                Some(r_fr.to_rational())
+            } else if avg_fr.is_valid() {
+                Some(avg_fr.to_rational())
+            } else {
+                None
+            };
             
             // Format duration is in AV_TIME_BASE (1,000,000) ticks. Convert to stream timebase.
             let duration_av = avformat_get_duration(ctx);
@@ -299,6 +314,7 @@ impl Demuxer {
                 frame_rate,
                 width:  if width  > 0 { Some(width  as u32) } else { None },
                 height: if height > 0 { Some(height as u32) } else { None },
+                is_vfr,
                 codecpar,
             }
         }

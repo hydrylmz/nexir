@@ -895,6 +895,8 @@ pub fn draw(
                                 pixel_fmt:    nexir::timeline::source::PixelFormat::Yuv420p,
                                 color_space:  nexir::timeline::source::ColorSpace::Bt709,
                                 duration_pts: project_tb.from_pts(s.duration, s.time_base),
+                                is_vfr:       s.is_vfr,
+                                time_base:    s.time_base,
                             });
                             let ai = demuxer.audio_stream.as_ref().map(|s| nexir::timeline::source::AudioStreamInfo {
                                 sample_rate:  48000,

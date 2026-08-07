@@ -31,6 +31,7 @@ pub struct CompositeNode {
     device:              Arc<wgpu::Device>,
     queue:               Arc<wgpu::Queue>,
     out_format:          wgpu::TextureFormat,
+    has_binding_arrays:  bool,
 }
 
 impl CompositeNode {
@@ -69,7 +70,11 @@ impl CompositeNode {
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
-                    count: std::num::NonZeroU32::new(max_instances),
+                    count: if device.has_binding_arrays {
+                        std::num::NonZeroU32::new(max_instances)
+                    } else {
+                        None
+                    },
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
@@ -86,7 +91,12 @@ impl CompositeNode {
             push_constant_ranges: &[],
         });
 
-        let shader = shaders.get(BuiltinShader::Composite);
+        let shader_id = if device.has_binding_arrays {
+            BuiltinShader::Composite
+        } else {
+            BuiltinShader::CompositeSingle
+        };
+        let shader = shaders.get(shader_id);
 
         let pipeline = device.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("composite_pipeline"),
@@ -133,6 +143,7 @@ impl CompositeNode {
             device: Arc::clone(&device.device),
             queue: Arc::clone(&device.queue),
             out_format: surface_format,
+            has_binding_arrays: device.has_binding_arrays,
         }
     }
 
@@ -201,24 +212,50 @@ impl RenderNode for CompositeNode {
             views.push(fallback_view);
         }
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("composite_bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.instance_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureViewArray(&views),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        let mut single_bg = None;
+        let mut multiple_bgs = Vec::new();
+
+        if self.has_binding_arrays {
+            single_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("composite_bg"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.instance_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureViewArray(&views),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            }));
+        } else {
+            for i in 0..count {
+                multiple_bgs.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("composite_bg_single"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.instance_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(views[i as usize]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                }));
+            }
+        }
 
         let out = ctx.get(self.out_color);
 
@@ -238,7 +275,15 @@ impl RenderNode for CompositeNode {
         });
 
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.draw(0..6, 0..count);
+
+        if self.has_binding_arrays {
+            pass.set_bind_group(0, single_bg.as_ref().unwrap(), &[]);
+            pass.draw(0..6, 0..count);
+        } else {
+            for i in 0..count {
+                pass.set_bind_group(0, &multiple_bgs[i as usize], &[]);
+                pass.draw(0..6, i..(i + 1));
+            }
+        }
     }
 }

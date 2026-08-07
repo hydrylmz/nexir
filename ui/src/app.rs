@@ -161,9 +161,9 @@ impl NexirApp {
         let worker = PrefetchWorker::new(prefetch_rx, io_layer.clone(), cache, prefetch_shutdown);
         spawn_prefetch_worker(worker);
         
-        // Setup FrameScheduler
-        let canvas_w = 1920;
-        let canvas_h = 1080;
+        // Setup FrameScheduler — use project canvas resolution
+        let canvas_w = project.settings.width;
+        let canvas_h = project.settings.height;
         let frame_scheduler = FrameScheduler::new(io_layer.clone(), canvas_w, canvas_h);
         log::info!("NexirApp::new: frame_scheduler created");
 
@@ -297,7 +297,7 @@ impl NexirApp {
             let can_redo = self.history.can_redo();
             let mut action: Option<crate::layout::top_bar::TopBarAction> = None;
             egui::TopBottomPanel::top("top_bar").show(&self.egui_ctx, |ui| {
-                action = crate::layout::top_bar::draw(ui, can_undo, can_redo);
+                action = crate::layout::top_bar::draw(ui, can_undo, can_redo, &mut self.project.settings);
             });
             action
         };
@@ -365,6 +365,8 @@ impl NexirApp {
                             color_space:  ColorSpace::Bt709,
                             // convert from stream timebase to project timebase
                             duration_pts: project_tb.from_pts(s.duration, s.time_base),
+                            is_vfr:       s.is_vfr,
+                            time_base:    s.time_base,
                         });
 
                         let ai = demuxer.audio_stream.as_ref().map(|s| AudioStreamInfo {
@@ -823,10 +825,10 @@ impl NexirApp {
 
         // Build export job from current project state
         let project_tb = Rational { num: 1, den: 90_000 };
-        let fps = Rational { num: 30, den: 1 };
+        let fps = self.project.settings.frame_rate;
         let total_duration = self.project.frame_to_pts(self.project.duration_frames());
-        let width = 1920;
-        let height = 1080;
+        let width  = self.project.settings.width;
+        let height = self.project.settings.height;
 
         let job = ExportJob {
             output_path: path,

@@ -11,6 +11,8 @@ pub struct VideoStreamInfo {
     pub pixel_fmt:   PixelFormat,
     pub color_space: ColorSpace,
     pub duration_pts: i64,       
+    pub is_vfr:      bool,
+    pub time_base:   Rational,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

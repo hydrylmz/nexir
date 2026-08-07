@@ -1,4 +1,6 @@
 use egui::{Ui, Color32};
+use nexir::project::ProjectSettings;
+use nexir::timeline::rational::Rational;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TopBarAction {
@@ -17,7 +19,7 @@ struct TopBarState {
     about_open: bool,
 }
 
-pub fn draw(ui: &mut Ui, can_undo: bool, can_redo: bool) -> Option<TopBarAction> {
+pub fn draw(ui: &mut Ui, can_undo: bool, can_redo: bool, settings: &mut ProjectSettings) -> Option<TopBarAction> {
     // Load/store persistent state in egui memory so it survives across frames.
     let mut state = ui.ctx().data(|d| d.get_temp::<TopBarState>(egui::Id::new("top_bar_state")).unwrap_or_default());
     let mut action = None;
@@ -69,6 +71,40 @@ pub fn draw(ui: &mut Ui, can_undo: bool, can_redo: bool) -> Option<TopBarAction>
             }
         });
 
+        // ── Project settings (canvas resolution + frame rate) ────────────────
+        ui.separator();
+
+        // Resolution preset combo
+        egui::ComboBox::from_id_source("proj_resolution")
+            .selected_text(resolution_label(settings.width, settings.height))
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for &(w, h) in RESOLUTION_PRESETS {
+                    if ui.selectable_label(settings.width == w && settings.height == h,
+                        resolution_label(w, h)).clicked()
+                    {
+                        settings.width  = w;
+                        settings.height = h;
+                    }
+                }
+            });
+
+        // Frame rate combo
+        egui::ComboBox::from_id_source("proj_fps")
+            .selected_text(fps_label(settings.frame_rate))
+            .width(70.0)
+            .show_ui(ui, |ui| {
+                for &(n, d) in FPS_PRESETS {
+                    let r = Rational::new(n, d);
+                    if ui.selectable_label(
+                        settings.frame_rate.num == n && settings.frame_rate.den == d,
+                        fps_label(r)
+                    ).clicked() {
+                        settings.frame_rate = r;
+                    }
+                }
+            });
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // CapCut style bright blue export button
             let export_btn = egui::Button::new(
@@ -113,4 +149,38 @@ pub fn draw(ui: &mut Ui, can_undo: bool, can_redo: bool) -> Option<TopBarAction>
     // Persist state back into egui memory.
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("top_bar_state"), state));
     action
+}
+
+const RESOLUTION_PRESETS: &[(u32, u32)] = &[
+    (3840, 2160),
+    (2560, 1440),
+    (1920, 1080),
+    (1280,  720),
+    ( 854,  480),
+];
+
+const FPS_PRESETS: &[(i64, i64)] = &[
+    (24, 1), (25, 1), (30, 1), (60, 1), (120, 1),
+];
+
+fn resolution_label(w: u32, h: u32) -> &'static str {
+    match (w, h) {
+        (3840, 2160) => "3840x2160 4K",
+        (2560, 1440) => "2560x1440 2K",
+        (1920, 1080) => "1920x1080 FHD",
+        (1280,  720) => "1280x720 HD",
+        ( 854,  480) => "854x480 SD",
+        _            => "Custom",
+    }
+}
+
+fn fps_label(r: Rational) -> &'static str {
+    match (r.num, r.den) {
+        (24,  1) => "24 fps",
+        (25,  1) => "25 fps",
+        (30,  1) => "30 fps",
+        (60,  1) => "60 fps",
+        (120, 1) => "120 fps",
+        _        => "? fps",
+    }
 }

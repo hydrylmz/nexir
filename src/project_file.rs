@@ -98,6 +98,8 @@ impl From<ProjectFile> for Project {
                             pixel_fmt:    crate::timeline::source::PixelFormat::Yuv420p,
                             color_space:  crate::timeline::source::ColorSpace::Bt709,
                             duration_pts: project_tb.from_pts(s.duration, s.time_base),
+                            is_vfr:       s.is_vfr,
+                            time_base:    s.time_base,
                         });
                     }
                     if ai.is_none() {

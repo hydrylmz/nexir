@@ -45,6 +45,7 @@ AVStream* avformat_get_stream(AVFormatContext* ctx, int idx) { return ctx->strea
 AVRational avstream_get_time_base(AVStream* st) { return st->time_base; }
 void avstream_set_time_base(AVStream* st, AVRational tb) { st->time_base = tb; }
 AVRational avstream_get_avg_frame_rate(AVStream* st) { return st->avg_frame_rate; }
+AVRational avstream_get_r_frame_rate(AVStream* st) { return st->r_frame_rate; }
 int64_t avformat_get_duration(AVFormatContext* ctx) { return ctx->duration; }
 AVCodecParameters* avstream_get_codecpar(AVStream* st) { return st->codecpar; }
 AVCodecParameters* avstream_get_codecpar_mut(AVStream* st) { return st->codecpar; }

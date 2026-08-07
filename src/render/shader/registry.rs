@@ -8,6 +8,7 @@ use crate::render::device::GpuDevice;
 pub enum BuiltinShader {
     YuvToRgb,
     Composite,
+    CompositeSingle,
     Blit,
     ColorCorrection,
     ChromaKey,
@@ -25,6 +26,7 @@ impl ShaderRegistry {
         let sources: &[(BuiltinShader, &str)] = &[
             (BuiltinShader::YuvToRgb,        include_str!("yuv_to_rgb.wgsl")),
             (BuiltinShader::Composite,        include_str!("composite.wgsl")),
+            (BuiltinShader::CompositeSingle,  include_str!("composite_single.wgsl")),
             (BuiltinShader::Blit,             include_str!("blit.wgsl")),
             (BuiltinShader::ColorCorrection,  include_str!("color_correction.wgsl")),
             (BuiltinShader::ChromaKey,        include_str!("chroma_key.wgsl")),
@@ -37,6 +39,7 @@ impl ShaderRegistry {
             let label = match shader_id {
                 BuiltinShader::YuvToRgb       => "yuv_to_rgb_shader",
                 BuiltinShader::Composite      => "composite_shader",
+                BuiltinShader::CompositeSingle=> "composite_single_shader",
                 BuiltinShader::Blit           => "blit_shader",
                 BuiltinShader::ColorCorrection => "color_correction_shader",
                 BuiltinShader::ChromaKey      => "chroma_key_shader",

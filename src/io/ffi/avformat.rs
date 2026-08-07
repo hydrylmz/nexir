@@ -82,10 +82,11 @@ extern "C" {
 
     /// Get the time_base of a stream (ticks per second as a rational).
     pub fn avstream_get_time_base(stream: *const AVStream) -> AVRational;
-
+    pub fn avstream_set_time_base(stream: *mut AVStream, tb: AVRational);
     /// Get the average frame rate of a video stream.
     /// Returns `{0, 0}` if unknown — call `avformat_find_stream_info` first.
     pub fn avstream_get_avg_frame_rate(stream: *const AVStream) -> AVRational;
+    pub fn avstream_get_r_frame_rate(stream: *const AVStream) -> AVRational;
 
     /// Get the duration of the format context in AV_TIME_BASE (µs) units.
     pub fn avformat_get_duration(ctx: *const AVFormatContext) -> i64;

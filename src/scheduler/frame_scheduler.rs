@@ -105,12 +105,27 @@ impl FrameScheduler {
         let mut entries = Vec::with_capacity(island.clips.len());
 
         for clip in &island.clips {
-            let fps = self.io_layer.source_reg.read().unwrap().video_info(clip.source_id)
-                .map(|info| info.frame_rate)
-                .unwrap_or(crate::timeline::rational::Rational { num: 30, den: 1 });
+            let (fps, is_vfr, time_base) = self.io_layer.source_reg.read().unwrap().video_info(clip.source_id)
+                .map(|info| (info.frame_rate, info.is_vfr, info.time_base))
+                .unwrap_or((
+                    crate::timeline::rational::Rational { num: 30, den: 1 },
+                    false,
+                    crate::timeline::rational::Rational { num: 1, den: 90_000 }
+                ));
+
+            let project_tb = crate::timeline::rational::Rational { num: 1, den: 90_000 };
 
             let quantized_pts = if fps.num == 0 {
                 0
+            } else if is_vfr {
+                let stream_pts = project_tb.rescale_pts(clip.source_pts, time_base);
+                let stream_frame_duration = time_base.den as i64 * fps.den as i64 / (time_base.num as i64 * fps.num as i64);
+                let quantized_stream_pts = if stream_frame_duration > 0 {
+                    (stream_pts / stream_frame_duration) * stream_frame_duration
+                } else {
+                    stream_pts
+                };
+                time_base.rescale_pts(quantized_stream_pts, project_tb)
             } else {
                 let frame_duration = 90_000 * (fps.den as i64) / (fps.num as i64);
                 (clip.source_pts / frame_duration) * frame_duration
@@ -157,12 +172,27 @@ impl FrameScheduler {
 
         for clip in &island.clips {
             // Get framerate to quantize source_pts
-            let fps = self.io_layer.source_reg.read().unwrap().video_info(clip.source_id)
-                .map(|info| info.frame_rate)
-                .unwrap_or(crate::timeline::rational::Rational { num: 30, den: 1 });
+            let (fps, is_vfr, time_base) = self.io_layer.source_reg.read().unwrap().video_info(clip.source_id)
+                .map(|info| (info.frame_rate, info.is_vfr, info.time_base))
+                .unwrap_or((
+                    crate::timeline::rational::Rational { num: 30, den: 1 },
+                    false,
+                    crate::timeline::rational::Rational { num: 1, den: 90_000 }
+                ));
             
+            let project_tb = crate::timeline::rational::Rational { num: 1, den: 90_000 };
+
             let quantized_pts = if fps.num == 0 {
                 0 // For images or unknown, always ask for frame 0
+            } else if is_vfr {
+                let stream_pts = project_tb.rescale_pts(clip.source_pts, time_base);
+                let stream_frame_duration = time_base.den as i64 * fps.den as i64 / (time_base.num as i64 * fps.num as i64);
+                let quantized_stream_pts = if stream_frame_duration > 0 {
+                    (stream_pts / stream_frame_duration) * stream_frame_duration
+                } else {
+                    stream_pts
+                };
+                time_base.rescale_pts(quantized_stream_pts, project_tb)
             } else {
                 let frame_duration = 90_000 * (fps.den as i64) / (fps.num as i64);
                 (clip.source_pts / frame_duration) * frame_duration

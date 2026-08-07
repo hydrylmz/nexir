@@ -14,6 +14,8 @@ pub struct GpuDevice {
     /// Surface format (the swapchain's pixel format, always SDR).
     /// Uses Mutex for interior mutability so GpuDevice can be shared behind Arc across threads.
     pub surface_format: Mutex<wgpu::TextureFormat>,
+    /// Whether the device supports TEXTURE_BINDING_ARRAY and SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+    pub has_binding_arrays: bool,
 }
 
 impl GpuDevice {
@@ -117,13 +119,21 @@ impl GpuDevice {
 
         log::info!("Selected GPU Adapter: {} (Vendor: 0x{:X}, Backend: {:?})", adapter.get_info().name, adapter.get_info().vendor, adapter.get_info().backend);
 
+        let adapter_features = adapter.features();
+        let has_binding_arrays = adapter_features.contains(wgpu::Features::TEXTURE_BINDING_ARRAY)
+            && adapter_features.contains(wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING);
+
+        let mut required_features = wgpu::Features::PUSH_CONSTANTS;
+        if has_binding_arrays {
+            required_features |= wgpu::Features::TEXTURE_BINDING_ARRAY
+                               | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
+        }
+
         // Step 3: Request device and queue
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("video_engine_device"),
-                required_features: wgpu::Features::TEXTURE_BINDING_ARRAY
-                                 | wgpu::Features::PUSH_CONSTANTS
-                                 | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
+                required_features,
                 required_limits: wgpu::Limits {
                     max_push_constant_size: 128,
                     ..wgpu::Limits::default()
@@ -150,6 +160,7 @@ impl GpuDevice {
             queue: Arc::new(queue),
             hdr_format,
             surface_format: Mutex::new(surface_format),
+            has_binding_arrays,
         })
     }
 
@@ -183,12 +194,20 @@ impl GpuDevice {
 
         log::info!("Selected GPU Adapter: {} (Vendor: 0x{:X}, Backend: {:?})", adapter.get_info().name, adapter.get_info().vendor, adapter.get_info().backend);
 
+        let adapter_features = adapter.features();
+        let has_binding_arrays = adapter_features.contains(wgpu::Features::TEXTURE_BINDING_ARRAY)
+            && adapter_features.contains(wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING);
+
+        let mut required_features = wgpu::Features::PUSH_CONSTANTS;
+        if has_binding_arrays {
+            required_features |= wgpu::Features::TEXTURE_BINDING_ARRAY
+                               | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
+        }
+
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("video_engine_device"),
-                required_features: wgpu::Features::TEXTURE_BINDING_ARRAY
-                                 | wgpu::Features::PUSH_CONSTANTS
-                                 | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
+                required_features,
                 required_limits: wgpu::Limits {
                     max_push_constant_size: 128,
                     ..wgpu::Limits::default()
@@ -212,6 +231,7 @@ impl GpuDevice {
             queue: Arc::new(queue),
             hdr_format,
             surface_format: Mutex::new(wgpu::TextureFormat::Bgra8UnormSrgb),
+            has_binding_arrays,
         };
 
         gpu_device.configure_surface(&surface, window_width, window_height);
