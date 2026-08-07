@@ -33,3 +33,36 @@ pollster = "0.3"
 [build-dependencies]
 pkg-config = "0.3"
 cc = "1.0"
+
+# ---------------------------------------------------------------------------
+# Fast-dev profile: optimize the nexir engine and heavy deps at level 2 so
+# that the hot-path (f16->u8 conversion, sws_scale, wgpu readback) gets SIMD
+# autovectorisation even in `cargo run` debug builds.  The ui binary itself
+# stays unoptimised for fast incremental rebuilds.
+# ---------------------------------------------------------------------------
+[profile.dev.package.nexir]
+opt-level = 2
+
+[profile.dev.package.half]
+opt-level = 2
+
+[profile.dev.package.wgpu]
+opt-level = 2
+
+[profile.dev.package.wgpu-core]
+opt-level = 2
+
+[profile.dev.package.wgpu-hal]
+opt-level = 2
+
+[profile.dev.package.naga]
+opt-level = 2
+
+[profile.dev.package.rayon]
+opt-level = 2
+
+[profile.dev.package.dashmap]
+opt-level = 2
+
+[profile.dev.package.lru]
+opt-level = 2

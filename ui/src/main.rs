@@ -9,11 +9,107 @@ mod app;
 mod history;
 pub mod layout;
 
-fn main() {
-    if std::env::var("RUST_LOG").is_err() {
-        unsafe { std::env::set_var("RUST_LOG", "info,nexir=debug,ui=debug,wgpu_core=warn,wgpu_hal=warn,naga=warn"); }
+struct SimpleFileLogger {
+    file: std::sync::Mutex<Option<std::fs::File>>,
+}
+
+impl log::Log for SimpleFileLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        // Filter out spam from wgpu/naga
+        let target = metadata.target();
+        if target.starts_with("wgpu") || target.starts_with("naga") {
+            return metadata.level() <= log::Level::Error;
+        }
+        metadata.level() <= log::Level::Info
     }
-    env_logger::init();
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        
+        let msg = format!("[{}] {} - {}\n", record.level(), record.target(), record.args());
+        
+        // Print to stderr
+        eprint!("{}", msg);
+        
+        // Write to file
+        if let Ok(mut guard) = self.file.lock() {
+            if let Some(file) = guard.as_mut() {
+                use std::io::Write;
+                let _ = file.write_all(msg.as_bytes());
+                let _ = file.flush();
+            }
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn main() {
+    // Setup crash logging and standard logging to a file
+    let log_file = if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(dir) = exe_path.parent() {
+            let log_path = dir.join("nexir_log.txt");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(log_path)
+                .ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Initialize the logger
+    let logger = SimpleFileLogger {
+        file: std::sync::Mutex::new(log_file),
+    };
+    log::set_boxed_logger(Box::new(logger)).unwrap();
+    log::set_max_level(log::LevelFilter::Info);
+
+    // Setup custom panic hook
+    std::panic::set_hook(Box::new(|panic_info| {
+        let mut message = String::new();
+        if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            message.push_str(s);
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            message.push_str(s);
+        } else {
+            message.push_str("Unknown panic");
+        }
+        
+        let location = if let Some(loc) = panic_info.location() {
+            format!("at {}:{}", loc.file(), loc.line())
+        } else {
+            "unknown location".to_string()
+        };
+
+        let backtrace = std::backtrace::Backtrace::capture();
+        let log_content = format!(
+            "==================================================\n\
+             NEXIR CRASH REPORT\n\
+             ==================================================\n\
+             Panic: {}\n\
+             Location: {}\n\
+             Backtrace:\n\
+             {:#?}\n",
+            message, location, backtrace
+        );
+        
+        eprint!("{}", log_content);
+        
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(dir) = exe_path.parent() {
+                let log_path = dir.join("nexir_crash.log");
+                let _ = std::fs::write(log_path, log_content);
+            }
+        }
+    }));
+
     info!("Starting Nexir UI");
 
     let event_loop = EventLoop::new().unwrap();

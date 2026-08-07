@@ -11,26 +11,33 @@ pub struct NvEncOpenEncodeSessionExParams {
     pub device:        *mut std::ffi::c_void,   // the CUcontext, cast to void*
     pub reserved:      *mut std::ffi::c_void,
     pub api_version:   u32,
+    pub reserved1:     [u32; 253],
+    pub reserved2:     [*mut std::ffi::c_void; 64],
 }
 
 pub const NV_ENC_DEVICE_TYPE_CUDA: u32 = 1;
 
 #[repr(C)]
 pub struct NvEncInitializeParams {
-    pub version:        u32,
-    pub encode_guid:    [u8; 16],   // NV_ENC_CODEC_H264_GUID or _HEVC_GUID
-    pub preset_guid:    [u8; 16],   // NV_ENC_PRESET_P*_GUID — quality/speed presets
-    pub encode_width:   u32,
-    pub encode_height:  u32,
-    pub frame_rate_num: u32,
-    pub frame_rate_den: u32,
+    pub version:           u32,
+    pub encode_guid:       [u8; 16],
+    pub preset_guid:       [u8; 16],
+    pub encode_width:      u32,
+    pub encode_height:     u32,
+    pub dar_width:         u32,
+    pub dar_height:        u32,
+    pub frame_rate_num:    u32,
+    pub frame_rate_den:    u32,
+    pub enable_ptd_flags:  u32,
+    pub priv_data_size:    u32,
+    pub priv_data:         *mut std::ffi::c_void,
+    pub encode_config:     *mut std::ffi::c_void,
     pub max_encode_width:  u32,
     pub max_encode_height: u32,
-    // Note: The rest of the fields are omitted for simplicity as they aren't explicitly required to be written out manually here in the scaffold.
-    // In practice, this struct is quite large. We will only use what's strictly necessary.
-    // Wait, FFmpeg's nvEncodeAPI.h contains the full struct. 
-    // To be safe, I'll allocate a large enough buffer and zero it out.
-    pub reserved: [u8; 1024], 
+    pub sync_obj:          *mut std::ffi::c_void,
+    pub buffer_format:     u32,
+    pub tuning_info:       u32,
+    pub reserved:          [u32; 286],
 }
 
 #[repr(C)]
@@ -84,6 +91,12 @@ pub mod functions {
     pub type OpenEncodeSessionEx = unsafe extern "C" fn(
         *const NvEncOpenEncodeSessionExParams,
         *mut NvEncodeSession,
+    ) -> i32;
+    pub type GetPresetConfig = unsafe extern "C" fn(
+        NvEncodeSession,
+        [u8; 16],
+        [u8; 16],
+        *mut std::ffi::c_void,
     ) -> i32;
     pub type InitializeEncoder = unsafe extern "C" fn(
         NvEncodeSession,

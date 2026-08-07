@@ -30,6 +30,29 @@ impl InteropCapability {
             return Self::none();
         }
 
+        // Before calling any CUDA driver function we must verify that cuda.dll
+        // is loadable. Our cuda.lib (from the FFmpeg dev package) was built against
+        // cuda.dll, so the /DELAYLOAD resolver will look for *exactly* "cuda.dll".
+        // Most consumer NVIDIA driver installs ship the CUDA runtime as "nvcuda.dll"
+        // in System32, NOT as "cuda.dll". If "cuda.dll" is absent the first call to
+        // cuInit() raises SEH 0xc06d007e (delay-load failure) and kills the process.
+        // We probe here with LoadLibraryA so we can bail out gracefully instead.
+        #[cfg(target_os = "windows")]
+        {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn LoadLibraryA(lp_lib_file_name: *const u8) -> *mut std::ffi::c_void;
+                fn FreeLibrary(h_lib_module: *mut std::ffi::c_void) -> i32;
+            }
+
+            let h = unsafe { LoadLibraryA(b"cuda.dll\0".as_ptr()) };
+            if h.is_null() {
+                log::warn!("InteropCapability::probe rejected: cuda.dll not found (CUDA Toolkit not installed)");
+                return Self::none();
+            }
+            unsafe { FreeLibrary(h) };
+        }
+
         let ret = unsafe { crate::interop::ffi::cuda_driver::cuInit(0) };
         if ret != crate::interop::ffi::cuda_driver::CUDA_SUCCESS {
             log::warn!("InteropCapability::probe rejected: cuInit(0) failed with error code {:?}", ret);

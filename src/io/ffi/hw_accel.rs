@@ -14,6 +14,7 @@ pub struct AVHWDeviceContext {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HwDeviceType {
     Cuda,          // NVIDIA — AV_HWDEVICE_TYPE_CUDA = 2
+    D3D11Va,       // Windows — AV_HWDEVICE_TYPE_D3D11VA = 11
     D3D12Va,       // Windows — AV_HWDEVICE_TYPE_D3D12VA = 13
     VideoToolbox,  // macOS — AV_HWDEVICE_TYPE_VIDEOTOOLBOX = 9
     Vaapi,         // Linux — AV_HWDEVICE_TYPE_VAAPI = 6
@@ -25,6 +26,7 @@ impl HwDeviceType {
     pub fn ffi_value(self) -> i32 {
         match self {
             HwDeviceType::Cuda         => 2,
+            HwDeviceType::D3D11Va      => 11,
             HwDeviceType::D3D12Va      => 13,
             HwDeviceType::VideoToolbox => 9,
             HwDeviceType::Vaapi        => 6,
@@ -67,7 +69,7 @@ pub fn probe_hardware_device()
 {
     // Step 1 — Build platform-specific preference list
     #[cfg(target_os = "windows")]
-    let preferred: &[HwDeviceType] = &[HwDeviceType::D3D12Va, HwDeviceType::Cuda];
+    let preferred: &[HwDeviceType] = &[HwDeviceType::Cuda, HwDeviceType::D3D11Va, HwDeviceType::D3D12Va];
     #[cfg(target_os = "macos")]
     let preferred: &[HwDeviceType] = &[HwDeviceType::VideoToolbox];
     #[cfg(target_os = "linux")]

@@ -3,6 +3,8 @@ use crate::io::ffi::avutil::{AVFrame, AVPacket, AVRational};
 
 extern "C" {
     pub fn avcodec_find_encoder(id: std::ffi::c_uint) -> *const crate::io::ffi::avcodec::AVCodec;
+    pub fn avcodec_find_encoder_by_name(name: *const std::ffi::c_char) -> *const crate::io::ffi::avcodec::AVCodec;
+    pub fn avcodec_get_name_shim(codec: *const crate::io::ffi::avcodec::AVCodec) -> *const std::ffi::c_char;
     pub fn avcodec_ctx_set_bit_rate(ctx: *mut AVCodecContext, bitrate: i64);
     pub fn avcodec_ctx_set_sample_rate(ctx: *mut AVCodecContext, sample_rate: i32);
     pub fn avcodec_ctx_set_ch_layout(ctx: *mut AVCodecContext, ch_mask: u64);

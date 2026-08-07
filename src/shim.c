@@ -25,6 +25,22 @@ void avcodec_ctx_set_sample_fmt(AVCodecContext* ctx, int fmt) { ctx->sample_fmt 
 void avcodec_set_hw_device_ctx(AVCodecContext* ctx, AVBufferRef* hw) { ctx->hw_device_ctx = hw; }
 void avcodec_set_thread_count(AVCodecContext* ctx, int c) { ctx->thread_count = c; }
 
+static enum AVPixelFormat default_get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *fmt) {
+    (void)ctx;
+    for (const enum AVPixelFormat *p = fmt; *p != -1; p++) {
+        if (*p == AV_PIX_FMT_CUDA || *p == AV_PIX_FMT_D3D11 || *p == AV_PIX_FMT_D3D11VA_VLD || *p == AV_PIX_FMT_NV12) {
+            return *p;
+        }
+    }
+    return fmt[0];
+}
+
+void avcodec_enable_hw_get_format(AVCodecContext* ctx) {
+    ctx->get_format = default_get_hw_format;
+}
+
+const char* avcodec_get_name_shim(const AVCodec* c) { return c->name; }
+
 AVStream* avformat_get_stream(AVFormatContext* ctx, int idx) { return ctx->streams[idx]; }
 AVRational avstream_get_time_base(AVStream* st) { return st->time_base; }
 void avstream_set_time_base(AVStream* st, AVRational tb) { st->time_base = tb; }

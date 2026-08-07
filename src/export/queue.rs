@@ -1,7 +1,7 @@
 use crate::export::renderer::RawFrame;
 use std::sync::{mpsc, Mutex};
 
-const QUEUE_DEPTH: usize = 4;
+const QUEUE_DEPTH: usize = 8;
 
 pub struct EncoderQueue {
     tx: mpsc::SyncSender<QueueItem>,

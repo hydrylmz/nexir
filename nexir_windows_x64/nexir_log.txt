@@ -1,0 +1,61 @@
+[INFO] ui - Starting Nexir UI
+[INFO] nexir::render::device - Found GPU Adapter: NVIDIA GeForce RTX 3050 (Vendor: 0x10DE, Backend: Dx12)
+[INFO] nexir::render::device - Found GPU Adapter: Microsoft Basic Render Driver (Vendor: 0x1414, Backend: Dx12)
+[INFO] nexir::render::device - Selected GPU Adapter: NVIDIA GeForce RTX 3050 (Vendor: 0x10DE, Backend: Dx12)
+[INFO] ui::app - NexirApp::new: creating egui_renderer...
+[WARN] egui_wgpu::renderer - Detected a linear (sRGBA aware) framebuffer Bgra8UnormSrgb. egui prefers Rgba8Unorm or Bgra8Unorm
+[INFO] ui::app - NexirApp::new: egui_renderer created
+[INFO] ui::app - NexirApp::new: compiling shaders...
+[INFO] ui::app - NexirApp::new: shaders compiled successfully
+[INFO] ui::app - NexirApp::new: pool and cache created
+[INFO] ui::app - NexirApp::new: io_layer created
+[INFO] ui::app - NexirApp::new: frame_scheduler created
+[INFO] ui::app - NexirApp::new: blit resources created
+[INFO] ui::app - NexirApp::new: CPAL audio stream opening...
+[INFO] ui::app - NexirApp::new: CPAL audio stream status: true
+[INFO] ui::app - NexirApp::new: InteropCapability probing...
+[WARN] nexir::interop::capability - InteropCapability::probe rejected: cuda.dll not found (CUDA Toolkit not installed)
+[INFO] ui::app - NexirApp::new: InteropCapability probed: InteropCapability { transport: None, cuda_device_ordinal: -1, driver_version: "" }
+[INFO] ui::app - NexirApp::new: completed successfully!
+[WARN] egui_wgpu::renderer - Missing texture: User(0)
+[INFO] nexir::io::decoder - [decoder] Attached hardware decoder: Cuda
+[INFO] nexir::export::video_encoder - [encoder] Found hardware encoder candidate: h264_nvenc
+[WARN] nexir::export::video_encoder - [encoder] Failed to open hardware encoder 'h264_nvenc' (error code -40), trying next
+[INFO] nexir::export::video_encoder - [encoder] Found hardware encoder candidate: h264_amf
+[WARN] nexir::export::video_encoder - [encoder] Failed to open hardware encoder 'h264_amf' (error code -1313558101), trying next
+[INFO] nexir::export::video_encoder - [encoder] Found hardware encoder candidate: h264_qsv
+[WARN] nexir::export::video_encoder - [encoder] Failed to open hardware encoder 'h264_qsv' (error code -1313558101), trying next
+[INFO] nexir::export::video_encoder - [encoder] Using software encoder for codec ID 27
+[INFO] nexir::export::video_encoder - [encoder] x264 preset='faster' av_opt_set returned 0
+[INFO] nexir::export::video_encoder - [encoder] x264 crf=23 av_opt_set returned 0
+[INFO] nexir::export::engine - [export] backend: FfmpegCpu (NVENC not available, fallback)
+[INFO] nexir::export::engine - [export] dispatch thread started, 6 segment(s)
+[INFO] nexir::export::renderer - [export] ExportRenderer::new — canvas 1920x1080, 369 total frames
+[INFO] nexir::export::engine - [export] starting segment 0/6
+[INFO] nexir::export::renderer - [export] render_segment 0 — frames 0..62
+[INFO] nexir::io::decoder - [decoder] Attached hardware decoder: Cuda
+[INFO] nexir::export::renderer - [export] (re)compiling graph for 1 clip(s) (was 0)
+[INFO] nexir::export::renderer - [export] render graph compiled successfully (1 clip(s))
+[INFO] nexir::export::renderer - [export] render_segment 0 done
+[INFO] nexir::export::engine - [export] segment 0 complete
+[INFO] nexir::export::engine - [export] starting segment 1/6
+[INFO] nexir::export::renderer - [export] render_segment 1 — frames 62..124
+[INFO] nexir::export::renderer - [export] render_segment 1 done
+[INFO] nexir::export::engine - [export] segment 1 complete
+[INFO] nexir::export::engine - [export] starting segment 2/6
+[INFO] nexir::export::renderer - [export] render_segment 2 — frames 124..186
+[INFO] nexir::export::renderer - [export] render_segment 2 done
+[INFO] nexir::export::engine - [export] segment 2 complete
+[INFO] nexir::export::engine - [export] starting segment 3/6
+[INFO] nexir::export::renderer - [export] render_segment 3 — frames 186..248
+[INFO] nexir::export::renderer - [export] render_segment 3 done
+[INFO] nexir::export::engine - [export] segment 3 complete
+[INFO] nexir::export::engine - [export] starting segment 4/6
+[INFO] nexir::export::renderer - [export] render_segment 4 — frames 248..310
+[INFO] nexir::export::renderer - [export] render_segment 4 done
+[INFO] nexir::export::engine - [export] segment 4 complete
+[INFO] nexir::export::engine - [export] starting segment 5/6
+[INFO] nexir::export::renderer - [export] render_segment 5 — frames 310..369
+[INFO] nexir::export::renderer - [export] render_segment 5 done
+[INFO] nexir::export::engine - [export] segment 5 complete
+[INFO] nexir::export::engine - [export] dispatch thread finished — AllDone sent

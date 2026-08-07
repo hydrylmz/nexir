@@ -78,6 +78,7 @@ extern "C" {
 
     /// Set decoder thread count. 0 = let FFmpeg choose (= num_cpus).
     pub fn avcodec_set_thread_count(avctx: *mut AVCodecContext, count: std::ffi::c_int);
+    pub fn avcodec_enable_hw_get_format(avctx: *mut AVCodecContext);
     pub fn avcodec_ctx_get_sample_rate(ctx: *const AVCodecContext) -> std::ffi::c_int;
     pub fn avcodec_ctx_get_channels(ctx: *const AVCodecContext) -> std::ffi::c_int;
     pub fn avcodec_ctx_get_sample_fmt(ctx: *const AVCodecContext) -> std::ffi::c_int;

@@ -26,7 +26,7 @@ impl Default for ExportSettings {
             container:   Container::Mp4,
             crf:         23,
             force_cpu:   false,
-            cpu_preset:  nexir::export::job::CpuPreset::Medium,
+            cpu_preset:  nexir::export::job::CpuPreset::Faster,
         }
     }
 }

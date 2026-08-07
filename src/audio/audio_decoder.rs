@@ -189,16 +189,13 @@ impl AudioDecoder {
             }
 
             let available = self.ring.available_write();
-            eprintln!("[audio] dec: available_write={} threshold={}", available, RING_TARGET_SAMPLES / 4);
             if available < RING_TARGET_SAMPLES / 4 {
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
 
-            eprintln!("[audio] dec: calling next_audio_packet");
             match self.demuxer.next_audio_packet() {
                 Ok(Some(pkt)) => {
-                    eprintln!("[audio] dec: got packet pts={}", pkt.pts);
                     unsafe {
                         let ret = avcodec_send_packet(self.decoder.ctx(), pkt.as_ptr());
                         if ret >= 0 {
@@ -208,25 +205,24 @@ impl AudioDecoder {
                                     break;
                                 }
                                 if r < 0 {
-                                    eprintln!("[audio] avcodec_receive_frame error: {}", r);
+                                    log::error!("[audio] avcodec_receive_frame error: {}", r);
                                     break;
                                 }
                                 if let Err(e) = self.resample_and_push() {
-                                    eprintln!("[audio] resample_and_push error: {:?}", e);
+                                    log::error!("[audio] resample_and_push error: {:?}", e);
                                 }
                             }
                         } else {
-                            eprintln!("[audio] avcodec_send_packet error: {}", ret);
+                            log::error!("[audio] avcodec_send_packet error: {}", ret);
                         }
                     }
                 }
                 Ok(None) => {
-                    println!("[audio] dec: Ok(None) EOF");
                     self.flush_swr();
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(e) => {
-                    eprintln!("[audio] dec: demux error: {:?}", e);
+                    log::error!("[audio] dec: demux error: {:?}", e);
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             }
@@ -243,7 +239,6 @@ impl AudioDecoder {
         };
 
         if in_count == 0 {
-            println!("[audio] resample_and_push: in_count == 0");
             return Ok(());
         }
 
@@ -264,7 +259,6 @@ impl AudioDecoder {
         };
 
         if written <= 0 {
-            println!("[audio] resample_and_push: written == {}", written);
             return Ok(());
         }
 
@@ -290,7 +284,6 @@ impl AudioDecoder {
 
         self.ring.write(&interleaved);
         self.samples_written += written_usize as u64;
-        println!("[audio] dec: pushed {} frames (total: {} elements), ring available: {}", written_usize, interleaved.len(), self.ring.available_read());
 
         Ok(())
     }

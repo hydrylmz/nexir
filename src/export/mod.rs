@@ -9,3 +9,4 @@ pub mod muxer;
 pub mod queue;
 pub mod progress;
 pub mod engine;
+pub mod decode_worker;

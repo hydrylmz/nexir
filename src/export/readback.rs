@@ -115,4 +115,56 @@ impl FrameReadback {
         }
         &self.strip_buf
     }
+
+    /// Zero-copy readback: map → strip padding directly from mapped view → unmap.
+    ///
+    /// Combines `map_read`, `strip_padding`, and `unmap` into a single call that
+    /// avoids the intermediate `Vec<u8>` allocation. The mapped GPU buffer is read
+    /// directly into the pre-allocated `strip_buf`, then unmapped immediately.
+    /// Returns owned bytes suitable for sending to the encoder queue.
+    ///
+    /// This eliminates 2 of the 3 full-frame copies that the old path performed:
+    ///   OLD: map → to_vec() [COPY 1] → strip_padding [COPY 2] → to_owned() [COPY 3]
+    ///   NEW: map → strip directly from view [COPY 1] → to_vec() [COPY 2 — unavoidable for queue ownership]
+    pub fn map_strip_unmap(
+        &mut self,
+        slot:   usize,
+        device: &GpuDevice,
+        sid:    wgpu::SubmissionIndex,
+    ) -> Result<Vec<u8>, String> {
+        let raw_bpr = (self.width * 8) as usize;
+        let pad_bpr = self.bytes_per_row as usize;
+
+        // Map the readback buffer.
+        let slice = self.buffers[slot].slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |v| { tx.send(v).unwrap(); });
+        device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+        if let Err(_) = rx.recv().map_err(|e| e.to_string())? {
+            return Err("Failed to map buffer".to_string());
+        }
+        let view = slice.get_mapped_range();
+
+        // Strip padding directly from the mapped GPU buffer into strip_buf.
+        // No intermediate Vec<u8> allocation — we read from the mapped view.
+        let padded_data: &[u8] = &view;
+        if raw_bpr == pad_bpr {
+            // No padding — bulk copy in one shot.
+            self.strip_buf.copy_from_slice(&padded_data[..raw_bpr * self.height as usize]);
+        } else {
+            for r in 0..self.height as usize {
+                let src = r * pad_bpr;
+                let dst = r * raw_bpr;
+                self.strip_buf[dst..dst + raw_bpr]
+                    .copy_from_slice(&padded_data[src..src + raw_bpr]);
+            }
+        }
+
+        // Release the mapped view and unmap before returning.
+        drop(view);
+        self.buffers[slot].unmap();
+
+        // Return owned bytes for the encoder queue.
+        Ok(self.strip_buf.to_vec())
+    }
 }

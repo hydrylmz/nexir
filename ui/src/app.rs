@@ -123,14 +123,19 @@ impl NexirApp {
             egui_ctx.clone(), egui::ViewportId::ROOT, window,
             Some(window.scale_factor() as f32), None,
         );
+        log::info!("NexirApp::new: creating egui_renderer...");
         let egui_renderer = Renderer::new(device.device.as_ref(), *device.surface_format.lock().unwrap(), None, 1);
+        log::info!("NexirApp::new: egui_renderer created");
 
         let mut project = Project::new("Untitled Project");
         let _ = project.add_video_track("Video 1");
         let _ = project.add_video_track("Video 2");
         let _ = project.add_audio_track("Audio 1");
 
+        log::info!("NexirApp::new: compiling shaders...");
         let shaders = Arc::new(ShaderRegistry::compile_all(&device).unwrap());
+        log::info!("NexirApp::new: shaders compiled successfully");
+        
         let compute_cache = Arc::new(ComputePipelineCache::new());
 
         // Initialize Backend Systems
@@ -138,6 +143,7 @@ impl NexirApp {
         
         let pool = Arc::new(FrameSlotPool::new(&device));
         let cache = Arc::new(FrameCache::new(pool.clone(), 32));
+        log::info!("NexirApp::new: pool and cache created");
         
         let (prefetch_tx, prefetch_rx) = std::sync::mpsc::sync_channel::<PrefetchRequest>(16);
         
@@ -149,6 +155,7 @@ impl NexirApp {
             prefetch_tx,
             project_tb,
         ));
+        log::info!("NexirApp::new: io_layer created");
         
         let prefetch_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker = PrefetchWorker::new(prefetch_rx, io_layer.clone(), cache, prefetch_shutdown);
@@ -158,6 +165,7 @@ impl NexirApp {
         let canvas_w = 1920;
         let canvas_h = 1080;
         let frame_scheduler = FrameScheduler::new(io_layer.clone(), canvas_w, canvas_h);
+        log::info!("NexirApp::new: frame_scheduler created");
 
         // Blit pipeline for preview
         let blit_bgl = device.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -196,6 +204,7 @@ impl NexirApp {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
+        log::info!("NexirApp::new: blit resources created");
 
         // Set up audio engine
         let project_tb = Rational { num: 1, den: 90_000 };
@@ -204,13 +213,18 @@ impl NexirApp {
         let audio_shutdown = Arc::new(AtomicBool::new(false));
         let audio_seek = Arc::new(Mutex::new(None::<(i64, i64)>));
 
+        log::info!("NexirApp::new: CPAL audio stream opening...");
         let audio_out = AudioOutputStream::open(
             Arc::clone(&audio_ring),
             Arc::clone(&audio_clock),
         ).map_err(|e| eprintln!("[audio] Failed to open output: {:?}", e)).ok();
+        log::info!("NexirApp::new: CPAL audio stream status: {:?}", audio_out.is_some());
 
+        log::info!("NexirApp::new: InteropCapability probing...");
         let interop_capability = InteropCapability::probe(&device);
+        log::info!("NexirApp::new: InteropCapability probed: {:?}", interop_capability);
 
+        log::info!("NexirApp::new: completed successfully!");
         Self {
             egui_ctx,
             egui_state,
@@ -843,11 +857,17 @@ impl NexirApp {
             None
         };
 
-        // Build a completely fresh IoLayer for export — no shared demuxer/decoder
-        // state with the live playback path. The prefetch channel receiver is
-        // dropped immediately; blocking decode is used throughout export.
+        // Build a completely fresh IoLayer for export — isolated from live playback.
+        //
+        // We intentionally drop the prefetch channel receiver immediately so that
+        // prime_export_prefetch's try_send calls do nothing. Export is sequential
+        // (frame 0, 1, 2...) and decode_blocking already tracks last_decoded_pts,
+        // so each call just reads the next packet without seeking — no prefetch
+        // benefit. A live prefetch worker causes a deadlock: it fills all 32 pool
+        // slots, evicts one, then tries to lock that slot's buffer mutex while the
+        // render thread holds it in upload_frame_data.
         let export_pool  = Arc::new(FrameSlotPool::new(&self.device));
-        let export_cache = Arc::new(FrameCache::new(export_pool.clone(), 8));
+        let export_cache = Arc::new(FrameCache::new(export_pool.clone(), 16));
         let (export_prefetch_tx, _export_prefetch_rx) =
             std::sync::mpsc::sync_channel::<PrefetchRequest>(1);
         let export_io = Arc::new(IoLayer::new(

@@ -243,13 +243,6 @@ impl ExportRenderer {
             // and eliminates the SID-is-None panic on the final drain iteration.
             let mut pending: Option<(usize, wgpu::SubmissionIndex)> = None;
 
-            // Fix D: prime the prefetch queue with all frame PTS in this segment
-            // so the prefetch worker can decode ahead while the GPU renders.
-            let pts_list: Vec<i64> = (segment.frame_start..segment.frame_end)
-                .map(|fi| self.job.frame_pts(fi))
-                .collect();
-            self.scheduler.io_layer().prime_export_prefetch(&pts_list);
-
             for frame_idx in segment.frame_start..=segment.frame_end {
                 // ── Render the current frame ──────────────────────────────────────
                 if frame_idx < segment.frame_end {
@@ -299,17 +292,11 @@ impl ExportRenderer {
                         let prev_slot = 1 - active_slot;
 
                         if let ExportBackend::Cpu { readback } = &mut self.backend {
-                            let view = readback.map_read(prev_slot, &self.device, prev_sid)
+                            let bytes = readback.map_strip_unmap(prev_slot, &self.device, prev_sid)
                                 .map_err(|e| {
-                                    log::error!("[export] map_read failed for frame {prev_idx}: {e}");
+                                    log::error!("[export] map_strip_unmap failed for frame {prev_idx}: {e}");
                                     RenderError::GpuTimeout
                                 })?;
-
-                            let padded: Vec<u8> = view.to_vec();
-                            drop(view);
-                            readback.unmap(prev_slot);
-
-                            let bytes = readback.strip_padding(&padded).to_owned();
 
                             queue.push(QueueItem::Frame(RawFrame {
                                 frame_index: prev_idx,
@@ -331,17 +318,11 @@ impl ExportRenderer {
                         let prev_slot = 1 - active_slot;
 
                         if let ExportBackend::Cpu { readback } = &mut self.backend {
-                            let view = readback.map_read(prev_slot, &self.device, prev_sid)
+                            let bytes = readback.map_strip_unmap(prev_slot, &self.device, prev_sid)
                                 .map_err(|e| {
-                                    log::error!("[export] map_read failed for frame {prev_idx} (drain): {e}");
+                                    log::error!("[export] map_strip_unmap failed for frame {prev_idx} (drain): {e}");
                                     RenderError::GpuTimeout
                                 })?;
-
-                            let padded: Vec<u8> = view.to_vec();
-                            drop(view);
-                            readback.unmap(prev_slot);
-
-                            let bytes = readback.strip_padding(&padded).to_owned();
 
                             queue.push(QueueItem::Frame(RawFrame {
                                 frame_index: prev_idx,

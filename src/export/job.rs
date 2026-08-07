@@ -179,7 +179,7 @@ impl ExportJob {
             frame_rate,
             project_tb,
             render_threads: num_cpus::get().max(2) / 2,
-            cpu_preset: CpuPreset::Medium,
+            cpu_preset: CpuPreset::Ultrafast,
         }
     }
 

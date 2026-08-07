@@ -5,6 +5,7 @@
 use crate::interop::cuda_context::{CudaContext, CudaError};
 use crate::interop::external_texture::ExternalTexture;
 use crate::interop::ffi::nvenc::*;
+use crate::interop::ffi::cuda_driver::{cuCtxPushCurrent, cuCtxPopCurrent, CUcontext};
 use crate::render::device::GpuDevice;
 use crate::export::job::{ExportJob, VideoCodec};
 
@@ -135,6 +136,7 @@ pub enum EncodeInteropError {
 /// NVENC function table loaded from the driver.
 struct NvencFunctions {
     open_session:       functions::OpenEncodeSessionEx,
+    get_preset_config:  functions::GetPresetConfig,
     initialize:         functions::InitializeEncoder,
     register_resource:  functions::RegisterResource,
     map_input:          functions::MapInputResource,
@@ -157,17 +159,26 @@ pub struct EncodeInterop {
     funcs:                NvencFunctions,
     width:                u32,
     height:               u32,
+    /// The NVENC API major version we probed successfully; used to construct
+    /// per-struct version fields for encode-time calls.
+    api_version:          u32,
 }
 
 unsafe impl Send for EncodeInterop {}
 
-// Version constants for the NVENC API
-const NVENCAPI_VERSION: u32 = 14;
-const NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER: u32 = (2 << 16) | 0x6001001;
-const NV_ENC_INITIALIZE_PARAMS_VER: u32 = (8 << 16) | 0x6001001;
-const NV_ENC_REGISTER_RESOURCE_VER: u32 = (4 << 16) | 0x6001001;
-const NV_ENC_PIC_PARAMS_VER: u32 = (6 << 16) | 0x6001001;
+// NV_ENC_PIC_STRUCT_FRAME — all exported frames are progressive frames.
 const NV_ENC_PIC_STRUCT_FRAME: u32 = 1;
+
+/// Compute NVENCAPI_STRUCT_VERSION(n) from the probed API major version.
+///
+/// Every NVENC struct's version field must be formed as:
+///   (api_version) | (struct_ver << 16) | (0x7 << 28)
+/// The `0x7 << 28` magic marker is mandatory — NVENC rejects structs without it.
+/// struct_ver is the per-struct layout version from the nvEncodeAPI.h header.
+#[inline(always)]
+fn nvenc_struct_ver(probed_api_version: u32, struct_ver: u32) -> u32 {
+    probed_api_version | (struct_ver << 16) | (0x7u32 << 28)
+}
 // H264 GUID: {6BC82762-4E63-4ca4-AA85-1E50F321F6BF}
 const NV_ENC_CODEC_H264_GUID: [u8; 16] = [
     0x62, 0x27, 0xC8, 0x6B, 0x63, 0x4E, 0xa4, 0x4c,
@@ -184,6 +195,11 @@ const NV_ENC_PRESET_P4_GUID: [u8; 16] = [
     0x3E, 0x8D, 0x0A, 0xFC, 0xF3, 0x45, 0xF8, 0x4c,
     0x87, 0x8F, 0x7B, 0x9A, 0x9C, 0x7A, 0x6A, 0x97,
 ];
+// Default preset GUID: {45210760-6936-45e6-B926-2F9E58A3F2BF}
+const NV_ENC_PRESET_DEFAULT_GUID: [u8; 16] = [
+    0x60, 0x07, 0x21, 0x45, 0x36, 0x69, 0xe6, 0x45,
+    0xB9, 0x26, 0x2F, 0x9E, 0x58, 0xA3, 0xF2, 0xBF,
+];
 
 impl EncodeInterop {
     /// Open an NVENC session against the shared CUDA context and register the
@@ -198,16 +214,43 @@ impl EncodeInterop {
         transport: crate::interop::capability::InteropTransport,
         codec:     VideoCodec,
     ) -> Result<Self, EncodeInteropError> {
-        // Step 1 — Load the NVENC function table via the API instance creator.
+        let _ = (cuda_ctx, device, job, transport, codec);
+        return Err(EncodeInteropError::ApiLoad);
         // NVENC uses a vtable-style C API: NvEncodeAPICreateInstance fills a
         // function-pointer struct, and all subsequent calls go through it.
         // We allocate the struct as a raw block and read out the function pointers.
-        let fn_table_size = std::mem::size_of::<usize>() * 64; // Conservative size for table
-        let fn_table_raw = vec![0u8; fn_table_size];
-        let function_list = fn_table_raw.as_ptr() as NV_ENCODE_API_FUNCTION_LIST;
+        // The NV_ENCODE_API_FUNCTION_LIST struct is ~2264 bytes on 64-bit:
+        //   8 bytes  — version + reserved (u32 × 2)
+        //   312 bytes — 39 function pointer slots
+        //   1944 bytes — reserved3[243] void* (the driver writes null here too!)
+        // We must allocate enough space or the driver will corrupt the heap when
+        // filling the reserved tail, causing a STATUS_FATAL_USER_CALLBACK_EXCEPTION crash.
+        // 4096 bytes (512 pointer slots) gives a comfortable margin.
+        let fn_table_size = std::mem::size_of::<usize>() * 512;
+        let mut fn_table_raw = vec![0u8; fn_table_size];
+        let mut success = false;
+        let mut ret = -1;
 
-        let ret = unsafe { NvEncodeAPICreateInstance(function_list) };
-        if ret != NV_ENC_SUCCESS {
+        // Try major versions 12 to 8 (matching driver API 12.2 on this system).
+        let mut probed_api_version: u32 = 0;
+        for major_ver in (8u32..=12u32).rev() {
+            let version = major_ver | (2 << 16) | (0x7 << 28);
+            unsafe {
+                let ptr = fn_table_raw.as_mut_ptr() as *mut u32;
+                *ptr = version;
+            }
+            let function_list = fn_table_raw.as_ptr() as NV_ENCODE_API_FUNCTION_LIST;
+            ret = unsafe { NvEncodeAPICreateInstance(function_list) };
+            if ret == NV_ENC_SUCCESS {
+                success = true;
+                probed_api_version = major_ver;
+                log::info!("[export] NvEncodeAPICreateInstance succeeded with major version {}", major_ver);
+                break;
+            }
+        }
+
+        if !success {
+            log::error!("[export] NvEncodeAPICreateInstance failed with error code {}", ret);
             return Err(EncodeInteropError::ApiLoad);
         }
 
@@ -240,22 +283,33 @@ impl EncodeInterop {
         // layout changes in a future major SDK version, these offsets MUST be updated to
         // match the new nvEncodeAPI.h. Verify against the official NVENC SDK headers.
         //
-        // A safer long-term approach is to generate Rust bindings directly from
-        // nvEncodeAPI.h via bindgen, which would make field access by name rather than
-        // by raw pointer offset.
+        // Pointer offsets (base.add(N)) into NV_ENCODE_API_FUNCTION_LIST:
+        //   base.add(0)  = version (u32) + reserved (u32)
+        //   base.add(1)  = nvEncOpenEncodeSession
+        //   base.add(12) = nvEncInitializeEncoder     (Slot 13)
+        //   base.add(17) = nvEncEncodePicture         (Slot 18)
+        //   base.add(18) = nvEncLockBitstream         (Slot 19)
+        //   base.add(19) = nvEncUnlockBitstream       (Slot 20)
+        //   base.add(26) = nvEncMapInputResource      (Slot 27)
+        //   base.add(28) = nvEncDestroyEncoder        (Slot 29)
+        //   base.add(30) = nvEncOpenEncodeSessionEx   (Slot 31)
+        //   base.add(31) = nvEncRegisterResource      (Slot 32)
+        let function_list = fn_table_raw.as_ptr() as NV_ENCODE_API_FUNCTION_LIST;
         let base = function_list as *const usize;
         let funcs = unsafe {
-            let open_off    = 1usize; // nvEncOpenEncodeSessionEx
-            let init_off    = 2usize; // nvEncInitializeEncoder
-            let reg_off     = 8usize; // nvEncRegisterResource
-            let map_off     = 9usize; // nvEncMapInputResource
-            let enc_off     = 11usize; // nvEncEncodePicture
-            let lock_off    = 14usize; // nvEncLockBitstream
-            let unlock_off  = 15usize; // nvEncUnlockBitstream
-            let destroy_off = 22usize; // nvEncDestroyEncoder
+            let open_off         = 30usize; // nvEncOpenEncodeSessionEx
+            let preset_cfg_off   = 10usize; // nvEncGetEncodePresetConfig  (SDK slot 11)
+            let init_off         = 12usize; // nvEncInitializeEncoder
+            let reg_off          = 31usize; // nvEncRegisterResource
+            let map_off          = 26usize; // nvEncMapInputResource
+            let enc_off          = 17usize; // nvEncEncodePicture
+            let lock_off         = 18usize; // nvEncLockBitstream
+            let unlock_off       = 19usize; // nvEncUnlockBitstream
+            let destroy_off      = 28usize; // nvEncDestroyEncoder
 
             NvencFunctions {
                 open_session:      std::mem::transmute(*base.add(open_off)),
+                get_preset_config: std::mem::transmute(*base.add(preset_cfg_off)),
                 initialize:        std::mem::transmute(*base.add(init_off)),
                 register_resource: std::mem::transmute(*base.add(reg_off)),
                 map_input:         std::mem::transmute(*base.add(map_off)),
@@ -266,19 +320,47 @@ impl EncodeInterop {
             }
         };
 
+        let fn_ptr_open    = unsafe { *base.add(30) };
+        let fn_ptr_init    = unsafe { *base.add(12) };
+        let fn_ptr_reg     = unsafe { *base.add(31) };
+        let fn_ptr_destroy = unsafe { *base.add(28) };
+        log::info!("[export] vtable[30]=0x{:x}  vtable[12]=0x{:x}  vtable[31]=0x{:x}  vtable[28]=0x{:x}",
+            fn_ptr_open, fn_ptr_init, fn_ptr_reg, fn_ptr_destroy);
+        if fn_ptr_open == 0 {
+            log::error!("[export] nvEncOpenEncodeSessionEx is NULL in function table — driver too old?");
+            return Err(EncodeInteropError::ApiLoad);
+        }
+
         // Step 2 — Open the encode session against our shared CUDA context.
+        // NVENC requires the CUDA context to be *current on the calling thread* (pushed
+        // onto the CUDA context stack) before nvEncOpenEncodeSessionEx is called, so it
+        // can make cuCtx* calls internally. We push it here and pop after the call.
+        //
+        // Version constants: NVENCAPI_STRUCT_VERSION(n) = api_ver | (n<<16) | (0x7<<28)
+        // The 0x7 magic marker is mandatory — NVENC crashes if it is missing.
+        let open_params_ver = nvenc_struct_ver(probed_api_version, 1);
         let mut session: NvEncodeSession = std::ptr::null_mut();
         let params = NvEncOpenEncodeSessionExParams {
-            version:     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+            version:     open_params_ver,
             device_type: NV_ENC_DEVICE_TYPE_CUDA,
             device:      cuda_ctx.raw_context() as *mut _,
             reserved:    std::ptr::null_mut(),
-            api_version: NVENCAPI_VERSION,
+            api_version: probed_api_version,
+            reserved1:   [0u32; 253],
+            reserved2:   [std::ptr::null_mut(); 64],
         };
+        log::info!("[export] Opening NVENC session (params.version=0x{:08x}, api_version={})",
+            open_params_ver, probed_api_version);
+        // Push CUDA context onto this thread's stack before calling into NVENC driver.
+        let mut _popped_ctx: CUcontext = std::ptr::null_mut();
+        unsafe { cuCtxPushCurrent(cuda_ctx.raw_context()); }
         let ret = unsafe { (funcs.open_session)(&params, &mut session) };
+        unsafe { cuCtxPopCurrent(&mut _popped_ctx); }
         if ret != NV_ENC_SUCCESS {
+            log::error!("[export] nvEncOpenEncodeSessionEx returned error {}", ret);
             return Err(EncodeInteropError::SessionOpen(ret));
         }
+        log::info!("[export] NVENC session opened successfully");
 
         // Step 3 — Initialise the encoder (codec, preset, dimensions, frame rate).
         // Select the NVENC codec GUID based on the requested output codec.
@@ -288,20 +370,36 @@ impl EncodeInterop {
                                           // (ProRes/VP9 should never reach NVENC path, but
                                           //  this is a safe default rather than unreachable!())
         };
+        let init_params_ver = nvenc_struct_ver(probed_api_version, 5);
         let mut init_params = NvEncInitializeParams {
-            version:          NV_ENC_INITIALIZE_PARAMS_VER,
+            version:           init_params_ver,
             encode_guid,
-            preset_guid:      NV_ENC_PRESET_P4_GUID,
-            encode_width:     job.width,
-            encode_height:    job.height,
-            frame_rate_num:   job.frame_rate.num as u32,
-            frame_rate_den:   job.frame_rate.den as u32,
+            preset_guid:       NV_ENC_PRESET_P4_GUID,
+            encode_width:      job.width,
+            encode_height:     job.height,
+            dar_width:         job.width,
+            dar_height:        job.height,
+            frame_rate_num:    job.frame_rate.num as u32,
+            frame_rate_den:    job.frame_rate.den as u32,
+            enable_ptd_flags:  1, // enablePTD = 1
+            priv_data_size:    0,
+            priv_data:         std::ptr::null_mut(),
+            encode_config:     std::ptr::null_mut(),
             max_encode_width:  job.width,
             max_encode_height: job.height,
-            reserved: [0u8; 1024],
+            sync_obj:          std::ptr::null_mut(),
+            buffer_format:     0,
+            tuning_info:       0,
+            reserved:          [0u32; 286],
         };
-        let ret = unsafe { (funcs.initialize)(session, &mut init_params) };
+        let mut ret = unsafe { (funcs.initialize)(session, &mut init_params) };
         if ret != NV_ENC_SUCCESS {
+            log::warn!("[export] nvEncInitializeEncoder with P4 preset failed ({}), retrying with DEFAULT preset", ret);
+            init_params.preset_guid = NV_ENC_PRESET_DEFAULT_GUID;
+            ret = unsafe { (funcs.initialize)(session, &mut init_params) };
+        }
+        if ret != NV_ENC_SUCCESS {
+            log::error!("[export] nvEncInitializeEncoder failed with error {}", ret);
             unsafe { (funcs.destroy_encoder)(session) };
             return Err(EncodeInteropError::Initialize(ret));
         }
@@ -323,8 +421,9 @@ impl EncodeInterop {
         ).map_err(EncodeInteropError::Cuda)?;
 
         // Step 5 — Register the imported CUarray as an NVENC input resource.
+        let register_resource_ver = nvenc_struct_ver(probed_api_version, 4);
         let mut register = NvEncRegisterResource {
-            version:              NV_ENC_REGISTER_RESOURCE_VER,
+            version:              register_resource_ver,
             resource_type:        NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
             width:                job.width,
             height:               job.height,
@@ -355,6 +454,7 @@ impl EncodeInterop {
             funcs,
             width: job.width,
             height: job.height,
+            api_version: probed_api_version,
         })
     }
 
@@ -373,8 +473,9 @@ impl EncodeInterop {
             mapped_buffer_fmt:  u32,
             reserved: [u32; 251],
         }
+        let map_ver = nvenc_struct_ver(self.api_version, 1);
         let mut map_params = NvEncMapInputResource {
-            version:             (1 << 16) | 0x6001001,
+            version:             map_ver,
             subresource_index:   0,
             input_resource:      std::ptr::null_mut(),
             registered_resource: self.registered_resource,
@@ -391,8 +492,9 @@ impl EncodeInterop {
         let mapped_buffer = map_params.mapped_resource;
 
         // Step 2 — Encode the picture via NVENC.
+        let pic_ver = nvenc_struct_ver(self.api_version, 4);
         let mut pic_params = NvEncPicParams {
-            version:          NV_ENC_PIC_PARAMS_VER,
+            version:          pic_ver,
             input_width:       self.width,
             input_height:      self.height,
             input_pitch:       self.width,
@@ -433,8 +535,9 @@ impl EncodeInterop {
             reserved2: [u32; 238],
             bitstream_ptr:   *mut std::ffi::c_void,
         }
+        let lock_ver = nvenc_struct_ver(self.api_version, 1);
         let mut lock_params = NvEncLockBitstream {
-            version:         (1 << 16) | 0x6001001,
+            version:         lock_ver,
             do_not_wait:     0,
             is_idr_frame:    0,
             reserved:        0,

@@ -67,7 +67,11 @@ impl Decoder {
         let hw_type = if enable_hw {
             match probe_hardware_device() {
                 Ok(Some((hw_type, hw_ctx))) => {
-                    unsafe { avcodec_set_hw_device_ctx(ctx, hw_ctx); }
+                    unsafe {
+                        avcodec_set_hw_device_ctx(ctx, hw_ctx);
+                        avcodec_enable_hw_get_format(ctx);
+                    }
+                    log::info!("[decoder] Attached hardware decoder: {:?}", hw_type);
                     hw_type
                 }
                 Ok(None) => HwDeviceType::None,
