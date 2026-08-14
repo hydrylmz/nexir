@@ -4,9 +4,9 @@
 /// A colour in CIELAB space (D65 illuminant).
 #[derive(Copy, Clone, Debug)]
 pub struct Lab {
-    pub l: f64,   // Lightness: [0, 100]
-    pub a: f64,   // Green–red: [-128, 127]
-    pub b: f64,   // Blue–yellow: [-128, 127]
+    pub l: f64, // Lightness: [0, 100]
+    pub a: f64, // Green–red: [-128, 127]
+    pub b: f64, // Blue–yellow: [-128, 127]
 }
 
 /// A colour in linear sRGB (D65).
@@ -80,14 +80,22 @@ pub fn delta_e_2000(c1: Lab, c2: Lab) -> f64 {
     // h' in [0, 360°)
     let h1p = {
         let _h = a1p.atan2(c1.b).to_degrees(); // Note: atan2(y,x) — in CIE: atan2(b', a')
-        // Wait, the standard says h' = atan2(b', a') but we flipped args above
-        // atan2(b, a') gives angle in [-180, 180], then add 360 if < 0
+                                               // Wait, the standard says h' = atan2(b', a') but we flipped args above
+                                               // atan2(b, a') gives angle in [-180, 180], then add 360 if < 0
         let h = c1.b.atan2(a1p).to_degrees();
-        if h < 0.0 { h + 360.0 } else { h }
+        if h < 0.0 {
+            h + 360.0
+        } else {
+            h
+        }
     };
     let h2p = {
         let h = c2.b.atan2(a2p).to_degrees();
-        if h < 0.0 { h + 360.0 } else { h }
+        if h < 0.0 {
+            h + 360.0
+        } else {
+            h
+        }
     };
 
     // Step 3 — Deltas
@@ -133,8 +141,7 @@ pub fn delta_e_2000(c1: Lab, c2: Lab) -> f64 {
     let sl = 1.0 + 0.015 * l50.powi(2) / (20.0 + l50.powi(2)).sqrt();
     let sc = 1.0 + 0.045 * c_avgp;
 
-    let t = 1.0
-        - 0.17 * ((h_avgp - 30.0).to_radians()).cos()
+    let t = 1.0 - 0.17 * ((h_avgp - 30.0).to_radians()).cos()
         + 0.24 * (2.0 * h_avgp.to_radians()).cos()
         + 0.32 * ((3.0 * h_avgp + 6.0).to_radians()).cos()
         - 0.20 * ((4.0 * h_avgp - 63.0).to_radians()).cos();
@@ -161,8 +168,16 @@ mod tests {
     /// Sharma 2005 pair 1. Tolerance: < 0.0001.
     #[test]
     fn sharma_2005_pair_1() {
-        let c1 = Lab { l: 50.0000, a: 2.6772, b: -79.7751 };
-        let c2 = Lab { l: 50.0000, a: 0.0000, b: -82.7485 };
+        let c1 = Lab {
+            l: 50.0000,
+            a: 2.6772,
+            b: -79.7751,
+        };
+        let c2 = Lab {
+            l: 50.0000,
+            a: 0.0000,
+            b: -82.7485,
+        };
         let de = delta_e_2000(c1, c2);
         assert!((de - 2.0425).abs() < 0.0001, "got {de:.4}");
     }
@@ -170,15 +185,27 @@ mod tests {
     /// Sharma 2005 pair 17 (tests the RT rotation term).
     #[test]
     fn sharma_2005_pair_17() {
-        let c1 = Lab { l: 50.0000, a: 3.1571, b: -77.2803 };
-        let c2 = Lab { l: 50.0000, a: 2.8361, b: -74.0200 };
+        let c1 = Lab {
+            l: 50.0000,
+            a: 3.1571,
+            b: -77.2803,
+        };
+        let c2 = Lab {
+            l: 50.0000,
+            a: 2.8361,
+            b: -74.0200,
+        };
         let de = delta_e_2000(c1, c2);
         assert!((de - 4.8045).abs() < 0.0001, "got {de:.4}");
     }
 
     #[test]
     fn identical_colours_zero() {
-        let c = Lab { l: 50.0, a: 20.0, b: -10.0 };
+        let c = Lab {
+            l: 50.0,
+            a: 20.0,
+            b: -10.0,
+        };
         let de = delta_e_2000(c, c);
         assert!(de < 1e-6, "identical colours should give 0, got {de}");
     }

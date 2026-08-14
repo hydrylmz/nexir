@@ -1,24 +1,21 @@
-use std::sync::Arc;
-use crate::timeline::store::TimelineStore;
-use crate::timeline::source::SourceRegistry;
-use crate::timeline::query::{query_active, ActiveClip};
-use crate::scheduler::island::{build_islands, Island};
 use crate::io::io_layer::IoLayer;
-use crate::render::frame_state::{FrameState, ClipRenderEntry};
+use crate::render::frame_state::{ClipRenderEntry, FrameState};
+use crate::scheduler::island::{build_islands, Island};
+use crate::timeline::query::{query_active, ActiveClip};
+use crate::timeline::source::SourceRegistry;
+use crate::timeline::store::TimelineStore;
+use crate::timeline::track::{TrackKind, TrackList};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct FrameScheduler {
-    io_layer:    Arc<IoLayer>,
-    canvas_w:    u32,
-    canvas_h:    u32,
+    io_layer: Arc<IoLayer>,
+    canvas_w: u32,
+    canvas_h: u32,
 }
 
 impl FrameScheduler {
-    pub fn new(
-        io_layer:   Arc<IoLayer>,
-        canvas_w:   u32,
-        canvas_h:   u32,
-    ) -> Self {
+    pub fn new(io_layer: Arc<IoLayer>, canvas_w: u32, canvas_h: u32) -> Self {
         Self {
             io_layer,
             canvas_w,
@@ -31,30 +28,39 @@ impl FrameScheduler {
     }
 
     pub fn schedule_frame(
-        &self, 
-        pts: i64, 
-        store: &TimelineStore, 
-        source_reg: &SourceRegistry
+        &self,
+        pts: i64,
+        store: &TimelineStore,
+        tracks: &TrackList,
+        source_reg: &SourceRegistry,
     ) -> FrameState {
         // Step 1 — Query active clips
         let mut active: Vec<ActiveClip> = Vec::with_capacity(32);
         query_active(store, pts, &mut active);
 
-        // Step 2 — Build islands
+        // Step 2 — Filter out Audio-track clips — they must never enter the
+        // GPU render pipeline (they have no visual content to composite).
+        active.retain(|ac| {
+            let track_id = store.track_id_at(ac.store_index);
+            tracks
+                .get(track_id)
+                .map_or(true, |t| !matches!(t.kind, TrackKind::Audio { .. }))
+        });
+
+        // Step 3 — Build islands
         let islands = build_islands(store, source_reg, &active, pts);
 
-        // Step 3 — Sequential island processing (decode_blocking is I/O and
-        // would stall Rayon workers if run in parallel)
+        // Step 4 — Sequential island processing
         let entries: Vec<Vec<ClipRenderEntry>> = islands
             .iter()
             .map(|island| self.process_island(island))
             .collect();
 
-        // Step 4 — Flatten and sort by layer_order
+        // Step 5 — Flatten and sort by layer_order
         let mut all: Vec<ClipRenderEntry> = entries.into_iter().flatten().collect();
         all.sort_by_key(|e| e.layer_order);
 
-        // Step 5 — Build FrameState
+        // Step 6 — Build FrameState
         FrameState {
             pts,
             canvas_width: self.canvas_w,
@@ -74,13 +80,22 @@ impl FrameScheduler {
     /// decode as a last resort (same behaviour as `schedule_frame`).
     pub fn schedule_frame_cached(
         &self,
-        pts:         i64,
-        store:       &TimelineStore,
-        source_reg:  &SourceRegistry,
+        pts: i64,
+        store: &TimelineStore,
+        tracks: &TrackList,
+        source_reg: &SourceRegistry,
         max_wait_ms: u64,
     ) -> FrameState {
         let mut active: Vec<ActiveClip> = Vec::with_capacity(32);
         query_active(store, pts, &mut active);
+
+        // Filter out Audio-track clips (same as schedule_frame)
+        active.retain(|ac| {
+            let track_id = store.track_id_at(ac.store_index);
+            tracks
+                .get(track_id)
+                .map_or(true, |t| !matches!(t.kind, TrackKind::Audio { .. }))
+        });
 
         let islands = build_islands(store, source_reg, &active, pts);
 
@@ -94,7 +109,7 @@ impl FrameScheduler {
 
         FrameState {
             pts,
-            canvas_width:  self.canvas_w,
+            canvas_width: self.canvas_w,
             canvas_height: self.canvas_h,
             clips: all,
             test_textures: vec![],
@@ -105,21 +120,37 @@ impl FrameScheduler {
         let mut entries = Vec::with_capacity(island.clips.len());
 
         for clip in &island.clips {
-            let (fps, is_vfr, time_base) = self.io_layer.source_reg.read().unwrap().video_info(clip.source_id)
-                .map(|info| (info.frame_rate, info.is_vfr, info.time_base))
-                .unwrap_or((
-                    crate::timeline::rational::Rational { num: 30, den: 1 },
-                    false,
-                    crate::timeline::rational::Rational { num: 1, den: 90_000 }
-                ));
+            let (fps, is_vfr, time_base, is_still_image) = {
+                let source_reg = self.io_layer.source_reg.read().unwrap();
+                let is_still_image = source_reg
+                    .path(clip.source_id)
+                    .map(|path| crate::timeline::source::is_still_image_path(path.as_ref()))
+                    .unwrap_or(false);
+                let (fps, is_vfr, time_base) = source_reg
+                    .video_info(clip.source_id)
+                    .map(|info| (info.frame_rate, info.is_vfr, info.time_base))
+                    .unwrap_or((
+                        crate::timeline::rational::Rational { num: 30, den: 1 },
+                        false,
+                        crate::timeline::rational::Rational {
+                            num: 1,
+                            den: 90_000,
+                        },
+                    ));
+                (fps, is_vfr, time_base, is_still_image)
+            };
 
-            let project_tb = crate::timeline::rational::Rational { num: 1, den: 90_000 };
+            let project_tb = crate::timeline::rational::Rational {
+                num: 1,
+                den: 90_000,
+            };
 
-            let quantized_pts = if fps.num == 0 {
+            let quantized_pts = if is_still_image || fps.num == 0 {
                 0
             } else if is_vfr {
                 let stream_pts = project_tb.rescale_pts(clip.source_pts, time_base);
-                let stream_frame_duration = time_base.den as i64 * fps.den as i64 / (time_base.num as i64 * fps.num as i64);
+                let stream_frame_duration =
+                    time_base.den as i64 * fps.den as i64 / (time_base.num as i64 * fps.num as i64);
                 let quantized_stream_pts = if stream_frame_duration > 0 {
                     (stream_pts / stream_frame_duration) * stream_frame_duration
                 } else {
@@ -132,8 +163,8 @@ impl FrameScheduler {
             };
 
             // Spin-wait for the decode worker with exponential backoff.
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis(max_wait_ms);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(max_wait_ms);
             let mut sleep_us = 100u64;
             let slot_info = loop {
                 if let Some(s) = self.io_layer.cache.touch(clip.source_id, quantized_pts) {
@@ -146,20 +177,37 @@ impl FrameScheduler {
                 std::thread::sleep(std::time::Duration::from_micros(sleep_us));
                 sleep_us = (sleep_us * 2).min(4_000);
             };
+            // If this is a still image and decode worker couldn't provide a
+            // slot, still include a placeholder entry — UI will handle the
+            // still-image upload path. Otherwise, require a valid slot.
+            if is_still_image && slot_info.is_none() {
+                entries.push(ClipRenderEntry {
+                    source_id: clip.source_id,
+                    texture_slot: 0,
+                    layer_order: clip.layer_order,
+                    clip_width: clip.clip_width,
+                    clip_height: clip.clip_height,
+                    transform: clip.transform,
+                    opacity: clip.opacity,
+                    is_nv12: false,
+                });
+                continue;
+            }
 
             let (slot, is_nv12) = match slot_info {
                 Some(s) => s,
-                None    => continue,
+                None => continue,
             };
 
             let packed_slot = ((slot.tier as u32) << 16) | (slot.index as u32);
             entries.push(ClipRenderEntry {
+                source_id: clip.source_id,
                 texture_slot: packed_slot,
-                layer_order:  clip.layer_order,
-                clip_width:   clip.clip_width,
-                clip_height:  clip.clip_height,
-                transform:    clip.transform,
-                opacity:      clip.opacity,
+                layer_order: clip.layer_order,
+                clip_width: clip.clip_width,
+                clip_height: clip.clip_height,
+                transform: clip.transform,
+                opacity: clip.opacity,
                 is_nv12,
             });
         }
@@ -172,21 +220,37 @@ impl FrameScheduler {
 
         for clip in &island.clips {
             // Get framerate to quantize source_pts
-            let (fps, is_vfr, time_base) = self.io_layer.source_reg.read().unwrap().video_info(clip.source_id)
-                .map(|info| (info.frame_rate, info.is_vfr, info.time_base))
-                .unwrap_or((
-                    crate::timeline::rational::Rational { num: 30, den: 1 },
-                    false,
-                    crate::timeline::rational::Rational { num: 1, den: 90_000 }
-                ));
-            
-            let project_tb = crate::timeline::rational::Rational { num: 1, den: 90_000 };
+            let (fps, is_vfr, time_base, is_still_image) = {
+                let source_reg = self.io_layer.source_reg.read().unwrap();
+                let is_still_image = source_reg
+                    .path(clip.source_id)
+                    .map(|path| crate::timeline::source::is_still_image_path(path.as_ref()))
+                    .unwrap_or(false);
+                let (fps, is_vfr, time_base) = source_reg
+                    .video_info(clip.source_id)
+                    .map(|info| (info.frame_rate, info.is_vfr, info.time_base))
+                    .unwrap_or((
+                        crate::timeline::rational::Rational { num: 30, den: 1 },
+                        false,
+                        crate::timeline::rational::Rational {
+                            num: 1,
+                            den: 90_000,
+                        },
+                    ));
+                (fps, is_vfr, time_base, is_still_image)
+            };
 
-            let quantized_pts = if fps.num == 0 {
+            let project_tb = crate::timeline::rational::Rational {
+                num: 1,
+                den: 90_000,
+            };
+
+            let quantized_pts = if is_still_image || fps.num == 0 {
                 0 // For images or unknown, always ask for frame 0
             } else if is_vfr {
                 let stream_pts = project_tb.rescale_pts(clip.source_pts, time_base);
-                let stream_frame_duration = time_base.den as i64 * fps.den as i64 / (time_base.num as i64 * fps.num as i64);
+                let stream_frame_duration =
+                    time_base.den as i64 * fps.den as i64 / (time_base.num as i64 * fps.num as i64);
                 let quantized_stream_pts = if stream_frame_duration > 0 {
                     (stream_pts / stream_frame_duration) * stream_frame_duration
                 } else {
@@ -198,23 +262,46 @@ impl FrameScheduler {
                 (clip.source_pts / frame_duration) * frame_duration
             };
 
+            if is_still_image {
+                // For still images, don't attempt to decode via the video slot pool.
+                // Still-image upload is handled on the UI side (StillImageUploadNode),
+                // so include a placeholder entry with texture_slot=0. This prevents
+                // the scheduler from dropping image clips when the slot pool has
+                // no decode entry for them.
+                entries.push(ClipRenderEntry {
+                    source_id: clip.source_id,
+                    texture_slot: 0,
+                    layer_order: clip.layer_order,
+                    clip_width: clip.clip_width,
+                    clip_height: clip.clip_height,
+                    transform: clip.transform,
+                    opacity: clip.opacity,
+                    is_nv12: false,
+                });
+                continue;
+            }
+
             // Try cache first (fast path); fall back to blocking decode.
-            let slot_info = self.io_layer.cache.touch(clip.source_id, quantized_pts)
+            let slot_info = self
+                .io_layer
+                .cache
+                .touch(clip.source_id, quantized_pts)
                 .or_else(|| self.io_layer.decode_blocking(clip.source_id, quantized_pts));
 
             let (slot, is_nv12) = match slot_info {
                 Some(s) => s,
-                None    => continue,  // source not importable / pool full
+                None => continue, // source not importable / pool full
             };
 
             let packed_slot = ((slot.tier as u32) << 16) | (slot.index as u32);
             entries.push(ClipRenderEntry {
+                source_id: clip.source_id,
                 texture_slot: packed_slot,
-                layer_order:  clip.layer_order,
-                clip_width:   clip.clip_width,
-                clip_height:  clip.clip_height,
-                transform:    clip.transform,
-                opacity:      clip.opacity,
+                layer_order: clip.layer_order,
+                clip_width: clip.clip_width,
+                clip_height: clip.clip_height,
+                transform: clip.transform,
+                opacity: clip.opacity,
                 is_nv12,
             });
         }

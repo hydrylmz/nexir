@@ -1,7 +1,7 @@
-use nexir::export::job::{ExportJob, Container, VideoCodec, AudioCodec, VideoQuality};
-use nexir::export::video_encoder::{VideoEncoder, VideoEncoderBackend};
 use nexir::export::audio_encoder::AudioMuxEncoder;
+use nexir::export::job::{AudioCodec, Container, ExportJob, VideoCodec, VideoQuality};
 use nexir::export::muxer::Muxer;
+use nexir::export::video_encoder::{VideoEncoder, VideoEncoderBackend};
 use nexir::io::ffi::avutil::AVRational;
 use nexir::timeline::rational::Rational;
 use std::path::PathBuf;
@@ -22,13 +22,13 @@ fn main() {
         pts_in: 0,
         pts_out: 3000,
     };
-    
+
     let video_enc = VideoEncoderBackend::FfmpegCpu(VideoEncoder::open(&job).unwrap());
     let audio_enc = AudioMuxEncoder::open(&job).unwrap();
-    
+
     let enc_video_tb = AVRational { num: 1, den: 30 };
     let enc_audio_tb = AVRational { num: 1, den: 48000 };
-    
+
     println!("Opening muxer...");
     match Muxer::open(&job, &video_enc, &audio_enc, enc_video_tb, enc_audio_tb) {
         Ok(_) => println!("Muxer opened successfully"),

@@ -91,6 +91,20 @@ impl IoLayer {
             return Some(slot);
         }
 
+        let is_still_image = self
+            .source_reg
+            .read()
+            .unwrap()
+            .path(source_id)
+            .map(|path| crate::timeline::source::is_still_image_path(path.as_ref()))
+            .unwrap_or(false);
+        if is_still_image {
+            let resolved_id = self.source_reg.read().unwrap().resolve_proxy(source_id);
+            self.demuxers.remove(&resolved_id);
+            self.decoders.remove(&resolved_id);
+            self.last_decoded_pts.remove(&source_id);
+        }
+
         let demuxer_arc = self.get_or_open_demuxer(source_id)?;
         let decoder_arc = self.get_or_open_decoder(source_id, &demuxer_arc)?;
 
@@ -99,14 +113,28 @@ impl IoLayer {
         let prev_pts = self.last_decoded_pts.get(&source_id).map(|v| *v).unwrap_or(i64::MIN);
         // 5 seconds in project timebase (90000 ticks/second)
         let five_seconds_pts = 5 * self.project_tb.den as i64;
-        let need_seek = prev_pts == i64::MIN || pts < prev_pts || (pts - prev_pts) > five_seconds_pts;
+        let need_seek = is_still_image
+            || prev_pts == i64::MIN
+            || pts < prev_pts
+            || (pts - prev_pts) > five_seconds_pts;
 
         let target_stream_pts = {
             if need_seek {
-                let mut demuxer = demuxer_arc.lock().unwrap();
-                let stream_pts = demuxer.seek(pts, self.project_tb).ok()?;
-                let mut decoder = decoder_arc.lock().unwrap();
-                decoder.seek_to(&mut demuxer, stream_pts).ok()?
+                if is_still_image {
+                    let stream_pts = {
+                        let demuxer = demuxer_arc.lock().unwrap();
+                        let stream_tb = demuxer.video_stream.as_ref()?.time_base;
+                        self.project_tb.rescale_pts(0, stream_tb)
+                    };
+                    let mut decoder = decoder_arc.lock().unwrap();
+                    decoder.flush();
+                    stream_pts
+                } else {
+                    let mut demuxer = demuxer_arc.lock().unwrap();
+                    let stream_pts = demuxer.seek(pts, self.project_tb).ok()?;
+                    let mut decoder = decoder_arc.lock().unwrap();
+                    decoder.seek_to(&mut demuxer, stream_pts).ok()?
+                }
             } else {
                 // Sequential path: translate project PTS to stream PTS without seeking
                 let demux = demuxer_arc.lock().unwrap();
@@ -202,7 +230,18 @@ impl IoLayer {
 
         let demux_lock = demuxer.lock().unwrap();
         let stream_info = demux_lock.video_stream.as_ref()?;
-        let decoder = Decoder::open(stream_info, stream_info.codecpar, true).ok()?;
+        let is_still_image = self
+            .source_reg
+            .read()
+            .unwrap()
+            .path(resolved_id)
+            .map(|path| crate::timeline::source::is_still_image_path(path.as_ref()))
+            .unwrap_or(false);
+        let decoder = if is_still_image {
+            Decoder::open_sw(stream_info, stream_info.codecpar).ok()?
+        } else {
+            Decoder::open(stream_info, stream_info.codecpar, true).ok()?
+        };
         let arc = Arc::new(Mutex::new(decoder));
         self.decoders.insert(resolved_id, arc.clone());
         Some(arc)

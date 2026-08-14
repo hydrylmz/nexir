@@ -1,13 +1,16 @@
-use winit::event_loop::{EventLoop, ControlFlow};
-use winit::window::WindowBuilder;
-use winit::event::{Event, WindowEvent};
-use std::sync::Arc;
-use nexir::render::device::GpuDevice;
 use log::info;
+use nexir::render::device::GpuDevice;
+use std::sync::Arc;
+use winit::event::{Event, WindowEvent};
+use winit::event_loop::{ControlFlow, EventLoop};
+use winit::window::WindowBuilder;
 
 mod app;
+mod audio_mixer;
 mod history;
+mod image_still;
 pub mod layout;
+mod waveform;
 
 struct SimpleFileLogger {
     file: std::sync::Mutex<Option<std::fs::File>>,
@@ -27,12 +30,17 @@ impl log::Log for SimpleFileLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        
-        let msg = format!("[{}] {} - {}\n", record.level(), record.target(), record.args());
-        
+
+        let msg = format!(
+            "[{}] {} - {}\n",
+            record.level(),
+            record.target(),
+            record.args()
+        );
+
         // Print to stderr
         eprint!("{}", msg);
-        
+
         // Write to file
         if let Ok(mut guard) = self.file.lock() {
             if let Some(file) = guard.as_mut() {
@@ -81,7 +89,7 @@ fn main() {
         } else {
             message.push_str("Unknown panic");
         }
-        
+
         let location = if let Some(loc) = panic_info.location() {
             format!("at {}:{}", loc.file(), loc.line())
         } else {
@@ -99,9 +107,9 @@ fn main() {
              {:#?}\n",
             message, location, backtrace
         );
-        
+
         eprint!("{}", log_content);
-        
+
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(dir) = exe_path.parent() {
                 let log_path = dir.join("nexir_crash.log");
@@ -113,11 +121,13 @@ fn main() {
     info!("Starting Nexir UI");
 
     let event_loop = EventLoop::new().unwrap();
-    let window = Arc::new(WindowBuilder::new()
-        .with_title("Nexir Video Editor")
-        .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
-        .build(&event_loop)
-        .unwrap());
+    let window = Arc::new(
+        WindowBuilder::new()
+            .with_title("Nexir Video Editor")
+            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+            .build(&event_loop)
+            .unwrap(),
+    );
 
     let size = window.inner_size();
 
@@ -133,34 +143,40 @@ fn main() {
 
     let mut app_state = app::NexirApp::new(Arc::clone(&device), &window);
 
-    event_loop.run(move |event, elwt| {
-        elwt.set_control_flow(ControlFlow::Poll);
+    event_loop
+        .run(move |event, elwt| {
+            elwt.set_control_flow(ControlFlow::Poll);
 
-        match event {
-            Event::WindowEvent { event, window_id } if window_id == window.id() => {
-                let response = app_state.handle_event(&window, &event);
-                if response.consumed {
-                    return;
-                }
+            match event {
+                Event::WindowEvent { event, window_id } if window_id == window.id() => {
+                    let response = app_state.handle_event(&window, &event);
+                    if response.consumed {
+                        return;
+                    }
 
-                match event {
-                    WindowEvent::CloseRequested => elwt.exit(),
-                    WindowEvent::Resized(physical_size) => {
-                        if physical_size.width > 0 && physical_size.height > 0 {
-                            device.configure_surface(&surface, physical_size.width, physical_size.height);
+                    match event {
+                        WindowEvent::CloseRequested => elwt.exit(),
+                        WindowEvent::Resized(physical_size) => {
+                            if physical_size.width > 0 && physical_size.height > 0 {
+                                device.configure_surface(
+                                    &surface,
+                                    physical_size.width,
+                                    physical_size.height,
+                                );
+                            }
                         }
+                        WindowEvent::RedrawRequested => {
+                            let viewport_size = app_state.update(&window);
+                            app_state.render(&*device, &surface, &window, viewport_size);
+                        }
+                        _ => {}
                     }
-                    WindowEvent::RedrawRequested => {
-                        let viewport_size = app_state.update(&window);
-                        app_state.render(&*device, &surface, &window, viewport_size);
-                    }
-                    _ => {}
                 }
+                Event::AboutToWait => {
+                    window.request_redraw();
+                }
+                _ => {}
             }
-            Event::AboutToWait => {
-                window.request_redraw();
-            }
-            _ => {}
-        }
-    }).unwrap();
+        })
+        .unwrap();
 }

@@ -1,26 +1,27 @@
 // src/export/renderer.rs
 
-use std::sync::Arc;
-use crate::render::device::GpuDevice;
-use crate::render::graph::{CompiledGraph, RenderGraphCompiler};
-use crate::render::resource::ResourceId;
-use crate::render::nodes::yuv_upload::YuvUploadNode;
-use crate::render::nodes::yuv_to_rgb::YuvToRgbNode;
-use crate::render::nodes::composite::CompositeNode;
-use crate::scheduler::frame_scheduler::FrameScheduler;
 use crate::export::job::ExportJob;
-use crate::timeline::store::TimelineStore;
-use crate::timeline::source::{SourceRegistry, ColorSpace};
-use crate::export::partitioner::ExportSegment;
-use crate::export::readback::FrameReadback;
-use crate::export::queue::{EncoderQueue, QueueItem};
-use crate::export::progress::{ProgressSender, ExportPhase};
-use crate::render::shader::registry::ShaderRegistry;
-use crate::render::compute::ComputePipelineCache;
-use crate::render::frame_state::FrameState;
-use crate::export::video_encoder::VideoEncoderBackend;
 use crate::export::muxer::Muxer;
+use crate::export::partitioner::ExportSegment;
+use crate::export::progress::{ExportPhase, ProgressSender};
+use crate::export::queue::{EncoderQueue, QueueItem};
+use crate::export::readback::FrameReadback;
+use crate::export::video_encoder::VideoEncoderBackend;
 use crate::interop::encode_interop::Abgr10RepackNode;
+use crate::render::compute::ComputePipelineCache;
+use crate::render::device::GpuDevice;
+use crate::render::frame_state::FrameState;
+use crate::render::graph::{CompiledGraph, RenderGraphCompiler};
+use crate::render::nodes::composite::CompositeNode;
+use crate::render::nodes::yuv_to_rgb::YuvToRgbNode;
+use crate::render::nodes::yuv_upload::YuvUploadNode;
+use crate::render::resource::ResourceId;
+use crate::render::shader::registry::ShaderRegistry;
+use crate::scheduler::frame_scheduler::FrameScheduler;
+use crate::timeline::source::{ColorSpace, SourceRegistry};
+use crate::timeline::store::TimelineStore;
+use crate::timeline::track::TrackList;
+use std::sync::Arc;
 
 pub enum ExportBackend {
     Cpu {
@@ -28,8 +29,8 @@ pub enum ExportBackend {
     },
     GpuNvenc {
         video_enc: VideoEncoderBackend,
-        muxer:     Arc<Muxer>,
-        repack:    Abgr10RepackNode,
+        muxer: Arc<Muxer>,
+        repack: Abgr10RepackNode,
     },
 }
 
@@ -41,44 +42,50 @@ const MAX_CLIPS: usize = 8;
 /// different texture sizes → different pipeline bind groups).
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct ClipSignature {
-    clip_width:  u32,
+    clip_width: u32,
     clip_height: u32,
-    is_nv12:     bool,
+    is_nv12: bool,
 }
 
 pub struct ExportRenderer {
-    device:         Arc<GpuDevice>,
-    scheduler:      Arc<FrameScheduler>,
-    pub backend:    ExportBackend,
-    job:            Arc<ExportJob>,
-    timeline:       Arc<std::sync::RwLock<TimelineStore>>,
-    sources:        Arc<std::sync::RwLock<SourceRegistry>>,
-    shaders:        Arc<ShaderRegistry>,
-    compute_cache:  Arc<ComputePipelineCache>,
+    device: Arc<GpuDevice>,
+    scheduler: Arc<FrameScheduler>,
+    pub backend: ExportBackend,
+    job: Arc<ExportJob>,
+    timeline: Arc<std::sync::RwLock<TimelineStore>>,
+    tracks: Arc<std::sync::RwLock<TrackList>>,
+    sources: Arc<std::sync::RwLock<SourceRegistry>>,
+    shaders: Arc<ShaderRegistry>,
+    compute_cache: Arc<ComputePipelineCache>,
 
     /// Current compiled render graph (None before first frame).
-    cached_graph:     Option<CompiledGraph>,
+    cached_graph: Option<CompiledGraph>,
     /// Clip signatures that the current cached graph was built for.
-    cached_sig:       Vec<ClipSignature>,
+    cached_sig: Vec<ClipSignature>,
     /// Indices of the YuvUploadNodes inside the cached graph (one per clip).
-    upload_indices:   Vec<usize>,
+    upload_indices: Vec<usize>,
 
     pub frames_done: usize,
 }
 
 impl ExportRenderer {
     pub fn new(
-        device:        Arc<GpuDevice>,
-        scheduler:     Arc<FrameScheduler>,
-        job:           Arc<ExportJob>,
-        timeline:      Arc<std::sync::RwLock<TimelineStore>>,
-        sources:       Arc<std::sync::RwLock<SourceRegistry>>,
-        shaders:       Arc<ShaderRegistry>,
+        device: Arc<GpuDevice>,
+        scheduler: Arc<FrameScheduler>,
+        job: Arc<ExportJob>,
+        timeline: Arc<std::sync::RwLock<TimelineStore>>,
+        tracks: Arc<std::sync::RwLock<TrackList>>,
+        sources: Arc<std::sync::RwLock<SourceRegistry>>,
+        shaders: Arc<ShaderRegistry>,
         compute_cache: Arc<ComputePipelineCache>,
-        backend:       ExportBackend,
+        backend: ExportBackend,
     ) -> Self {
-        log::info!("[export] ExportRenderer::new — canvas {}x{}, {} total frames",
-            job.width, job.height, job.total_frames());
+        log::info!(
+            "[export] ExportRenderer::new — canvas {}x{}, {} total frames",
+            job.width,
+            job.height,
+            job.total_frames()
+        );
 
         Self {
             device,
@@ -86,23 +93,28 @@ impl ExportRenderer {
             backend,
             job,
             timeline,
+            tracks,
             sources,
             shaders,
             compute_cache,
-            cached_graph:   None,
-            cached_sig:     Vec::new(),
+            cached_graph: None,
+            cached_sig: Vec::new(),
             upload_indices: Vec::new(),
-            frames_done:    0,
+            frames_done: 0,
         }
     }
 
     /// Compute the clip signature for `frame`.
     fn signature(frame: &FrameState) -> Vec<ClipSignature> {
-        frame.clips.iter().map(|c| ClipSignature {
-            clip_width:  c.clip_width,
-            clip_height: c.clip_height,
-            is_nv12:     c.is_nv12,
-        }).collect()
+        frame
+            .clips
+            .iter()
+            .map(|c| ClipSignature {
+                clip_width: c.clip_width,
+                clip_height: c.clip_height,
+                is_nv12: c.is_nv12,
+            })
+            .collect()
     }
 
     /// Compile (or reuse the cached) render graph for the active clips in `frame`.
@@ -119,10 +131,11 @@ impl ExportRenderer {
 
         log::info!(
             "[export] (re)compiling graph for {} clip(s) (was {})",
-            sig.len(), self.cached_sig.len()
+            sig.len(),
+            self.cached_sig.len()
         );
 
-        let mut compiler   = RenderGraphCompiler::new();
+        let mut compiler = RenderGraphCompiler::new();
         let mut id_counter = 2u32; // 0 = FINAL_COLOR, 1 = SCREEN (reserved)
 
         let mut comp_node = CompositeNode::new(
@@ -136,8 +149,8 @@ impl ExportRenderer {
         let mut upload_indices = Vec::with_capacity(sig.len());
 
         for (slot, clip) in frame.clips.iter().enumerate() {
-            let y_id    = ResourceId::next(&mut id_counter);
-            let uv_id   = ResourceId::next(&mut id_counter);
+            let y_id = ResourceId::next(&mut id_counter);
+            let uv_id = ResourceId::next(&mut id_counter);
             let rgba_id = ResourceId::next(&mut id_counter);
 
             // Create YuvUpload with the clip's ACTUAL dimensions so the GPU
@@ -179,10 +192,13 @@ impl ExportRenderer {
             .compile(self.job.width, self.job.height)
             .map_err(|_| RenderError::GraphOutput)?;
 
-        log::info!("[export] render graph compiled successfully ({} clip(s))", sig.len());
+        log::info!(
+            "[export] render graph compiled successfully ({} clip(s))",
+            sig.len()
+        );
 
-        self.cached_graph   = Some(graph);
-        self.cached_sig     = sig;
+        self.cached_graph = Some(graph);
+        self.cached_sig = sig;
         self.upload_indices = upload_indices;
 
         Ok(())
@@ -193,7 +209,7 @@ impl ExportRenderer {
     ///
     /// The graph must have been compiled by `ensure_graph` before calling this.
     fn upload_frame_data(&mut self, frame: &FrameState) {
-        let io    = self.scheduler.io_layer();
+        let io = self.scheduler.io_layer();
         let graph = self.cached_graph.as_mut().expect("graph not compiled");
         let nodes = graph.nodes_mut();
 
@@ -204,17 +220,15 @@ impl ExportRenderer {
             }
 
             let node_idx = self.upload_indices[slot_idx];
-            let node     = &mut nodes[node_idx];
+            let node = &mut nodes[node_idx];
 
             if let Some(upload) = node
                 .as_any_mut()
                 .and_then(|n| n.downcast_mut::<YuvUploadNode>())
             {
-                let tier    = (clip.texture_slot >> 16) as u8;
-                let index   = (clip.texture_slot & 0xFFFF) as u16;
+                let tier = (clip.texture_slot >> 16) as u8;
+                let index = (clip.texture_slot & 0xFFFF) as u16;
                 let slot_id = crate::io::slot_pool::FrameSlotId { tier, index };
-
-
 
                 io.pool.with_buffer_read(slot_id, |data| {
                     upload.upload_frame(data, clip.is_nv12, clip.clip_width, clip.clip_height);
@@ -227,12 +241,16 @@ impl ExportRenderer {
 
     pub fn render_segment(
         &mut self,
-        segment:  &ExportSegment,
-        queue:    &EncoderQueue,
+        segment: &ExportSegment,
+        queue: &EncoderQueue,
         progress: &ProgressSender,
     ) -> Result<(), RenderError> {
-        log::info!("[export] render_segment {} — frames {}..{}",
-            segment.index, segment.frame_start, segment.frame_end);
+        log::info!(
+            "[export] render_segment {} — frames {}..{}",
+            segment.index,
+            segment.frame_start,
+            segment.frame_end
+        );
 
         let is_cpu = matches!(self.backend, ExportBackend::Cpu { .. });
 
@@ -251,6 +269,7 @@ impl ExportRenderer {
                     let frame_state = self.scheduler.schedule_frame(
                         pts,
                         &self.timeline.read().unwrap(),
+                        &self.tracks.read().unwrap(),
                         &self.sources.read().unwrap(),
                     );
 
@@ -262,10 +281,10 @@ impl ExportRenderer {
                     self.upload_frame_data(&frame_state);
 
                     let mut encoder = self.device.begin_frame();
-                    let rtt_id      = ResourceId::FINAL_COLOR;
+                    let rtt_id = ResourceId::FINAL_COLOR;
 
                     let graph = self.cached_graph.as_mut().unwrap();
-                    
+
                     if let ExportBackend::Cpu { readback } = &mut self.backend {
                         graph.execute_with_callback(
                             &mut encoder,
@@ -292,15 +311,18 @@ impl ExportRenderer {
                         let prev_slot = 1 - active_slot;
 
                         if let ExportBackend::Cpu { readback } = &mut self.backend {
-                            let bytes = readback.map_strip_unmap(prev_slot, &self.device, prev_sid)
+                            let bytes = readback
+                                .map_strip_unmap(prev_slot, &self.device, prev_sid)
                                 .map_err(|e| {
-                                    log::error!("[export] map_strip_unmap failed for frame {prev_idx}: {e}");
+                                    log::error!(
+                                        "[export] map_strip_unmap failed for frame {prev_idx}: {e}"
+                                    );
                                     RenderError::GpuTimeout
                                 })?;
 
                             queue.push(QueueItem::Frame(RawFrame {
                                 frame_index: prev_idx,
-                                pts:  self.job.frame_pts(prev_idx),
+                                pts: self.job.frame_pts(prev_idx),
                                 data: bytes,
                             }));
                         }
@@ -326,7 +348,7 @@ impl ExportRenderer {
 
                             queue.push(QueueItem::Frame(RawFrame {
                                 frame_index: prev_idx,
-                                pts:  self.job.frame_pts(prev_idx),
+                                pts: self.job.frame_pts(prev_idx),
                                 data: bytes,
                             }));
                         }
@@ -338,7 +360,9 @@ impl ExportRenderer {
             }
 
             log::info!("[export] render_segment {} done", segment.index);
-            queue.push(QueueItem::SegmentDone { segment_index: segment.index });
+            queue.push(QueueItem::SegmentDone {
+                segment_index: segment.index,
+            });
         } else {
             // GPU NVENC path
             for frame_idx in segment.frame_start..segment.frame_end {
@@ -347,6 +371,7 @@ impl ExportRenderer {
                 let frame_state = self.scheduler.schedule_frame(
                     pts,
                     &self.timeline.read().unwrap(),
+                    &self.tracks.read().unwrap(),
                     &self.sources.read().unwrap(),
                 );
 
@@ -357,17 +382,23 @@ impl ExportRenderer {
                 self.upload_frame_data(&frame_state);
 
                 let mut encoder = self.device.begin_frame();
-                let rtt_id      = ResourceId::FINAL_COLOR;
+                let rtt_id = ResourceId::FINAL_COLOR;
 
                 let graph = self.cached_graph.as_mut().unwrap();
                 let width = self.job.width;
                 let height = self.job.height;
                 let device_ref = &self.device;
 
-                if let ExportBackend::GpuNvenc { video_enc, repack, muxer } = &mut self.backend {
+                if let ExportBackend::GpuNvenc {
+                    video_enc,
+                    repack,
+                    muxer,
+                } = &mut self.backend
+                {
                     let interop = video_enc.nvenc_interop().unwrap();
                     let abgr10_texture = interop.abgr10_texture();
-                    let abgr10_view = abgr10_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let abgr10_view =
+                        abgr10_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
                     graph.execute_with_callback(
                         &mut encoder,
@@ -392,7 +423,7 @@ impl ExportRenderer {
                     );
 
                     self.device.submit(encoder);
-                    
+
                     // Wait for GPU execution to complete.
                     self.device.device.poll(wgpu::Maintain::Wait);
 
@@ -415,7 +446,10 @@ impl ExportRenderer {
                 progress.report(self.frames_done, ExportPhase::Rendering);
             }
 
-            log::info!("[export] render_segment {} done (NVENC inline)", segment.index);
+            log::info!(
+                "[export] render_segment {} done (NVENC inline)",
+                segment.index
+            );
         }
 
         Ok(())
@@ -424,8 +458,8 @@ impl ExportRenderer {
 
 pub struct RawFrame {
     pub frame_index: usize,
-    pub pts:         i64,
-    pub data:        Vec<u8>,
+    pub pts: i64,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug)]

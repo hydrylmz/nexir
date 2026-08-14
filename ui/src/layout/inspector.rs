@@ -1,18 +1,18 @@
-use egui::{Ui, RichText, Color32};
-use nexir::project::Project;
 use crate::history::HistoryState;
+use egui::{Color32, RichText, Ui};
+use nexir::project::Project;
 
 pub struct InspectorState {
     // Local edit copies — written back to the project on change
-    pub scale:    f32,
-    pub pos_x:    f32,
-    pub pos_y:    f32,
+    pub scale: f32,
+    pub pos_x: f32,
+    pub pos_y: f32,
     pub rotation: f32,
-    pub opacity:  f32,
-    pub volume:   f32,
-    pub pan:      f32,
+    pub opacity: f32,
+    pub volume: f32,
+    pub pan: f32,
     pub audio_muted: bool,
-    pub speed:    f32,
+    pub speed: f32,
 
     /// The clip store-index we last loaded values from.
     /// Used to detect when the selection changes so we can reload.
@@ -22,15 +22,15 @@ pub struct InspectorState {
 impl Default for InspectorState {
     fn default() -> Self {
         Self {
-            scale:    1.0,
-            pos_x:    0.0,
-            pos_y:    0.0,
+            scale: 1.0,
+            pos_x: 0.0,
+            pos_y: 0.0,
             rotation: 0.0,
-            opacity:  100.0,
-            volume:   100.0,
-            pan:      0.0,
+            opacity: 100.0,
+            volume: 100.0,
+            pan: 0.0,
             audio_muted: false,
-            speed:    1.0,
+            speed: 1.0,
             last_loaded_clip: None,
         }
     }
@@ -51,8 +51,8 @@ pub fn draw(
     egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
         .show(ui, |ui| {
-        draw_inner(ui, state, project, selected_clip, history);
-    });
+            draw_inner(ui, state, project, selected_clip, history);
+        });
 }
 
 fn draw_inner(
@@ -62,20 +62,19 @@ fn draw_inner(
     selected_clip: Option<usize>,
     history: &mut HistoryState,
 ) {
-
     // ── Sync local state when selection changes ──────────────────────────
     if selected_clip != state.last_loaded_clip || selected_clip.is_some() {
         if let Some(idx) = selected_clip {
             let t = project.clips.transform_at(idx);
-            state.pos_x    = t.position[0];
-            state.pos_y    = t.position[1];
-            state.scale    = t.scale[0];          // uniform scale (X)
+            state.pos_x = t.position[0];
+            state.pos_y = t.position[1];
+            state.scale = t.scale[0]; // uniform scale (X)
             state.rotation = t.rotation.to_degrees();
-            state.opacity  = project.clips.opacity_at(idx) * 100.0;
-            state.volume   = project.clips.volume_at(idx) * 100.0;
-            state.pan      = project.clips.pan_at(idx) * 100.0;
+            state.opacity = project.clips.opacity_at(idx) * 100.0;
+            state.volume = project.clips.volume_at(idx) * 100.0;
+            state.pan = project.clips.pan_at(idx) * 100.0;
             state.audio_muted = project.clips.audio_muted_at(idx);
-            state.speed    = project.clips.speed_at(idx);
+            state.speed = project.clips.speed_at(idx);
         } else {
             *state = InspectorState::default();
         }
@@ -131,7 +130,8 @@ fn draw_inner(
             let source_id = project.clips.source_id_at(idx);
             let clip_name = {
                 let sources = project.sources.read().unwrap();
-                sources.path(source_id)
+                sources
+                    .path(source_id)
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                     .unwrap_or_else(|| format!("Clip {}", idx))
             };
@@ -161,33 +161,43 @@ fn draw_inner(
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
                         ui.label("Scale");
-                        transform_changed |= ui.add(egui::Slider::new(&mut state.scale, 0.1..=5.0).suffix("x")).changed();
+                        transform_changed |= ui
+                            .add(egui::Slider::new(&mut state.scale, 0.1..=5.0).suffix("x"))
+                            .changed();
                         ui.end_row();
 
                         ui.label("Position X");
-                        transform_changed |= ui.add(egui::Slider::new(&mut state.pos_x, -1920.0..=1920.0).suffix("px")).changed();
+                        transform_changed |= ui
+                            .add(egui::Slider::new(&mut state.pos_x, -1920.0..=1920.0).suffix("px"))
+                            .changed();
                         ui.end_row();
 
                         ui.label("Position Y");
-                        transform_changed |= ui.add(egui::Slider::new(&mut state.pos_y, -1080.0..=1080.0).suffix("px")).changed();
+                        transform_changed |= ui
+                            .add(egui::Slider::new(&mut state.pos_y, -1080.0..=1080.0).suffix("px"))
+                            .changed();
                         ui.end_row();
 
                         ui.label("Rotation");
-                        transform_changed |= ui.add(egui::Slider::new(&mut state.rotation, -180.0..=180.0).suffix("°")).changed();
+                        transform_changed |= ui
+                            .add(egui::Slider::new(&mut state.rotation, -180.0..=180.0).suffix("°"))
+                            .changed();
                         ui.end_row();
 
                         ui.label("Opacity");
-                        opacity_changed |= ui.add(egui::Slider::new(&mut state.opacity, 0.0..=100.0).suffix("%")).changed();
+                        opacity_changed |= ui
+                            .add(egui::Slider::new(&mut state.opacity, 0.0..=100.0).suffix("%"))
+                            .changed();
                         ui.end_row();
                     });
 
                 ui.add_space(4.0);
                 if ui.button("↺  Reset").clicked() {
-                    state.scale    = 1.0;
-                    state.pos_x    = 0.0;
-                    state.pos_y    = 0.0;
+                    state.scale = 1.0;
+                    state.pos_x = 0.0;
+                    state.pos_y = 0.0;
                     state.rotation = 0.0;
-                    state.opacity  = 100.0;
+                    state.opacity = 100.0;
                     transform_changed = true;
                     opacity_changed = true;
                 }
@@ -200,7 +210,7 @@ fn draw_inner(
                 let t = project.clips.transform_at(idx);
                 let mut new_t = *t;
                 new_t.position = [state.pos_x, state.pos_y];
-                new_t.scale    = [state.scale, state.scale];
+                new_t.scale = [state.scale, state.scale];
                 new_t.rotation = state.rotation.to_radians();
                 project.clips.set_transform_at(idx, new_t);
             }
@@ -222,19 +232,23 @@ fn draw_inner(
                         ui.end_row();
 
                         ui.label("Volume");
-                        audio_changed |= ui.add(
-                            egui::Slider::new(&mut state.volume, 0.0..=200.0)
-                                .suffix("%")
-                                .fixed_decimals(0),
-                        ).changed();
+                        audio_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut state.volume, 0.0..=200.0)
+                                    .suffix("%")
+                                    .fixed_decimals(0),
+                            )
+                            .changed();
                         ui.end_row();
 
                         ui.label("Pan");
-                        audio_changed |= ui.add(
-                            egui::Slider::new(&mut state.pan, -100.0..=100.0)
-                                .suffix("%")
-                                .fixed_decimals(0),
-                        ).changed();
+                        audio_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut state.pan, -100.0..=100.0)
+                                    .suffix("%")
+                                    .fixed_decimals(0),
+                            )
+                            .changed();
                         ui.end_row();
                     });
 
@@ -262,8 +276,12 @@ fn draw_inner(
             });
             if audio_changed {
                 history.record(project);
-                project.clips.set_volume_at(idx, (state.volume / 100.0).clamp(0.0, 2.0));
-                project.clips.set_pan_at(idx, (state.pan / 100.0).clamp(-1.0, 1.0));
+                project
+                    .clips
+                    .set_volume_at(idx, (state.volume / 100.0).clamp(0.0, 2.0));
+                project
+                    .clips
+                    .set_pan_at(idx, (state.pan / 100.0).clamp(-1.0, 1.0));
                 project.clips.set_audio_muted_at(idx, state.audio_muted);
             }
 
@@ -279,20 +297,35 @@ fn draw_inner(
                         .spacing([8.0, 6.0])
                         .show(ui, |ui| {
                             ui.label("Speed");
-                            if ui.add(
-                                egui::Slider::new(&mut state.speed, 0.1..=8.0)
-                                    .suffix("x")
-                                    .logarithmic(true),
-                            ).changed() {
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut state.speed, 0.1..=8.0)
+                                        .suffix("x")
+                                        .logarithmic(true),
+                                )
+                                .changed()
+                            {
                                 history.record(project);
                                 project.clips.set_speed_at(idx, state.speed);
+                                let clip_id = project.clips.clip_id_at(idx);
+                                if let Some(linked_id) =
+                                    crate::layout::timeline::find_linked_clip(project, clip_id)
+                                {
+                                    if let Some(linked_idx) = project.clips.index_of(linked_id) {
+                                        project.clips.set_speed_at(linked_idx, state.speed);
+                                    }
+                                }
                             }
                             ui.end_row();
                         });
 
                     ui.add_space(4.0);
                     // Speed presets
-                    ui.label(RichText::new("Speed presets:").color(Color32::from_rgb(160, 160, 160)).small());
+                    ui.label(
+                        RichText::new("Speed presets:")
+                            .color(Color32::from_rgb(160, 160, 160))
+                            .small(),
+                    );
                     ui.horizontal(|ui| {
                         for (i, &preset) in [0.25_f32, 0.5, 1.0, 1.5, 2.0, 4.0].iter().enumerate() {
                             let btn = egui::Button::new(format!("{}×", preset)).small();
@@ -300,12 +333,19 @@ fn draw_inner(
                                 history.record(project);
                                 state.speed = preset;
                                 project.clips.set_speed_at(idx, preset);
+                                let clip_id = project.clips.clip_id_at(idx);
+                                if let Some(linked_id) =
+                                    crate::layout::timeline::find_linked_clip(project, clip_id)
+                                {
+                                    if let Some(linked_idx) = project.clips.index_of(linked_id) {
+                                        project.clips.set_speed_at(linked_idx, preset);
+                                    }
+                                }
                             }
                             let _ = i; // suppress warning
                         }
                     });
                     ui.add_space(4.0);
-
                 });
             let _ = speed_resp;
 

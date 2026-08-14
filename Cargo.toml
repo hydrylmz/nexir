@@ -26,6 +26,7 @@ num_cpus = "1"
 wgpu-hal = "0.19.4"
 ash = "0.38"
 log = "0.4"
+image = "0.24"
 
 [dev-dependencies]
 pollster = "0.3"

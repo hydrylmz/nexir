@@ -1,4 +1,4 @@
-use egui::{Ui, RichText, Color32};
+use egui::{Color32, RichText, Ui};
 use std::path::PathBuf;
 
 /// Represents a single imported media entry in the pool.
@@ -23,11 +23,20 @@ impl MediaEntry {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let kind = match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str() {
-            "mp4" | "mov" | "mkv" | "avi" | "webm" | "mxf" | "m4v" => MediaKind::Video,
-            "mp3" | "wav" | "aac" | "flac" | "ogg" | "m4a" => MediaKind::Audio,
-            "png" | "jpg" | "jpeg" | "bmp" | "tiff" | "tif" | "webp" => MediaKind::Image,
-            _ => MediaKind::Video, // default
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase()
+            .to_string();
+        let kind = if nexir::timeline::source::is_still_image_path(&path) {
+            MediaKind::Image
+        } else {
+            match ext.as_str() {
+                "mp4" | "mov" | "mkv" | "avi" | "webm" | "mxf" | "m4v" => MediaKind::Video,
+                "mp3" | "wav" | "aac" | "flac" | "ogg" | "m4a" => MediaKind::Audio,
+                _ => MediaKind::Video, // default
+            }
         };
         Self { path, name, kind }
     }
@@ -65,15 +74,18 @@ pub fn draw(ui: &mut Ui, state: &mut MediaPoolState) {
     ui.horizontal(|ui| {
         ui.strong(RichText::new("Media Pool").color(Color32::WHITE));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let import_btn = egui::Button::new(
-                RichText::new("+ Import").color(Color32::WHITE)
-            ).fill(Color32::from_rgb(0, 130, 220));
+            let import_btn = egui::Button::new(RichText::new("+ Import").color(Color32::WHITE))
+                .fill(Color32::from_rgb(0, 130, 220));
             if ui.add(import_btn).clicked() {
                 // Trigger native file dialog — runs on main thread synchronously via rfd blocking API
                 let files = rfd::FileDialog::new()
-                    .add_filter("Media", &["mp4", "mov", "mkv", "avi", "webm", "mxf", "m4v",
-                                           "mp3", "wav", "aac", "flac", "ogg", "m4a",
-                                           "png", "jpg", "jpeg", "bmp", "tiff", "webp"])
+                    .add_filter(
+                        "Media",
+                        &[
+                            "mp4", "mov", "mkv", "avi", "webm", "mxf", "m4v", "mp3", "wav", "aac",
+                            "flac", "ogg", "m4a", "png", "jpg", "jpeg", "bmp", "tiff", "webp",
+                        ],
+                    )
                     .set_title("Import Media")
                     .pick_files();
                 if let Some(paths) = files {
@@ -134,7 +146,11 @@ pub fn draw(ui: &mut Ui, state: &mut MediaPoolState) {
                             ui.add_space(4.0);
                             ui.label(
                                 RichText::new(&entry.name)
-                                    .color(if is_selected { Color32::WHITE } else { Color32::LIGHT_GRAY })
+                                    .color(if is_selected {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::LIGHT_GRAY
+                                    })
                                     .size(12.0),
                             );
                         });
@@ -145,7 +161,7 @@ pub fn draw(ui: &mut Ui, state: &mut MediaPoolState) {
                 if response.clicked() {
                     state.selected = Some(i);
                 }
-                
+
                 if response.drag_started() {
                     state.dragging_item = Some(entry.clone());
                 }

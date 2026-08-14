@@ -228,6 +228,15 @@ pub fn draw(
         }
     }
 
+    // ── Pending track property mutations (collected while iterating immutably) ──
+    enum TrackMutation {
+        ToggleMute(TrackId),
+        ToggleSolo(TrackId),
+        AddVideoTrack,
+        AddAudioTrack,
+    }
+    let mut pending_track_mutations: Vec<TrackMutation> = Vec::new();
+
     // ── Header / toolbar ─────────────────────────────────────────────
     ui.horizontal(|ui| {
         ui.strong(RichText::new("Timeline").color(Color32::WHITE));
@@ -258,6 +267,24 @@ pub fn draw(
         if ui.button("⏭").on_hover_text("Go to end").clicked() {
             state.playing = false;
             state.playhead_frame = project.duration_frames();
+        }
+
+        ui.separator();
+
+        // ── Add track buttons ─────────────────────────────────────────
+        if ui
+            .button("⊕ Video")
+            .on_hover_text("Add a new video track")
+            .clicked()
+        {
+            pending_track_mutations.push(TrackMutation::AddVideoTrack);
+        }
+        if ui
+            .button("⊕ Audio")
+            .on_hover_text("Add a new audio track")
+            .clicked()
+        {
+            pending_track_mutations.push(TrackMutation::AddAudioTrack);
         }
 
         ui.separator();
@@ -346,13 +373,6 @@ pub fn draw(
         media_path: Option<std::path::PathBuf>,
     }
     let mut pending_drop = PendingDrop::default();
-
-    // ── Pending track property mutations (collected while iterating immutably) ──
-    enum TrackMutation {
-        ToggleMute(TrackId),
-        ToggleSolo(TrackId),
-    }
-    let mut pending_track_mutations: Vec<TrackMutation> = Vec::new();
 
     // ── Is a clip currently being dragged? ───────────────────────────────
     let pointer_released = ui.input(|i| i.pointer.any_released());
@@ -919,6 +939,16 @@ pub fn draw(
                             track.solo = !track.solo;
                         }
                     }
+                    TrackMutation::AddVideoTrack => {
+                        history.record(project);
+                        let n = project.tracks.len();
+                        let _ = project.add_video_track(format!("Video {}", n + 1));
+                    }
+                    TrackMutation::AddAudioTrack => {
+                        history.record(project);
+                        let n = project.tracks.len();
+                        let _ = project.add_audio_track(format!("Audio {}", n + 1));
+                    }
                 }
             }
 
@@ -1476,15 +1506,6 @@ pub fn draw(
                     }
                     let pts_in = project.frame_to_pts(pending_drop.drop_frame);
                     let pts_out = pts_in + duration;
-                    let is_video_track = project.tracks.get(track_id).map_or(false, |t| {
-                        matches!(t.kind, nexir::timeline::track::TrackKind::Video)
-                    });
-                    let has_audio = project
-                        .sources
-                        .read()
-                        .unwrap()
-                        .audio_info(source_id)
-                        .is_ok();
 
                     history.record(project);
                     // Log clip insertion details so we can trace PNG vs JPG behavior.
@@ -1496,7 +1517,7 @@ pub fn draw(
                         pts_in,
                         pts_out
                     );
-                    let _ = project.insert_clip_overwrite(ClipInsertParams {
+                    let _ = project.insert_clip_ripple(ClipInsertParams {
                         track_id,
                         source_id,
                         pts_in,
@@ -1512,32 +1533,8 @@ pub fn draw(
                         pitch: 0.0,
                     });
 
-                    if is_video_track && has_audio {
-                        let audio_track_id = project
-                            .tracks
-                            .iter()
-                            .find(|t| {
-                                matches!(t.kind, nexir::timeline::track::TrackKind::Audio { .. })
-                            })
-                            .map(|t| t.id);
-                        if let Some(aud_track_id) = audio_track_id {
-                            let _ = project.insert_clip_overwrite(ClipInsertParams {
-                                track_id: aud_track_id,
-                                source_id,
-                                pts_in,
-                                pts_out,
-                                source_in: 0,
-                                layer_order: 0,
-                                opacity: 1.0,
-                                transform: ClipTransform::identity(),
-                                volume: 1.0,
-                                pan: 0.0,
-                                audio_muted: false,
-                                speed: 1.0,
-                                pitch: 0.0,
-                            });
-                        }
-                    }
+                    // NOTE: Auto-inserting an audio clip on import is intentionally disabled.
+                    // A future voice-separation feature will handle audio placement explicitly.
                 }
             }
 

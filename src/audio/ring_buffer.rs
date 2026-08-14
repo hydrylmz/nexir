@@ -8,19 +8,19 @@ use std::sync::Arc;
 /// so that modulo reduces to a cheap bitwise AND.
 pub struct AudioRingBuffer {
     /// Heap-allocated sample storage. Length = capacity (power of two).
-    data:       Box<[std::cell::UnsafeCell<f32>]>,
+    data: Box<[std::cell::UnsafeCell<f32>]>,
     /// Capacity — always a power of two.
-    capacity:   usize,
+    capacity: usize,
     /// Bitmask = capacity - 1 (used instead of %).
-    mask:       usize,
+    mask: usize,
     /// Write position (samples written total, wraps implicitly via mask).
     /// Written only by the producer thread.
-    write_pos:  AtomicUsize,
+    write_pos: AtomicUsize,
     /// Read position (samples consumed total).
     /// Written only by the consumer thread.
-    read_pos:   AtomicUsize,
+    read_pos: AtomicUsize,
     /// Underrun counter
-    underruns:  AtomicUsize,
+    underruns: AtomicUsize,
 }
 
 // SAFETY: AudioRingBuffer is explicitly designed for concurrent SPSC access.
@@ -30,7 +30,10 @@ unsafe impl Sync for AudioRingBuffer {}
 impl AudioRingBuffer {
     /// Allocate a ring buffer of `capacity_samples` F32 samples.
     pub fn new(capacity_samples: usize) -> Arc<Self> {
-        assert!(capacity_samples.is_power_of_two(), "capacity must be power of two");
+        assert!(
+            capacity_samples.is_power_of_two(),
+            "capacity must be power of two"
+        );
         let mut vec = Vec::with_capacity(capacity_samples);
         for _ in 0..capacity_samples {
             vec.push(std::cell::UnsafeCell::new(0.0f32));
@@ -78,7 +81,11 @@ impl AudioRingBuffer {
             let data_ptr = self.data.as_ptr() as *mut std::cell::UnsafeCell<f32> as *mut f32;
             std::ptr::copy_nonoverlapping(samples.as_ptr(), data_ptr.add(w), first_len);
             if second_len > 0 {
-                std::ptr::copy_nonoverlapping(samples.as_ptr().add(first_len), data_ptr, second_len);
+                std::ptr::copy_nonoverlapping(
+                    samples.as_ptr().add(first_len),
+                    data_ptr,
+                    second_len,
+                );
             }
         }
 
@@ -106,7 +113,11 @@ impl AudioRingBuffer {
             let data_ptr = self.data.as_ptr() as *const std::cell::UnsafeCell<f32> as *const f32;
             std::ptr::copy_nonoverlapping(data_ptr.add(r), out.as_mut_ptr(), first_len);
             if second_len > 0 {
-                std::ptr::copy_nonoverlapping(data_ptr, out.as_mut_ptr().add(first_len), second_len);
+                std::ptr::copy_nonoverlapping(
+                    data_ptr,
+                    out.as_mut_ptr().add(first_len),
+                    second_len,
+                );
             }
         }
 

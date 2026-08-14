@@ -3,10 +3,10 @@
 /// A parsed 3D LUT.
 pub struct Lut3D {
     /// Cube size per axis (e.g. 33 for a 33³ LUT).
-    pub size:       u32,
+    pub size: u32,
     /// Output RGB values, f32. Length = size³.
     /// Index: r + g * size + b * size²   (R varies fastest).
-    pub data:       Vec<[f32; 3]>,
+    pub data: Vec<[f32; 3]>,
     /// Input domain min (usually [0,0,0]).
     pub domain_min: [f32; 3],
     /// Input domain max (usually [1,1,1]).
@@ -37,9 +37,14 @@ impl Lut3D {
                 domain_min = parse_triple(rest, line_num)?;
             } else if let Some(rest) = trimmed.strip_prefix("DOMAIN_MAX") {
                 domain_max = parse_triple(rest, line_num)?;
-            } else if trimmed.chars().next().map_or(false, |c| c.is_ascii_digit() || c == '-' || c == '+') {
+            } else if trimmed
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_ascii_digit() || c == '-' || c == '+')
+            {
                 // Step 2 — Parse data line
-                let vals: Vec<f32> = trimmed.split_whitespace()
+                let vals: Vec<f32> = trimmed
+                    .split_whitespace()
                     .map(|s| s.parse::<f32>())
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|_| LutError::ParseError {
@@ -64,7 +69,10 @@ impl Lut3D {
         let n = size.ok_or(LutError::MissingSize)?;
         let expected = (n * n * n) as usize;
         if data.len() != expected {
-            return Err(LutError::DataCountMismatch { expected, got: data.len() });
+            return Err(LutError::DataCountMismatch {
+                expected,
+                got: data.len(),
+            });
         }
 
         // Step 4 — Normalise domain if non-standard
@@ -80,7 +88,12 @@ impl Lut3D {
             }
         }
 
-        Ok(Lut3D { size: n, data, domain_min, domain_max })
+        Ok(Lut3D {
+            size: n,
+            data,
+            domain_min,
+            domain_max,
+        })
     }
 
     /// Look up the LUT output for a given (r, g, b) input, using CPU trilinear interpolation.
@@ -103,14 +116,14 @@ impl Lut3D {
         let s = self.size as usize;
         let idx = |ri: usize, gi: usize, bi: usize| ri + gi * s + bi * s * s;
 
-        let c000 = self.data[idx(u0,   v0,   w0  )];
-        let c001 = self.data[idx(u0,   v0,   w0+1)];
-        let c010 = self.data[idx(u0,   v0+1, w0  )];
-        let c011 = self.data[idx(u0,   v0+1, w0+1)];
-        let c100 = self.data[idx(u0+1, v0,   w0  )];
-        let c101 = self.data[idx(u0+1, v0,   w0+1)];
-        let c110 = self.data[idx(u0+1, v0+1, w0  )];
-        let c111 = self.data[idx(u0+1, v0+1, w0+1)];
+        let c000 = self.data[idx(u0, v0, w0)];
+        let c001 = self.data[idx(u0, v0, w0 + 1)];
+        let c010 = self.data[idx(u0, v0 + 1, w0)];
+        let c011 = self.data[idx(u0, v0 + 1, w0 + 1)];
+        let c100 = self.data[idx(u0 + 1, v0, w0)];
+        let c101 = self.data[idx(u0 + 1, v0, w0 + 1)];
+        let c110 = self.data[idx(u0 + 1, v0 + 1, w0)];
+        let c111 = self.data[idx(u0 + 1, v0 + 1, w0 + 1)];
 
         fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
             [
@@ -125,21 +138,24 @@ impl Lut3D {
         let c01 = lerp3(c010, c011, dw);
         let c10 = lerp3(c100, c101, dw);
         let c11 = lerp3(c110, c111, dw);
-        let c0  = lerp3(c00, c01, dv);
-        let c1  = lerp3(c10, c11, dv);
+        let c0 = lerp3(c00, c01, dv);
+        let c1 = lerp3(c10, c11, dv);
         lerp3(c0, c1, du)
     }
 }
 
 fn parse_triple(rest: &str, line_num: usize) -> Result<[f32; 3], LutError> {
-    let parts: Vec<f32> = rest.split_whitespace()
+    let parts: Vec<f32> = rest
+        .split_whitespace()
         .map(|s| s.parse::<f32>())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| LutError::InvalidHeader(format!("Invalid triple on line {}", line_num + 1)))?;
 
     if parts.len() < 3 {
         return Err(LutError::InvalidHeader(format!(
-            "Expected 3 values on line {}, got {}", line_num + 1, parts.len()
+            "Expected 3 values on line {}, got {}",
+            line_num + 1,
+            parts.len()
         )));
     }
     Ok([parts[0], parts[1], parts[2]])
@@ -189,7 +205,11 @@ mod tests {
         assert!((out[0]).abs() < 0.01 && (out[1]).abs() < 0.01 && (out[2]).abs() < 0.01);
 
         let out = lut.sample(1.0, 1.0, 1.0);
-        assert!((out[0] - 1.0).abs() < 0.01 && (out[1] - 1.0).abs() < 0.01 && (out[2] - 1.0).abs() < 0.01);
+        assert!(
+            (out[0] - 1.0).abs() < 0.01
+                && (out[1] - 1.0).abs() < 0.01
+                && (out[2] - 1.0).abs() < 0.01
+        );
     }
 
     #[test]
@@ -201,6 +221,9 @@ mod tests {
     #[test]
     fn data_count_mismatch_returns_error() {
         let src = "LUT_3D_SIZE 2\n0.0 0.0 0.0\n";
-        assert!(matches!(Lut3D::parse(src), Err(LutError::DataCountMismatch { .. })));
+        assert!(matches!(
+            Lut3D::parse(src),
+            Err(LutError::DataCountMismatch { .. })
+        ));
     }
 }

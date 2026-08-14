@@ -1,11 +1,12 @@
 // src/render/frame_state.rs
 
 use crate::timeline::transform::ClipTransform;
-// use crate::timeline::ids::SourceId; // Not needed strictly in Phase 2 unless used
+use crate::timeline::ids::SourceId;
 
 /// One clip's contribution to the current frame.
 #[derive(Clone, Debug)]
 pub struct ClipRenderEntry {
+    pub source_id:     SourceId,
     /// Which GPU texture slot holds this clip's decoded RGBA data.
     pub texture_slot:  u32,
     /// Z-order: 0 = bottom, higher = top.

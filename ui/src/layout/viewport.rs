@@ -1,21 +1,29 @@
-use egui::{Ui, RichText, Color32, Vec2, Align2, Rect, pos2};
-use nexir::project::Project;
-use crate::layout::timeline::TimelineState;
 use crate::history::HistoryState;
+use crate::layout::timeline::TimelineState;
+use egui::{Align2, Color32, Rect, RichText, Ui, Vec2, pos2};
+use nexir::project::Project;
 use nexir::timeline::query::ActiveClip;
 use nexir::timeline::transform::ClipTransform;
 
-fn clip_corners_ui(transform: &ClipTransform, clip_w: f32, clip_h: f32, draw_rect: Rect) -> [egui::Pos2; 4] {
+fn clip_corners_ui(
+    transform: &ClipTransform,
+    clip_w: f32,
+    clip_h: f32,
+    draw_rect: Rect,
+) -> [egui::Pos2; 4] {
     let m = transform.to_matrix(clip_w, clip_h, 1920.0, 1080.0);
-    
+
     let map_corner = |u: f32, v: f32| -> egui::Pos2 {
         let ndc_x = u * m[0] + v * m[3] + m[6];
         let ndc_y = u * m[1] + v * m[4] + m[7];
-        
+
         let nx = (ndc_x + 1.0) * 0.5;
         let ny = (1.0 - ndc_y) * 0.5;
-        
-        pos2(draw_rect.min.x + nx * draw_rect.width(), draw_rect.min.y + ny * draw_rect.height())
+
+        pos2(
+            draw_rect.min.x + nx * draw_rect.width(),
+            draw_rect.min.y + ny * draw_rect.height(),
+        )
     };
 
     [
@@ -30,8 +38,10 @@ fn is_point_in_quad(p: egui::Pos2, quad: &[egui::Pos2; 4]) -> bool {
     let mut inside = false;
     let mut j = 3;
     for i in 0..4 {
-        if ((quad[i].y > p.y) != (quad[j].y > p.y)) &&
-           (p.x < (quad[j].x - quad[i].x) * (p.y - quad[i].y) / (quad[j].y - quad[i].y) + quad[i].x) {
+        if ((quad[i].y > p.y) != (quad[j].y > p.y))
+            && (p.x
+                < (quad[j].x - quad[i].x) * (p.y - quad[i].y) / (quad[j].y - quad[i].y) + quad[i].x)
+        {
             inside = !inside;
         }
         j = i;
@@ -51,17 +61,21 @@ pub fn draw(
     history: &mut HistoryState,
 ) -> Vec2 {
     let fps = project.settings.frame_rate.num.max(1);
-    let f   = state.playhead_frame;
-    let ff  = f % fps;
-    let ss  = (f / fps) % 60;
-    let mm  = (f / (fps * 60)) % 60;
-    let hh  = f / (fps * 3600);
+    let f = state.playhead_frame;
+    let ff = f % fps;
+    let ss = (f / fps) % 60;
+    let mm = (f / (fps * 60)) % 60;
+    let hh = f / (fps * 3600);
     let timecode = format!("{:02}:{:02}:{:02}:{:02}", hh, mm, ss, ff);
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("Player").color(Color32::WHITE));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(timecode).monospace().color(Color32::LIGHT_GRAY));
+            ui.label(
+                RichText::new(timecode)
+                    .monospace()
+                    .color(Color32::LIGHT_GRAY),
+            );
         });
     });
 
@@ -89,7 +103,10 @@ pub fn draw(
     };
 
     let draw_rect = Rect::from_min_size(
-        pos2(rect.center().x - draw_w * 0.5, rect.center().y - draw_h * 0.5),
+        pos2(
+            rect.center().x - draw_w * 0.5,
+            rect.center().y - draw_h * 0.5,
+        ),
         Vec2::new(draw_w, draw_h),
     );
 
@@ -98,8 +115,11 @@ pub fn draw(
         ui.painter().image(tex_id, draw_rect, uv, Color32::WHITE);
     } else {
         ui.painter().text(
-            rect.center(), Align2::CENTER_CENTER, "No Media Selected",
-            egui::FontId::proportional(24.0), Color32::DARK_GRAY,
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No Media Selected",
+            egui::FontId::proportional(24.0),
+            Color32::DARK_GRAY,
         );
     }
 
@@ -108,12 +128,20 @@ pub fn draw(
         if let Some(pos) = ui.ctx().pointer_interact_pos() {
             let mut clicked_idx = None;
             for clip in active_clips.iter().rev() {
+                let track_id = project.clips.track_id_at(clip.store_index);
+                let is_video_track = project.tracks.get(track_id).map_or(false, |t| {
+                    matches!(t.kind, nexir::timeline::track::TrackKind::Video)
+                });
+                if !is_video_track {
+                    continue;
+                }
+
                 let source_id = project.clips.source_id_at(clip.store_index);
                 if let Ok(info) = project.sources.read().unwrap().video_info(source_id) {
                     let clip_w = info.width as f32;
                     let clip_h = info.height as f32;
                     let transform = project.clips.transform_at(clip.store_index);
-                    
+
                     let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect);
                     if is_point_in_quad(pos, &corners) {
                         clicked_idx = Some(clip.store_index);
@@ -128,139 +156,203 @@ pub fn draw(
     // Selected clip overlay
     if let Some(idx) = state.selected_clip {
         if active_clips.iter().any(|c| c.store_index == idx) {
-            let source_id = project.clips.source_id_at(idx);
-            if let Ok(info) = project.sources.read().unwrap().video_info(source_id) {
-                let clip_w = info.width as f32;
-                let clip_h = info.height as f32;
-                let transform = *project.clips.transform_at(idx);
-                let clip_id = project.clips.clip_id_at(idx);
-                
-                let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect);
-                
-                // Draw outline
-                for i in 0..4 {
-                    ui.painter().line_segment([corners[i], corners[(i + 1) % 4]], egui::Stroke::new(2.0, Color32::LIGHT_BLUE));
-                }
-                
-                let handle_radius = 6.0;
-                let delete_radius = 8.0;
-                let handle_rects = corners.map(|corner| {
-                    Rect::from_center_size(corner, Vec2::splat(handle_radius * 3.0))
-                });
-                let tr = corners[1];
-                let del_center = tr + egui::vec2(12.0, -12.0);
-                let del_rect = Rect::from_center_size(del_center, Vec2::splat(delete_radius * 2.5));
+            let track_id = project.clips.track_id_at(idx);
+            let is_video_track = project.tracks.get(track_id).map_or(false, |t| {
+                matches!(t.kind, nexir::timeline::track::TrackKind::Video)
+            });
+            if is_video_track {
+                let source_id = project.clips.source_id_at(idx);
+                if let Ok(info) = project.sources.read().unwrap().video_info(source_id) {
+                    let clip_w = info.width as f32;
+                    let clip_h = info.height as f32;
+                    let transform = *project.clips.transform_at(idx);
+                    let clip_id = project.clips.clip_id_at(idx);
 
-                let mut min = corners[0];
-                let mut max = corners[0];
-                for &corner in &corners[1..] {
-                    min.x = min.x.min(corner.x);
-                    min.y = min.y.min(corner.y);
-                    max.x = max.x.max(corner.x);
-                    max.y = max.y.max(corner.y);
-                }
-                let body_rect = Rect::from_min_max(min, max);
-                let move_resp = ui.interact(
-                    body_rect,
-                    egui::Id::new(("viewport_move", idx)),
-                    egui::Sense::drag(),
-                );
+                    let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect);
 
-                if move_resp.drag_started() && state.viewport_resize().is_none() {
-                    if let Some(pointer) = ui.ctx().pointer_interact_pos() {
-                        let started_on_handle = handle_rects.iter().any(|rect| rect.contains(pointer));
-                        if !started_on_handle && !del_rect.contains(pointer) && is_point_in_quad(pointer, &corners) {
-                            history.record(project);
-                            state.start_viewport_move(clip_id, pointer, transform);
-                        }
+                    // Draw outline
+                    for i in 0..4 {
+                        ui.painter().line_segment(
+                            [corners[i], corners[(i + 1) % 4]],
+                            egui::Stroke::new(2.0, Color32::LIGHT_BLUE),
+                        );
                     }
-                }
-                
-                // Resize Handles
-                for (i, (&corner, handle_rect)) in corners.iter().zip(handle_rects.iter()).enumerate() {
-                    let resize_id = egui::Id::new(("viewport_resize", idx, i));
-                    let resp = ui.interact(*handle_rect, resize_id, egui::Sense::drag());
 
-                    if resp.drag_started() {
+                    let handle_radius = 6.0;
+                    let delete_radius = 8.0;
+                    let handle_rects = corners.map(|corner| {
+                        Rect::from_center_size(corner, Vec2::splat(handle_radius * 3.0))
+                    });
+                    let tr = corners[1];
+                    let del_center = tr + egui::vec2(12.0, -12.0);
+                    let del_rect =
+                        Rect::from_center_size(del_center, Vec2::splat(delete_radius * 2.5));
+
+                    let mut min = corners[0];
+                    let mut max = corners[0];
+                    for &corner in &corners[1..] {
+                        min.x = min.x.min(corner.x);
+                        min.y = min.y.min(corner.y);
+                        max.x = max.x.max(corner.x);
+                        max.y = max.y.max(corner.y);
+                    }
+                    let body_rect = Rect::from_min_max(min, max);
+                    let move_resp = ui.interact(
+                        body_rect,
+                        egui::Id::new(("viewport_move", idx)),
+                        egui::Sense::drag(),
+                    );
+
+                    if move_resp.drag_started() && state.viewport_resize().is_none() {
                         if let Some(pointer) = ui.ctx().pointer_interact_pos() {
-                            history.record(project);
-                            state.start_viewport_resize(clip_id, i, pointer, transform);
+                            let started_on_handle =
+                                handle_rects.iter().any(|rect| rect.contains(pointer));
+                            if !started_on_handle
+                                && !del_rect.contains(pointer)
+                                && is_point_in_quad(pointer, &corners)
+                            {
+                                history.record(project);
+                                state.start_viewport_move(clip_id, pointer, transform);
+                            }
                         }
                     }
-                    
-                    let color = if resp.hovered() { Color32::WHITE } else { Color32::from_rgb(200, 200, 255) };
-                    ui.painter().circle_filled(corner, handle_radius, color);
-                    ui.painter().circle_stroke(corner, handle_radius, egui::Stroke::new(1.0, Color32::BLACK));
-                }
 
-                if let Some(movement) = state.viewport_move() {
-                    if movement.clip_id == clip_id && state.viewport_resize().is_none() {
-                        if let Some(pointer) = ui.ctx().pointer_interact_pos().or_else(|| ui.ctx().pointer_hover_pos()) {
-                            let delta = pointer - movement.start_pointer;
-                            let mut new_transform = movement.start_transform;
-                            new_transform.position[0] += delta.x * canvas_w / draw_rect.width();
-                            new_transform.position[1] += delta.y * canvas_h / draw_rect.height();
+                    // Resize Handles
+                    for (i, (&corner, handle_rect)) in
+                        corners.iter().zip(handle_rects.iter()).enumerate()
+                    {
+                        let resize_id = egui::Id::new(("viewport_resize", idx, i));
+                        let resp = ui.interact(*handle_rect, resize_id, egui::Sense::drag());
 
-                            project.clips.set_transform_at(idx, new_transform);
-                            ui.ctx().request_repaint();
+                        if resp.drag_started() {
+                            if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                                history.record(project);
+                                state.start_viewport_resize(clip_id, i, pointer, transform);
+                            }
                         }
 
-                        if ui.input(|input| input.pointer.any_released()) {
-                            state.finish_viewport_move();
+                        let color = if resp.hovered() {
+                            Color32::WHITE
+                        } else {
+                            Color32::from_rgb(200, 200, 255)
+                        };
+                        ui.painter().circle_filled(corner, handle_radius, color);
+                        ui.painter().circle_stroke(
+                            corner,
+                            handle_radius,
+                            egui::Stroke::new(1.0, Color32::BLACK),
+                        );
+                    }
+
+                    if let Some(movement) = state.viewport_move() {
+                        if movement.clip_id == clip_id && state.viewport_resize().is_none() {
+                            if let Some(pointer) = ui
+                                .ctx()
+                                .pointer_interact_pos()
+                                .or_else(|| ui.ctx().pointer_hover_pos())
+                            {
+                                let delta = pointer - movement.start_pointer;
+                                let mut new_transform = movement.start_transform;
+                                new_transform.position[0] += delta.x * canvas_w / draw_rect.width();
+                                new_transform.position[1] +=
+                                    delta.y * canvas_h / draw_rect.height();
+
+                                project.clips.set_transform_at(idx, new_transform);
+                                ui.ctx().request_repaint();
+                            }
+
+                            if ui.input(|input| input.pointer.any_released()) {
+                                state.finish_viewport_move();
+                            }
                         }
                     }
-                }
 
-                if let Some(resize) = state.viewport_resize() {
-                    if resize.clip_id == clip_id {
-                        if let Some(pointer) = ui.ctx().pointer_interact_pos().or_else(|| ui.ctx().pointer_hover_pos()) {
-                            let delta = pointer - resize.start_pointer;
-                            let scale_dir = match resize.handle_index {
-                                0 => -delta.x - delta.y,
-                                1 => delta.x - delta.y,
-                                2 => delta.x + delta.y,
-                                3 => -delta.x + delta.y,
-                                _ => 0.0,
-                            };
-                            let scale_delta = scale_dir * 0.003;
-                            let mut new_transform = resize.start_transform;
-                            let sign_x = if resize.start_transform.scale[0] < 0.0 { -1.0 } else { 1.0 };
-                            let sign_y = if resize.start_transform.scale[1] < 0.0 { -1.0 } else { 1.0 };
-                            new_transform.scale[0] += scale_delta * sign_x;
-                            new_transform.scale[1] += scale_delta * sign_y;
-                            
-                            if new_transform.scale[0].abs() < 0.01 { new_transform.scale[0] = 0.01 * sign_x; }
-                            if new_transform.scale[1].abs() < 0.01 { new_transform.scale[1] = 0.01 * sign_y; }
+                    if let Some(resize) = state.viewport_resize() {
+                        if resize.clip_id == clip_id {
+                            if let Some(pointer) = ui
+                                .ctx()
+                                .pointer_interact_pos()
+                                .or_else(|| ui.ctx().pointer_hover_pos())
+                            {
+                                let delta = pointer - resize.start_pointer;
+                                let scale_dir = match resize.handle_index {
+                                    0 => -delta.x - delta.y,
+                                    1 => delta.x - delta.y,
+                                    2 => delta.x + delta.y,
+                                    3 => -delta.x + delta.y,
+                                    _ => 0.0,
+                                };
+                                let scale_delta = scale_dir * 0.003;
+                                let mut new_transform = resize.start_transform;
+                                let sign_x = if resize.start_transform.scale[0] < 0.0 {
+                                    -1.0
+                                } else {
+                                    1.0
+                                };
+                                let sign_y = if resize.start_transform.scale[1] < 0.0 {
+                                    -1.0
+                                } else {
+                                    1.0
+                                };
+                                new_transform.scale[0] += scale_delta * sign_x;
+                                new_transform.scale[1] += scale_delta * sign_y;
 
-                            project.clips.set_transform_at(idx, new_transform);
-                            ui.ctx().request_repaint();
-                        }
+                                if new_transform.scale[0].abs() < 0.01 {
+                                    new_transform.scale[0] = 0.01 * sign_x;
+                                }
+                                if new_transform.scale[1].abs() < 0.01 {
+                                    new_transform.scale[1] = 0.01 * sign_y;
+                                }
 
-                        if ui.input(|input| input.pointer.any_released()) {
-                            state.finish_viewport_resize();
+                                project.clips.set_transform_at(idx, new_transform);
+                                ui.ctx().request_repaint();
+                            }
+
+                            if ui.input(|input| input.pointer.any_released()) {
+                                state.finish_viewport_resize();
+                            }
                         }
                     }
-                }
-                
-                // Delete Button
-                let del_resp = ui.interact(del_rect, egui::Id::new(("delete", idx)), egui::Sense::click());
-                
-                let del_color = if del_resp.hovered() { Color32::from_rgb(255, 50, 50) } else { Color32::RED };
-                ui.painter().circle_filled(del_center, delete_radius, del_color);
-                ui.painter().circle_stroke(del_center, delete_radius, egui::Stroke::new(1.0, Color32::WHITE));
-                ui.painter().line_segment(
-                    [del_center + egui::vec2(-3.0, -3.0), del_center + egui::vec2(3.0, 3.0)],
-                    egui::Stroke::new(2.0, Color32::WHITE)
-                );
-                ui.painter().line_segment(
-                    [del_center + egui::vec2(3.0, -3.0), del_center + egui::vec2(-3.0, 3.0)],
-                    egui::Stroke::new(2.0, Color32::WHITE)
-                );
-                
-                if del_resp.clicked() {
-                    history.record(project);
-                    let _ = nexir::timeline::mutation::remove_clip(&mut project.clips, clip_id);
-                    state.selected_clip = None;
+
+                    // Delete Button
+                    let del_resp = ui.interact(
+                        del_rect,
+                        egui::Id::new(("delete", idx)),
+                        egui::Sense::click(),
+                    );
+
+                    let del_color = if del_resp.hovered() {
+                        Color32::from_rgb(255, 50, 50)
+                    } else {
+                        Color32::RED
+                    };
+                    ui.painter()
+                        .circle_filled(del_center, delete_radius, del_color);
+                    ui.painter().circle_stroke(
+                        del_center,
+                        delete_radius,
+                        egui::Stroke::new(1.0, Color32::WHITE),
+                    );
+                    ui.painter().line_segment(
+                        [
+                            del_center + egui::vec2(-3.0, -3.0),
+                            del_center + egui::vec2(3.0, 3.0),
+                        ],
+                        egui::Stroke::new(2.0, Color32::WHITE),
+                    );
+                    ui.painter().line_segment(
+                        [
+                            del_center + egui::vec2(3.0, -3.0),
+                            del_center + egui::vec2(-3.0, 3.0),
+                        ],
+                        egui::Stroke::new(2.0, Color32::WHITE),
+                    );
+
+                    if del_resp.clicked() {
+                        history.record(project);
+                        let _ = nexir::timeline::mutation::remove_clip(&mut project.clips, clip_id);
+                        state.selected_clip = None;
+                    }
                 }
             }
         }
@@ -276,32 +368,39 @@ pub fn draw(
     ui.add_space(8.0);
 
     ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_justify(true), |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("⏮").on_hover_text("Go to start").clicked() {
-                    state.playhead_frame = 0;
-                    state.playing = false;
-                }
-                if ui.button("⏪").on_hover_text("Step back").clicked() {
-                    state.playing = false;
-                    state.playhead_frame = (state.playhead_frame - 1).max(0);
-                }
-                let play_label = if state.playing { "⏸" } else { "▶" };
-                let play_hint  = if state.playing { "Pause" } else { "Play" };
-                if ui.button(play_label).on_hover_text(play_hint).clicked() {
-                    state.playing = !state.playing;
-                    state.last_tick = if state.playing { Some(std::time::Instant::now()) } else { None };
-                }
-                if ui.button("⏩").on_hover_text("Step forward").clicked() {
-                    state.playing = false;
-                    state.playhead_frame += 1;
-                }
-                if ui.button("⏭").on_hover_text("Go to end").clicked() {
-                    state.playing = false;
-                    state.playhead_frame = project.duration_frames();
-                }
-            });
-        });
+        ui.with_layout(
+            egui::Layout::left_to_right(egui::Align::Center).with_main_justify(true),
+            |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("⏮").on_hover_text("Go to start").clicked() {
+                        state.playhead_frame = 0;
+                        state.playing = false;
+                    }
+                    if ui.button("⏪").on_hover_text("Step back").clicked() {
+                        state.playing = false;
+                        state.playhead_frame = (state.playhead_frame - 1).max(0);
+                    }
+                    let play_label = if state.playing { "⏸" } else { "▶" };
+                    let play_hint = if state.playing { "Pause" } else { "Play" };
+                    if ui.button(play_label).on_hover_text(play_hint).clicked() {
+                        state.playing = !state.playing;
+                        state.last_tick = if state.playing {
+                            Some(std::time::Instant::now())
+                        } else {
+                            None
+                        };
+                    }
+                    if ui.button("⏩").on_hover_text("Step forward").clicked() {
+                        state.playing = false;
+                        state.playhead_frame += 1;
+                    }
+                    if ui.button("⏭").on_hover_text("Go to end").clicked() {
+                        state.playing = false;
+                        state.playhead_frame = project.duration_frames();
+                    }
+                });
+            },
+        );
     });
 
     viewport_size

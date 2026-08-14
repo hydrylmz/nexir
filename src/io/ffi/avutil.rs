@@ -166,6 +166,16 @@ unsafe extern "C" {
         align:        std::ffi::c_int,
     ) -> std::ffi::c_int;
 
+    pub fn av_image_fill_arrays(
+        dst_data:     *mut *mut u8,
+        dst_linesize: *mut std::ffi::c_int,
+        src:          *const u8,
+        pix_fmt:      std::ffi::c_int,
+        width:        std::ffi::c_int,
+        height:       std::ffi::c_int,
+        align:        std::ffi::c_int,
+    ) -> std::ffi::c_int;
+
     /// Get the error string for an AVERROR code into a caller-supplied buffer.
     pub fn av_strerror(
         errnum:      std::ffi::c_int,

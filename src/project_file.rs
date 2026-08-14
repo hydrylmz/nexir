@@ -1,15 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use crate::project::{Project, ProjectSettings};
+use crate::timeline::ids::SourceId;
+use crate::timeline::source::{AudioStreamInfo, SourceRegistry, VideoStreamInfo};
 use crate::timeline::store::TimelineStore;
 use crate::timeline::track::TrackList;
-use crate::timeline::source::{
-    SourceRegistry, VideoStreamInfo, AudioStreamInfo,
-};
-use crate::timeline::ids::SourceId;
 
 /// The canonical .nexp file format version.
 const FORMAT_VERSION: u32 = 1;
@@ -34,12 +32,12 @@ pub struct ProjectFile {
 /// (instead of `Arc<PathBuf>`) so serde derives work without extra feature flags.
 #[derive(Serialize, Deserialize)]
 pub struct SourceRegistryFile {
-    pub ids:        Vec<SourceId>,
-    pub paths:      Vec<PathBuf>,
+    pub ids: Vec<SourceId>,
+    pub paths: Vec<PathBuf>,
     pub video_info: Vec<Option<VideoStreamInfo>>,
     pub audio_info: Vec<Option<AudioStreamInfo>>,
-    pub proxy_ids:  Vec<Option<SourceId>>,
-    pub next_id:    u32,
+    pub proxy_ids: Vec<Option<SourceId>>,
+    pub next_id: u32,
 }
 
 // ─────────────────────────────────────────────
@@ -50,12 +48,12 @@ impl From<&Project> for ProjectFile {
     fn from(project: &Project) -> Self {
         let sources_lock = project.sources.read().unwrap();
         let source_file = SourceRegistryFile {
-            ids:        sources_lock.ids.clone(),
-            paths:      sources_lock.paths.iter().map(|p| (**p).clone()).collect(),
+            ids: sources_lock.ids.clone(),
+            paths: sources_lock.paths.iter().map(|p| (**p).clone()).collect(),
             video_info: sources_lock.video_info.clone(),
             audio_info: sources_lock.audio_info.clone(),
-            proxy_ids:  sources_lock.proxy_ids.clone(),
-            next_id:    sources_lock.next_id,
+            proxy_ids: sources_lock.proxy_ids.clone(),
+            next_id: sources_lock.next_id,
         };
         drop(sources_lock);
 
@@ -84,37 +82,64 @@ impl From<ProjectFile> for Project {
             let path = pf.sources.paths[idx].clone();
             let mut vi = pf.sources.video_info[idx].clone();
             let mut ai = pf.sources.audio_info[idx].clone();
-            
+            let is_still_image = crate::timeline::source::is_still_image_path(&path);
+
             // If the project file was generated externally without stream info, reprobe it now
             if vi.is_none() || ai.is_none() {
                 if let Ok(demuxer) = crate::io::demuxer::Demuxer::open(&path) {
-                    let project_tb = crate::timeline::rational::Rational { num: 1, den: 90_000 };
-                    
+                    let project_tb = crate::timeline::rational::Rational {
+                        num: 1,
+                        den: 90_000,
+                    };
+
                     if vi.is_none() {
-                        vi = demuxer.video_stream.as_ref().map(|s| crate::timeline::source::VideoStreamInfo {
-                            width:        s.width.unwrap_or(1920),
-                            height:       s.height.unwrap_or(1080),
-                            frame_rate:   s.frame_rate.unwrap_or(crate::timeline::rational::Rational { num: 30, den: 1 }),
-                            pixel_fmt:    crate::timeline::source::PixelFormat::Yuv420p,
-                            color_space:  crate::timeline::source::ColorSpace::Bt709,
-                            duration_pts: project_tb.from_pts(s.duration, s.time_base),
-                            is_vfr:       s.is_vfr,
-                            time_base:    s.time_base,
+                        vi = demuxer.video_stream.as_ref().map(|s| {
+                            crate::timeline::source::VideoStreamInfo {
+                                width: s.width.unwrap_or(1920),
+                                height: s.height.unwrap_or(1080),
+                                frame_rate: if is_still_image {
+                                    crate::timeline::rational::Rational { num: 0, den: 1 }
+                                } else {
+                                    s.frame_rate.unwrap_or(crate::timeline::rational::Rational {
+                                        num: 30,
+                                        den: 1,
+                                    })
+                                },
+                                pixel_fmt: crate::timeline::source::PixelFormat::Yuv420p,
+                                color_space: crate::timeline::source::ColorSpace::Bt709,
+                                duration_pts: if is_still_image {
+                                    0
+                                } else {
+                                    project_tb.from_pts(s.duration, s.time_base)
+                                },
+                                is_vfr: !is_still_image && s.is_vfr,
+                                time_base: s.time_base,
+                            }
                         });
                     }
                     if ai.is_none() {
-                        ai = demuxer.audio_stream.as_ref().map(|s| crate::timeline::source::AudioStreamInfo {
-                            sample_rate:  48000, // standard default
-                            channels:     2,
-                            sample_fmt:   crate::timeline::source::SampleFormat::F32Interleaved,
-                            duration_pts: project_tb.from_pts(s.duration, s.time_base),
+                        ai = demuxer.audio_stream.as_ref().map(|s| {
+                            crate::timeline::source::AudioStreamInfo {
+                                sample_rate: 48000, // standard default
+                                channels: 2,
+                                sample_fmt: crate::timeline::source::SampleFormat::F32Interleaved,
+                                duration_pts: project_tb.from_pts(s.duration, s.time_base),
+                            }
                         });
                     }
                 }
             }
 
-            let pid  = pf.sources.proxy_ids[idx];
-            let sid  = registry.register(path, vi, ai);
+            if is_still_image {
+                if let Some(info) = vi.as_mut() {
+                    info.frame_rate = crate::timeline::rational::Rational { num: 0, den: 1 };
+                    info.duration_pts = 0;
+                    info.is_vfr = false;
+                }
+            }
+
+            let pid = pf.sources.proxy_ids[idx];
+            let sid = registry.register(path, vi, ai);
             if let Some(proxy) = pid {
                 let _ = registry.set_proxy(sid, proxy);
             }
@@ -139,7 +164,10 @@ impl From<ProjectFile> for Project {
 
 impl ProjectFile {
     /// Serialise a `Project` and write it to `path` as a `.nexp` JSON file.
-    pub fn save(path: impl AsRef<Path>, project: &Project) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save(
+        path: impl AsRef<Path>,
+        project: &Project,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let pf = ProjectFile::from(project);
         let json = serde_json::to_string_pretty(&pf)?;
         std::fs::write(path, json)?;
@@ -156,7 +184,8 @@ impl ProjectFile {
             return Err(format!(
                 "Project file uses format v{}, but this version of nexir only supports v{}",
                 pf.format_version, FORMAT_VERSION,
-            ).into());
+            )
+            .into());
         }
 
         Ok(Project::from(pf))

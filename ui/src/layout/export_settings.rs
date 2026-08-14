@@ -4,18 +4,18 @@
 // The user configures codec, quality, and hardware preference here,
 // then clicks Export to kick off the job.
 
-use nexir::export::job::{VideoCodec, AudioCodec, Container, VideoQuality};
+use nexir::export::job::{AudioCodec, Container, VideoCodec, VideoQuality};
 use nexir::interop::capability::InteropCapability;
 
 /// Persistent state for the export settings panel.
 #[derive(Debug, Clone)]
 pub struct ExportSettings {
-    pub video_codec:  VideoCodec,
-    pub audio_codec:  AudioCodec,
-    pub container:    Container,
-    pub crf:          u32,
-    pub force_cpu:    bool,
-    pub cpu_preset:   nexir::export::job::CpuPreset,
+    pub video_codec: VideoCodec,
+    pub audio_codec: AudioCodec,
+    pub container: Container,
+    pub crf: u32,
+    pub force_cpu: bool,
+    pub cpu_preset: nexir::export::job::CpuPreset,
 }
 
 impl Default for ExportSettings {
@@ -23,10 +23,10 @@ impl Default for ExportSettings {
         Self {
             video_codec: VideoCodec::H264,
             audio_codec: AudioCodec::Aac,
-            container:   Container::Mp4,
-            crf:         23,
-            force_cpu:   false,
-            cpu_preset:  nexir::export::job::CpuPreset::Faster,
+            container: Container::Mp4,
+            crf: 23,
+            force_cpu: false,
+            cpu_preset: nexir::export::job::CpuPreset::Faster,
         }
     }
 }
@@ -45,8 +45,8 @@ impl ExportSettings {
     fn auto_container(codec: VideoCodec) -> Container {
         match codec {
             VideoCodec::ProRes => Container::Mov,
-            VideoCodec::Vp9    => Container::Mkv,
-            _                  => Container::Mp4,
+            VideoCodec::Vp9 => Container::Mkv,
+            _ => Container::Mp4,
         }
     }
 }
@@ -55,11 +55,11 @@ impl ExportSettings {
 ///
 /// `open` is a mutable bool; set it to `false` to close the window from outside.
 pub fn draw(
-    ctx:          &egui::Context,
-    open:         &mut bool,
-    settings:     &mut ExportSettings,
-    capability:   &InteropCapability,
-    output_path:  &std::path::Path,
+    ctx: &egui::Context,
+    open: &mut bool,
+    settings: &mut ExportSettings,
+    capability: &InteropCapability,
+    output_path: &std::path::Path,
 ) -> bool {
     let mut do_export = false;
 
@@ -86,13 +86,28 @@ pub fn draw(
 
             // ── Video codec ───────────────────────────────────────────────────
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Video codec:").strong().line_height(Some(20.0)));
+                ui.label(
+                    egui::RichText::new("Video codec:")
+                        .strong()
+                        .line_height(Some(20.0)),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::ComboBox::from_id_source("export_video_codec")
                         .selected_text(codec_label(settings.video_codec))
                         .show_ui(ui, |ui| {
-                            for &codec in &[VideoCodec::H264, VideoCodec::H265, VideoCodec::ProRes, VideoCodec::Vp9] {
-                                if ui.selectable_label(settings.video_codec == codec, codec_label(codec)).clicked() {
+                            for &codec in &[
+                                VideoCodec::H264,
+                                VideoCodec::H265,
+                                VideoCodec::ProRes,
+                                VideoCodec::Vp9,
+                            ] {
+                                if ui
+                                    .selectable_label(
+                                        settings.video_codec == codec,
+                                        codec_label(codec),
+                                    )
+                                    .clicked()
+                                {
                                     settings.video_codec = codec;
                                     // Auto-update container to match new codec
                                     settings.container = ExportSettings::auto_container(codec);
@@ -114,7 +129,13 @@ pub fn draw(
                             .selected_text(container_label(settings.container))
                             .show_ui(ui, |ui| {
                                 for &c in &[Container::Mp4, Container::Mkv] {
-                                    if ui.selectable_label(settings.container == c, container_label(c)).clicked() {
+                                    if ui
+                                        .selectable_label(
+                                            settings.container == c,
+                                            container_label(c),
+                                        )
+                                        .clicked()
+                                    {
                                         settings.container = c;
                                     }
                                 }
@@ -130,11 +151,14 @@ pub fn draw(
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!("{}", settings.crf));
                         let mut crf_f = settings.crf as f32;
-                        if ui.add(
-                            egui::Slider::new(&mut crf_f, 0.0..=51.0)
-                                .show_value(false)
-                                .clamp_to_range(true)
-                        ).changed() {
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut crf_f, 0.0..=51.0)
+                                    .show_value(false)
+                                    .clamp_to_range(true),
+                            )
+                            .changed()
+                        {
                             settings.crf = crf_f.round() as u32;
                         }
                         ui.label("0 = lossless  51 = worst");
@@ -150,7 +174,13 @@ pub fn draw(
                         .selected_text(audio_codec_label(settings.audio_codec))
                         .show_ui(ui, |ui| {
                             for &ac in &[AudioCodec::Aac, AudioCodec::Opus, AudioCodec::Pcm] {
-                                if ui.selectable_label(settings.audio_codec == ac, audio_codec_label(ac)).clicked() {
+                                if ui
+                                    .selectable_label(
+                                        settings.audio_codec == ac,
+                                        audio_codec_label(ac),
+                                    )
+                                    .clicked()
+                                {
                                     settings.audio_codec = ac;
                                 }
                             }
@@ -162,7 +192,10 @@ pub fn draw(
 
             // ── Hardware encode ───────────────────────────────────────────────
             let hw_label = if capability.is_available() {
-                format!("Hardware: NVENC available (driver {})", capability.driver_version)
+                format!(
+                    "Hardware: NVENC available (driver {})",
+                    capability.driver_version
+                )
             } else {
                 "Hardware: NVENC not available — CPU encode only".to_string()
             };
@@ -176,7 +209,7 @@ pub fn draw(
                         ui.label(
                             egui::RichText::new("⚠ Slower — use for compatibility/quality control")
                                 .color(egui::Color32::GOLD)
-                                .small()
+                                .small(),
                         );
                     }
                 });
@@ -190,8 +223,14 @@ pub fn draw(
                         .selected_text(preset_label(settings.cpu_preset))
                         .show_ui(ui, |ui| {
                             use nexir::export::job::CpuPreset::*;
-                            for &p in &[Ultrafast, Superfast, Veryfast, Faster, Fast, Medium, Slow, Slower, Veryslow] {
-                                if ui.selectable_label(settings.cpu_preset == p, preset_label(p)).clicked() {
+                            for &p in &[
+                                Ultrafast, Superfast, Veryfast, Faster, Fast, Medium, Slow, Slower,
+                                Veryslow,
+                            ] {
+                                if ui
+                                    .selectable_label(settings.cpu_preset == p, preset_label(p))
+                                    .clicked()
+                                {
                                     settings.cpu_preset = p;
                                 }
                             }
@@ -212,7 +251,10 @@ pub fn draw(
                     *open = false;
                 }
 
-                if ui.add_sized([80.0, 32.0], egui::Button::new("Cancel")).clicked() {
+                if ui
+                    .add_sized([80.0, 32.0], egui::Button::new("Cancel"))
+                    .clicked()
+                {
                     *open = false;
                 }
             });
@@ -223,10 +265,10 @@ pub fn draw(
 
 fn codec_label(codec: VideoCodec) -> &'static str {
     match codec {
-        VideoCodec::H264   => "H.264 (AVC)",
-        VideoCodec::H265   => "H.265 (HEVC)",
+        VideoCodec::H264 => "H.264 (AVC)",
+        VideoCodec::H265 => "H.265 (HEVC)",
         VideoCodec::ProRes => "Apple ProRes 4444",
-        VideoCodec::Vp9    => "VP9",
+        VideoCodec::Vp9 => "VP9",
     }
 }
 
@@ -240,9 +282,9 @@ fn container_label(c: Container) -> &'static str {
 
 fn audio_codec_label(ac: AudioCodec) -> &'static str {
     match ac {
-        AudioCodec::Aac  => "AAC",
+        AudioCodec::Aac => "AAC",
         AudioCodec::Opus => "Opus",
-        AudioCodec::Pcm  => "PCM (lossless)",
+        AudioCodec::Pcm => "PCM (lossless)",
     }
 }
 
@@ -251,12 +293,12 @@ fn preset_label(p: nexir::export::job::CpuPreset) -> &'static str {
     match p {
         Ultrafast => "Ultrafast",
         Superfast => "Superfast",
-        Veryfast  => "Veryfast",
-        Faster    => "Faster",
-        Fast      => "Fast",
-        Medium    => "Medium",
-        Slow      => "Slow",
-        Slower    => "Slower",
-        Veryslow  => "Veryslow",
+        Veryfast => "Veryfast",
+        Faster => "Faster",
+        Fast => "Fast",
+        Medium => "Medium",
+        Slow => "Slow",
+        Slower => "Slower",
+        Veryslow => "Veryslow",
     }
 }

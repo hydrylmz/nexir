@@ -1,73 +1,82 @@
 // src/audio/audio_decoder.rs
 
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
-use std::ptr::null_mut;
 use crate::audio::ffi::avresample::{
-    SwrContext, swr_alloc_set_opts, swr_init, swr_free, swr_convert,
-    swr_get_delay, swr_output_sample_count,
-    AV_SAMPLE_FMT_FLTP, AV_CH_LAYOUT_STEREO,
+    swr_alloc_set_opts, swr_convert, swr_free, swr_get_delay, swr_init, swr_output_sample_count,
+    SwrContext, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_FLTP,
 };
-use crate::io::ffi::avutil::{
-    AVFrame, av_frame_alloc, av_frame_free, av_frame_get_data,
-    av_frame_get_nb_samples, av_frame_get_sample_rate,
-    AVERROR_EOF, AVERROR_EAGAIN
-};
-use crate::io::ffi::avcodec::{
-    avcodec_send_packet, avcodec_receive_frame,
-
-};
-use crate::io::demuxer::Demuxer;
-use crate::io::decoder::Decoder;
 use crate::audio::ring_buffer::AudioRingBuffer;
+use crate::io::decoder::Decoder;
+use crate::io::demuxer::Demuxer;
+use crate::io::ffi::avcodec::{avcodec_receive_frame, avcodec_send_packet};
+use crate::io::ffi::avutil::{
+    av_frame_alloc, av_frame_free, av_frame_get_data, av_frame_get_nb_samples,
+    av_frame_get_sample_rate, AVFrame, AVERROR_EAGAIN, AVERROR_EOF,
+};
 use crate::timeline::rational::Rational;
+use std::ptr::null_mut;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 pub const OUT_SAMPLE_RATE: u32 = 48_000;
-pub const OUT_CHANNELS:    u32 = 2;
-pub const LOOKAHEAD_MS:    u64 = 512;
+pub const OUT_CHANNELS: u32 = 2;
+pub const LOOKAHEAD_MS: u64 = 512;
 
-pub const RING_TARGET_SAMPLES: usize =
-    (OUT_SAMPLE_RATE as usize * LOOKAHEAD_MS as usize) / 1000;
+pub const RING_TARGET_SAMPLES: usize = (OUT_SAMPLE_RATE as usize * LOOKAHEAD_MS as usize) / 1000;
 
 pub struct AudioDecoder {
-    demuxer:    Demuxer,
-    decoder:    Decoder,
-    swr:        *mut SwrContext,
-    frame:      *mut AVFrame,
-    ring:       Arc<AudioRingBuffer>,
-    clock:      Arc<crate::sync::master_clock::MasterClock>,
+    demuxer: Demuxer,
+    decoder: Decoder,
+    swr: *mut SwrContext,
+    frame: *mut AVFrame,
+    ring: Arc<AudioRingBuffer>,
+    clock: Arc<crate::sync::master_clock::MasterClock>,
     project_tb: Rational,
-    shutdown:   Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     seek_request: Arc<Mutex<Option<(i64, i64)>>>, // (source_pts, timeline_pts)
-    volume:     f32,
-    pan:        f32,
-    muted:      bool,
+    volume: f32,
+    pan: f32,
+    muted: bool,
     samples_written: u64,
-    stream_tb:  Rational,
-    path:       std::path::PathBuf,
+    stream_tb: Rational,
+    path: std::path::PathBuf,
+    speed: f32,
+    source_in_pts: i64,
+    source_out_pts: i64,
+    current_seek_pts: i64,
+    current_timeline_pts: i64,
+    current_timeline_out_pts: i64,
 }
 
 unsafe impl Send for AudioDecoder {}
 
 impl AudioDecoder {
     pub fn new(
-        path:       &std::path::Path,
-        ring:       Arc<AudioRingBuffer>,
-        clock:      Arc<crate::sync::master_clock::MasterClock>,
+        path: &std::path::Path,
+        ring: Arc<AudioRingBuffer>,
+        clock: Arc<crate::sync::master_clock::MasterClock>,
         project_tb: Rational,
-        shutdown:   Arc<AtomicBool>,
+        shutdown: Arc<AtomicBool>,
         seek_request: Arc<Mutex<Option<(i64, i64)>>>,
-        volume:     f32,
-        pan:        f32,
-        muted:      bool,
-        speed:      f32,
-        pitch:      f32,
+        volume: f32,
+        pan: f32,
+        muted: bool,
+        speed: f32,
+        pitch: f32,
+        source_in_pts: i64,
+        source_out_pts: i64,
     ) -> Result<Self, AudioError> {
         let mut demuxer = Demuxer::open(path).map_err(AudioError::Demux)?;
-        
-        let audio_stream = demuxer.audio_stream().cloned().ok_or(AudioError::NoAudioStream)?;
+
+        let audio_stream = demuxer
+            .audio_stream()
+            .cloned()
+            .ok_or(AudioError::NoAudioStream)?;
         let stream_tb = audio_stream.time_base;
 
-        let decoder = Decoder::open(&audio_stream, audio_stream.codecpar, false).map_err(AudioError::Decode)?;
+        let decoder = Decoder::open(&audio_stream, audio_stream.codecpar, false)
+            .map_err(AudioError::Decode)?;
 
         // Need FFI for codec parameters to set up SwrContext
         let (in_ch_layout, in_sample_fmt, mut in_sample_rate) = unsafe {
@@ -76,11 +85,11 @@ impl AudioDecoder {
             let mut cl = crate::io::ffi::avcodec::avcodec_ctx_get_channel_layout(ctx);
             let channels = crate::io::ffi::avcodec::avcodec_ctx_get_channels(ctx);
             let fmt = crate::io::ffi::avcodec::avcodec_ctx_get_sample_fmt(ctx);
-            
+
             if cl == 0 {
                 cl = if channels == 1 { 4 } else { 3 }; // 4 = MONO, 3 = STEREO
             }
-            
+
             (cl as i64, fmt as i32, sr as i32)
         };
 
@@ -141,6 +150,12 @@ impl AudioDecoder {
             samples_written: 0,
             stream_tb,
             path: path.to_path_buf(),
+            speed,
+            source_in_pts,
+            source_out_pts,
+            current_seek_pts: source_in_pts,
+            current_timeline_pts: 0,
+            current_timeline_out_pts: source_out_pts,
         })
     }
 
@@ -154,7 +169,10 @@ impl AudioDecoder {
                 // Seek demuxer to the file PTS (demuxer.seek converts project_tb -> stream_tb internally)
                 let mut result = self.demuxer.seek(source_pts, self.project_tb);
                 if result.is_err() {
-                    eprintln!("[audio] seek failed, attempting to reopen demuxer: {:?}", result);
+                    eprintln!(
+                        "[audio] seek failed, attempting to reopen demuxer: {:?}",
+                        result
+                    );
                     if let Ok(new_demuxer) = Demuxer::open(&self.path) {
                         self.demuxer = new_demuxer;
                         if source_pts == 0 {
@@ -162,7 +180,7 @@ impl AudioDecoder {
                         }
                     }
                 }
-                
+
                 // ALWAYS discard audio packets until we reach the target PTS
                 if source_pts > 0 {
                     let target_stream_pts = self.project_tb.rescale_pts(source_pts, self.stream_tb);
@@ -181,7 +199,11 @@ impl AudioDecoder {
                 if let Ok(_stream_pts) = result {
                     self.decoder.flush();
                     self.samples_written = 0;
-                    
+                    self.current_seek_pts = source_pts;
+                    self.current_timeline_pts = timeline_pts;
+                    self.current_timeline_out_pts =
+                        timeline_pts + self.timeline_pts_until_source_out(source_pts);
+
                     // Reset the master clock to the timeline PTS!
                     self.clock.seek(timeline_pts);
                     eprintln!("[audio] seek done, clock reset to pts={}", timeline_pts);
@@ -195,28 +217,26 @@ impl AudioDecoder {
             }
 
             match self.demuxer.next_audio_packet() {
-                Ok(Some(pkt)) => {
-                    unsafe {
-                        let ret = avcodec_send_packet(self.decoder.ctx(), pkt.as_ptr());
-                        if ret >= 0 {
-                            loop {
-                                let r = avcodec_receive_frame(self.decoder.ctx(), self.frame);
-                                if r == AVERROR_EAGAIN || r == AVERROR_EOF {
-                                    break;
-                                }
-                                if r < 0 {
-                                    log::error!("[audio] avcodec_receive_frame error: {}", r);
-                                    break;
-                                }
-                                if let Err(e) = self.resample_and_push() {
-                                    log::error!("[audio] resample_and_push error: {:?}", e);
-                                }
+                Ok(Some(pkt)) => unsafe {
+                    let ret = avcodec_send_packet(self.decoder.ctx(), pkt.as_ptr());
+                    if ret >= 0 {
+                        loop {
+                            let r = avcodec_receive_frame(self.decoder.ctx(), self.frame);
+                            if r == AVERROR_EAGAIN || r == AVERROR_EOF {
+                                break;
                             }
-                        } else {
-                            log::error!("[audio] avcodec_send_packet error: {}", ret);
+                            if r < 0 {
+                                log::error!("[audio] avcodec_receive_frame error: {}", r);
+                                break;
+                            }
+                            if let Err(e) = self.resample_and_push() {
+                                log::error!("[audio] resample_and_push error: {:?}", e);
+                            }
                         }
+                    } else {
+                        log::error!("[audio] avcodec_send_packet error: {}", ret);
                     }
-                }
+                },
                 Ok(None) => {
                     self.flush_swr();
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -243,10 +263,12 @@ impl AudioDecoder {
         }
 
         let out_count = swr_output_sample_count(in_count, in_rate, OUT_SAMPLE_RATE);
-        
+
         let mut out_buf = vec![vec![0.0f32; out_count]; OUT_CHANNELS as usize];
-        let mut out_ptrs: Vec<*mut u8> = out_buf.iter_mut()
-            .map(|ch| ch.as_mut_ptr() as *mut u8).collect();
+        let mut out_ptrs: Vec<*mut u8> = out_buf
+            .iter_mut()
+            .map(|ch| ch.as_mut_ptr() as *mut u8)
+            .collect();
 
         let written = unsafe {
             swr_convert(
@@ -274,11 +296,30 @@ impl AudioDecoder {
             interleaved.fill(0.0);
         } else {
             let angle = (self.pan + 1.0) * std::f32::consts::PI / 4.0; // 0 (full left) → π/2 (full right)
-            let left_gain  = self.volume * angle.cos();
-            let right_gain = self.volume * angle.sin();
-            for frame in interleaved.chunks_exact_mut(2) {
-                frame[0] *= left_gain;
-                frame[1] *= right_gain;
+            let base_left_gain = self.volume * angle.cos();
+            let base_right_gain = self.volume * angle.sin();
+            for (sample_idx, frame) in interleaved.chunks_exact_mut(2).enumerate() {
+                let current_sample_index = self.samples_written + sample_idx as u64;
+                let current_timeline_pts = self.current_timeline_pts
+                    + (current_sample_index as f64 * 90000.0 / OUT_SAMPLE_RATE as f64) as i64;
+
+                let mut fade_factor = 1.0f32;
+                let dist_from_start = current_timeline_pts
+                    - (self.current_timeline_pts
+                        - self.timeline_pts_since_source_in(self.current_seek_pts));
+                if dist_from_start < 13500 {
+                    fade_factor = fade_factor.min((dist_from_start as f32 / 13500.0).max(0.0));
+                }
+                let dist_to_end = self.current_timeline_out_pts - current_timeline_pts;
+                if dist_to_end < 13500 {
+                    fade_factor = fade_factor.min((dist_to_end as f32 / 13500.0).max(0.0));
+                }
+                if current_timeline_pts > self.current_timeline_out_pts {
+                    fade_factor = 0.0;
+                }
+
+                frame[0] *= base_left_gain * fade_factor;
+                frame[1] *= base_right_gain * fade_factor;
             }
         }
 
@@ -296,11 +337,19 @@ impl AudioDecoder {
             }
             let out_count = delay as usize + 16;
             let mut out_buf = vec![vec![0.0f32; out_count]; OUT_CHANNELS as usize];
-            let mut out_ptrs: Vec<*mut u8> = out_buf.iter_mut()
-                .map(|ch| ch.as_mut_ptr() as *mut u8).collect();
+            let mut out_ptrs: Vec<*mut u8> = out_buf
+                .iter_mut()
+                .map(|ch| ch.as_mut_ptr() as *mut u8)
+                .collect();
 
             let written = unsafe {
-                swr_convert(self.swr, out_ptrs.as_mut_ptr(), out_count as i32, null_mut(), 0)
+                swr_convert(
+                    self.swr,
+                    out_ptrs.as_mut_ptr(),
+                    out_count as i32,
+                    null_mut(),
+                    0,
+                )
             };
 
             if written <= 0 {
@@ -318,7 +367,7 @@ impl AudioDecoder {
                 interleaved.fill(0.0);
             } else {
                 let angle = (self.pan + 1.0) * std::f32::consts::PI / 4.0;
-                let left_gain  = self.volume * angle.cos();
+                let left_gain = self.volume * angle.cos();
                 let right_gain = self.volume * angle.sin();
                 for frame in interleaved.chunks_exact_mut(2) {
                     frame[0] *= left_gain;
@@ -326,6 +375,33 @@ impl AudioDecoder {
                 }
             }
             self.ring.write(&interleaved);
+        }
+    }
+
+    fn timeline_pts_since_source_in(&self, source_pts: i64) -> i64 {
+        self.source_delta_to_timeline_pts(source_pts - self.source_in_pts)
+    }
+
+    fn timeline_pts_until_source_out(&self, source_pts: i64) -> i64 {
+        self.source_delta_to_timeline_pts(self.source_out_pts - source_pts)
+    }
+
+    fn source_delta_to_timeline_pts(&self, source_delta: i64) -> i64 {
+        if self.speed.abs() < f32::EPSILON {
+            return source_delta;
+        }
+
+        let den = (self.speed * 10_000.0).round() as i64;
+        if den == 0 {
+            return source_delta;
+        }
+
+        let numer = source_delta as i128 * 10_000_i128;
+        let den = den as i128;
+        if numer >= 0 {
+            ((numer + den / 2) / den) as i64
+        } else {
+            ((numer - den / 2) / den) as i64
         }
     }
 }
@@ -354,4 +430,3 @@ pub enum AudioError {
 }
 
 // Debug added at end of file to trace
-

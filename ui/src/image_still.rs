@@ -79,26 +79,17 @@ impl StillImageCache {
             for x in 0..width {
                 let pixel = rgba.get_pixel(x, y).0;
                 let dst = dst_row + (x * bytes_per_pixel) as usize;
-                    // Convert from sRGB 8-bit to linear float and premultiply by alpha.
+                    // Store sRGB-encoded values normalised to [0,1] as f16.
+                    // The blit shader will apply srgb_to_linear once, and wgpu
+                    // applies the sRGB gamma curve on write to Rgba8UnormSrgb.
+                    // Do NOT pre-convert here — doing so would double-apply the
+                    // gamma decode and darken the image noticeably.
                     let sr = pixel[0] as f32 / 255.0;
                     let sg = pixel[1] as f32 / 255.0;
                     let sb = pixel[2] as f32 / 255.0;
                     let sa = if force_opaque { 1.0 } else { pixel[3] as f32 / 255.0 };
 
-                    fn srgb_to_linear(u: f32) -> f32 {
-                        if u <= 0.04045 {
-                            u / 12.92
-                        } else {
-                            ((u + 0.055) / 1.055).powf(2.4)
-                        }
-                    }
-
-                    let lr = srgb_to_linear(sr) * sa;
-                    let lg = srgb_to_linear(sg) * sa;
-                    let lb = srgb_to_linear(sb) * sa;
-                    let la = sa;
-
-                    let comps = [lr, lg, lb, la];
+                    let comps = [sr, sg, sb, sa];
                     for c in 0..4 {
                         let value = f16::from_f32(comps[c]).to_le_bytes();
                         upload[dst + c * 2] = value[0];

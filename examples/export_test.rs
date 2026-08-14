@@ -1,15 +1,15 @@
-use nexir::export::job::{ExportJob, Container, VideoCodec, AudioCodec, VideoQuality};
 use nexir::export::engine::ExportEngine;
+use nexir::export::job::{AudioCodec, Container, ExportJob, VideoCodec, VideoQuality};
 use nexir::render::device::GpuDevice;
-use nexir::timeline::store::TimelineStore;
 use nexir::timeline::rational::Rational;
-use std::sync::Arc;
+use nexir::timeline::store::TimelineStore;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn main() {
     let device = Arc::new(pollster::block_on(GpuDevice::new_headless()).unwrap());
     let mut store = TimelineStore::new();
-    
+
     let job = ExportJob {
         output_path: PathBuf::from("test_export.mp4"),
         container: Container::Mp4,
@@ -25,15 +25,19 @@ fn main() {
         pts_in: 0,
         pts_out: 3000,
     };
-    
+
     println!("Starting export...");
-    
+
     let capability = nexir::interop::capability::InteropCapability::none();
     let io_layer = Arc::new(nexir::io::io_layer::IoLayer::new(&device, 1024, 8));
-    let scheduler = Arc::new(nexir::scheduler::frame_scheduler::FrameScheduler::new(io_layer, 1920, 1080));
-    let sources = Arc::new(std::sync::RwLock::new(nexir::timeline::source::SourceRegistry::new()));
+    let scheduler = Arc::new(nexir::scheduler::frame_scheduler::FrameScheduler::new(
+        io_layer, 1920, 1080,
+    ));
+    let sources = Arc::new(std::sync::RwLock::new(
+        nexir::timeline::source::SourceRegistry::new(),
+    ));
     let store_arc = Arc::new(std::sync::RwLock::new(store));
-    
+
     let engine = ExportEngine::new(
         device.clone(),
         job,
@@ -42,10 +46,11 @@ fn main() {
         sources,
         capability,
         None,
-        false
+        false,
     );
-    
-    let shaders = Arc::new(nexir::render::shader::registry::ShaderRegistry::compile_all(&device).unwrap());
+
+    let shaders =
+        Arc::new(nexir::render::shader::registry::ShaderRegistry::compile_all(&device).unwrap());
     let compute = Arc::new(nexir::render::compute::ComputePipelineCache::new());
     match engine.start(shaders, compute) {
         Ok(_) => println!("Export started"),

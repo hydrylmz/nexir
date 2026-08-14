@@ -7,10 +7,12 @@ use crate::io::ffi::avutil::{
     AVFrame, av_frame_alloc, av_frame_free, av_frame_unref,
     av_frame_get_pts, av_frame_get_data, av_frame_get_linesize,
     av_frame_get_format, av_frame_get_width, av_frame_get_height,
-    av_image_copy_to_buffer, AVERROR_EOF, AVERROR_EAGAIN, AV_NOPTS_VALUE,
+    av_image_copy_to_buffer, av_image_fill_arrays, AVERROR_EOF, AVERROR_EAGAIN, AV_NOPTS_VALUE,
+    AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P,
     av_err_to_string,
 };
 use crate::io::ffi::hw_accel::{HwDeviceType, probe_hardware_device, av_hwframe_transfer_data};
+use crate::io::ffi::swscale::{sws_freeContext, sws_getContext, sws_scale, SWS_BILINEAR};
 use crate::io::demuxer::{Demuxer, Packet, StreamInfo};
 
 pub struct Decoder {
@@ -265,26 +267,85 @@ impl Decoder {
             self.frame
         };
 
-        // Step 4 — Copy pixel data into staging buffer
+        // Step 4 — Copy pixel data into staging buffer. The render upload path
+        // accepts YUV420p and NV12, so normalize RGB/RGBA image codecs here.
+        let mut output_is_nv12 = is_nv12;
         unsafe {
-            let data     = av_frame_get_data(src_frame);
+            let data = av_frame_get_data(src_frame);
             let linesize = av_frame_get_linesize(src_frame);
-            let fmt      = av_frame_get_format(src_frame);
-            let w        = av_frame_get_width(src_frame);
-            let h        = av_frame_get_height(src_frame);
+            let fmt = av_frame_get_format(src_frame);
+            let w = av_frame_get_width(src_frame);
+            let h = av_frame_get_height(src_frame);
 
-            let ret = av_image_copy_to_buffer(
-                dst.as_mut_ptr(),
-                dst.len() as i32,
-                data as *const *const u8,
-                linesize,
-                fmt, w, h,
-                1, // align=1: exact row widths, no extra padding
-            );
-            if ret < 0 {
-                av_frame_unref(self.frame);
-                av_frame_unref(self.sw_frame);
-                return Err(DecodeError::Receive(av_err_to_string(ret)));
+            if fmt == AV_PIX_FMT_YUV420P || fmt == AV_PIX_FMT_NV12 {
+                let ret = av_image_copy_to_buffer(
+                    dst.as_mut_ptr(),
+                    dst.len() as i32,
+                    data as *const *const u8,
+                    linesize,
+                    fmt,
+                    w,
+                    h,
+                    1, // align=1: exact row widths, no extra padding
+                );
+                if ret < 0 {
+                    av_frame_unref(self.frame);
+                    av_frame_unref(self.sw_frame);
+                    return Err(DecodeError::Receive(av_err_to_string(ret)));
+                }
+            } else {
+                let sws = sws_getContext(
+                    w,
+                    h,
+                    fmt,
+                    w,
+                    h,
+                    AV_PIX_FMT_YUV420P,
+                    SWS_BILINEAR,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                if sws.is_null() {
+                    av_frame_unref(self.frame);
+                    av_frame_unref(self.sw_frame);
+                    return Err(DecodeError::Convert("sws_getContext failed".into()));
+                }
+
+                let mut dst_data = [std::ptr::null_mut::<u8>(); 8];
+                let mut dst_linesize = [0i32; 8];
+                let fill_ret = av_image_fill_arrays(
+                    dst_data.as_mut_ptr(),
+                    dst_linesize.as_mut_ptr(),
+                    dst.as_mut_ptr(),
+                    AV_PIX_FMT_YUV420P,
+                    w,
+                    h,
+                    1,
+                );
+                if fill_ret < 0 || fill_ret as usize > dst.len() {
+                    sws_freeContext(sws);
+                    av_frame_unref(self.frame);
+                    av_frame_unref(self.sw_frame);
+                    return Err(DecodeError::Receive(av_err_to_string(fill_ret)));
+                }
+
+                let scaled = sws_scale(
+                    sws,
+                    data as *const *const u8,
+                    linesize,
+                    0,
+                    h,
+                    dst_data.as_ptr(),
+                    dst_linesize.as_ptr(),
+                );
+                sws_freeContext(sws);
+                if scaled <= 0 {
+                    av_frame_unref(self.frame);
+                    av_frame_unref(self.sw_frame);
+                    return Err(DecodeError::Convert(format!("sws_scale returned {scaled}")));
+                }
+                output_is_nv12 = false;
             }
         }
 
@@ -301,7 +362,7 @@ impl Decoder {
             (pts, aw, ah)
         };
 
-        Ok(Some((pts, is_nv12, actual_w, actual_h)))
+        Ok(Some((pts, output_is_nv12, actual_w, actual_h)))
     }
 
     /// Seek decoder to a target PTS by flushing then running the discard loop.
@@ -369,5 +430,6 @@ pub enum DecodeError {
     Send(String),
     Receive(String),
     HwTransfer(String),
+    Convert(String),
     NoFrame,
 }

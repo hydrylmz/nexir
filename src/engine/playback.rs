@@ -1,53 +1,59 @@
 // src/engine/playback.rs  (Phase 5 update)
 
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
+use crate::audio::output_stream::AudioOutputStream;
+use crate::audio::ring_buffer::AudioRingBuffer;
 use crate::render::device::GpuDevice;
 use crate::render::graph::CompiledGraph;
 use crate::render::nodes::blit::BlitToScreenNode;
 use crate::scheduler::frame_scheduler::FrameScheduler;
-use crate::audio::ring_buffer::AudioRingBuffer;
-use crate::audio::output_stream::AudioOutputStream;
-use crate::sync::master_clock::MasterClock;
 use crate::sync::drift_corrector::DriftCorrector;
-use crate::sync::presentation::{PresentationDecider, PresentAction};
+use crate::sync::master_clock::MasterClock;
+use crate::sync::presentation::{PresentAction, PresentationDecider};
 #[cfg(any(test, debug_assertions))]
 use crate::sync::sync_probe::SyncProbe;
 use crate::timeline::rational::Rational;
-use crate::timeline::store::TimelineStore;
 use crate::timeline::source::SourceRegistry;
+use crate::timeline::store::TimelineStore;
+use crate::timeline::track::TrackList;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 pub struct PlaybackEngine {
-    device:      Arc<GpuDevice>,
-    surface:     wgpu::Surface<'static>,
-    graph:       CompiledGraph,
-    scheduler:   Arc<FrameScheduler>,
-    timeline:    Arc<std::sync::RwLock<TimelineStore>>,
-    sources:     Arc<std::sync::RwLock<SourceRegistry>>,
-    clock:       Arc<MasterClock>,
-    decider:     PresentationDecider,
-    corrector:   DriftCorrector,
+    device: Arc<GpuDevice>,
+    surface: wgpu::Surface<'static>,
+    graph: CompiledGraph,
+    scheduler: Arc<FrameScheduler>,
+    timeline: Arc<std::sync::RwLock<TimelineStore>>,
+    tracks: Arc<std::sync::RwLock<TrackList>>,
+    sources: Arc<std::sync::RwLock<SourceRegistry>>,
+    clock: Arc<MasterClock>,
+    decider: PresentationDecider,
+    corrector: DriftCorrector,
     #[cfg(any(test, debug_assertions))]
-    probe:       SyncProbe,
-    _audio_stream: AudioOutputStream,  // kept alive to prevent stream close
-    project_tb:  Rational,
-    shutdown:    Arc<AtomicBool>,
+    probe: SyncProbe,
+    _audio_stream: AudioOutputStream, // kept alive to prevent stream close
+    project_tb: Rational,
+    shutdown: Arc<AtomicBool>,
     seek_request: Arc<Mutex<Option<i64>>>,
-    ring:        Arc<AudioRingBuffer>,
+    ring: Arc<AudioRingBuffer>,
 }
 
 impl PlaybackEngine {
     pub fn new(
-        device:       Arc<GpuDevice>,
-        surface:      wgpu::Surface<'static>,
-        graph:        CompiledGraph,
-        scheduler:    Arc<FrameScheduler>,
-        timeline:     Arc<std::sync::RwLock<TimelineStore>>,
-        sources:      Arc<std::sync::RwLock<SourceRegistry>>,
-        ring:         Arc<AudioRingBuffer>,
-        project_tb:   Rational,
-        frame_rate:   Rational,
+        device: Arc<GpuDevice>,
+        surface: wgpu::Surface<'static>,
+        graph: CompiledGraph,
+        scheduler: Arc<FrameScheduler>,
+        timeline: Arc<std::sync::RwLock<TimelineStore>>,
+        tracks: Arc<std::sync::RwLock<TrackList>>,
+        sources: Arc<std::sync::RwLock<SourceRegistry>>,
+        ring: Arc<AudioRingBuffer>,
+        project_tb: Rational,
+        frame_rate: Rational,
         vsync_period_ns: i64,
-        shutdown:     Arc<AtomicBool>,
+        shutdown: Arc<AtomicBool>,
         seek_request: Arc<Mutex<Option<i64>>>,
     ) -> Result<Self, crate::audio::output_stream::AudioStreamError> {
         let clock = MasterClock::new(project_tb, crate::audio::audio_decoder::OUT_SAMPLE_RATE);
@@ -55,8 +61,8 @@ impl PlaybackEngine {
         let audio_stream = AudioOutputStream::open(Arc::clone(&ring), Arc::clone(&clock))?;
 
         let corrector = DriftCorrector::new(Arc::clone(&clock));
-        let decider   = PresentationDecider::new(Arc::clone(&clock), project_tb,
-                                                  frame_rate, vsync_period_ns);
+        let decider =
+            PresentationDecider::new(Arc::clone(&clock), project_tb, frame_rate, vsync_period_ns);
 
         #[cfg(any(test, debug_assertions))]
         let probe = SyncProbe::new(project_tb);
@@ -67,6 +73,7 @@ impl PlaybackEngine {
             graph,
             scheduler,
             timeline,
+            tracks,
             sources,
             clock,
             decider,
@@ -86,7 +93,7 @@ impl PlaybackEngine {
         while !self.shutdown.load(Ordering::Relaxed) {
             let pts = self.clock.pts();
             let next_pts = self.decider.next_frame_pts();
-            let action   = self.decider.decide(next_pts);
+            let action = self.decider.decide(next_pts);
 
             match action {
                 PresentAction::Drop => {
@@ -94,7 +101,8 @@ impl PlaybackEngine {
                     let _frame_state = self.scheduler.schedule_frame(
                         next_pts,
                         &self.timeline.read().unwrap(),
-                        &self.sources.read().unwrap()
+                        &self.tracks.read().unwrap(),
+                        &self.sources.read().unwrap(),
                     );
                     continue;
                 }
@@ -114,7 +122,8 @@ impl PlaybackEngine {
                     let frame_state = self.scheduler.schedule_frame(
                         next_pts,
                         &self.timeline.read().unwrap(),
-                        &self.sources.read().unwrap()
+                        &self.tracks.read().unwrap(),
+                        &self.sources.read().unwrap(),
                     );
 
                     let output = match self.surface.get_current_texture() {
@@ -128,7 +137,9 @@ impl PlaybackEngine {
                         }
                     };
 
-                    let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let view = output
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
                     for node in self.graph.nodes_mut() {
                         if let Some(any) = node.as_any_mut() {
                             if let Some(blit_node) = any.downcast_mut::<BlitToScreenNode>() {

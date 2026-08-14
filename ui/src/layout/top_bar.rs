@@ -1,4 +1,4 @@
-use egui::{Ui, Color32};
+use egui::{Color32, Ui};
 use nexir::project::ProjectSettings;
 use nexir::timeline::rational::Rational;
 
@@ -19,9 +19,17 @@ struct TopBarState {
     about_open: bool,
 }
 
-pub fn draw(ui: &mut Ui, can_undo: bool, can_redo: bool, settings: &mut ProjectSettings) -> Option<TopBarAction> {
+pub fn draw(
+    ui: &mut Ui,
+    can_undo: bool,
+    can_redo: bool,
+    settings: &mut ProjectSettings,
+) -> Option<TopBarAction> {
     // Load/store persistent state in egui memory so it survives across frames.
-    let mut state = ui.ctx().data(|d| d.get_temp::<TopBarState>(egui::Id::new("top_bar_state")).unwrap_or_default());
+    let mut state = ui.ctx().data(|d| {
+        d.get_temp::<TopBarState>(egui::Id::new("top_bar_state"))
+            .unwrap_or_default()
+    });
     let mut action = None;
 
     egui::menu::bar(ui, |ui| {
@@ -49,11 +57,17 @@ pub fn draw(ui: &mut Ui, can_undo: bool, can_redo: bool, settings: &mut ProjectS
             }
         });
         ui.menu_button("Edit", |ui| {
-            if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
+            if ui
+                .add_enabled(can_undo, egui::Button::new("Undo"))
+                .clicked()
+            {
                 action = Some(TopBarAction::Undo);
                 ui.close_menu();
             }
-            if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
+            if ui
+                .add_enabled(can_redo, egui::Button::new("Redo"))
+                .clicked()
+            {
                 action = Some(TopBarAction::Redo);
                 ui.close_menu();
             }
@@ -80,10 +94,14 @@ pub fn draw(ui: &mut Ui, can_undo: bool, can_redo: bool, settings: &mut ProjectS
             .width(110.0)
             .show_ui(ui, |ui| {
                 for &(w, h) in RESOLUTION_PRESETS {
-                    if ui.selectable_label(settings.width == w && settings.height == h,
-                        resolution_label(w, h)).clicked()
+                    if ui
+                        .selectable_label(
+                            settings.width == w && settings.height == h,
+                            resolution_label(w, h),
+                        )
+                        .clicked()
                     {
-                        settings.width  = w;
+                        settings.width = w;
                         settings.height = h;
                     }
                 }
@@ -96,10 +114,13 @@ pub fn draw(ui: &mut Ui, can_undo: bool, can_redo: bool, settings: &mut ProjectS
             .show_ui(ui, |ui| {
                 for &(n, d) in FPS_PRESETS {
                     let r = Rational::new(n, d);
-                    if ui.selectable_label(
-                        settings.frame_rate.num == n && settings.frame_rate.den == d,
-                        fps_label(r)
-                    ).clicked() {
+                    if ui
+                        .selectable_label(
+                            settings.frame_rate.num == n && settings.frame_rate.den == d,
+                            fps_label(r),
+                        )
+                        .clicked()
+                    {
                         settings.frame_rate = r;
                     }
                 }
@@ -107,9 +128,8 @@ pub fn draw(ui: &mut Ui, can_undo: bool, can_redo: bool, settings: &mut ProjectS
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // CapCut style bright blue export button
-            let export_btn = egui::Button::new(
-                egui::RichText::new("Export").color(Color32::WHITE)
-            ).fill(Color32::from_rgb(0, 153, 255));
+            let export_btn = egui::Button::new(egui::RichText::new("Export").color(Color32::WHITE))
+                .fill(Color32::from_rgb(0, 153, 255));
 
             if ui.add(export_btn).clicked() {
                 action = Some(TopBarAction::Export);
@@ -129,14 +149,27 @@ pub fn draw(ui: &mut Ui, can_undo: bool, can_redo: bool, settings: &mut ProjectS
             .show(ui.ctx(), |ui| {
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("nexir").size(28.0).strong().color(Color32::from_rgb(0, 153, 255)));
+                    ui.label(
+                        egui::RichText::new("nexir")
+                            .size(28.0)
+                            .strong()
+                            .color(Color32::from_rgb(0, 153, 255)),
+                    );
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Video Editor").size(13.0).color(Color32::GRAY));
+                    ui.label(
+                        egui::RichText::new("Video Editor")
+                            .size(13.0)
+                            .color(Color32::GRAY),
+                    );
                     ui.add_space(12.0);
                     ui.label("A fast, GPU-accelerated non-linear video editor");
                     ui.label("built in Rust with wgpu + egui.");
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("v0.1.0").monospace().color(Color32::LIGHT_GRAY));
+                    ui.label(
+                        egui::RichText::new("v0.1.0")
+                            .monospace()
+                            .color(Color32::LIGHT_GRAY),
+                    );
                     ui.add_space(16.0);
                     if ui.button("  Close  ").clicked() {
                         state.about_open = false;
@@ -147,7 +180,8 @@ pub fn draw(ui: &mut Ui, can_undo: bool, can_redo: bool, settings: &mut ProjectS
     }
 
     // Persist state back into egui memory.
-    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("top_bar_state"), state));
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(egui::Id::new("top_bar_state"), state));
     action
 }
 
@@ -155,32 +189,30 @@ const RESOLUTION_PRESETS: &[(u32, u32)] = &[
     (3840, 2160),
     (2560, 1440),
     (1920, 1080),
-    (1280,  720),
-    ( 854,  480),
+    (1280, 720),
+    (854, 480),
 ];
 
-const FPS_PRESETS: &[(i64, i64)] = &[
-    (24, 1), (25, 1), (30, 1), (60, 1), (120, 1),
-];
+const FPS_PRESETS: &[(i64, i64)] = &[(24, 1), (25, 1), (30, 1), (60, 1), (120, 1)];
 
 fn resolution_label(w: u32, h: u32) -> &'static str {
     match (w, h) {
         (3840, 2160) => "3840x2160 4K",
         (2560, 1440) => "2560x1440 2K",
         (1920, 1080) => "1920x1080 FHD",
-        (1280,  720) => "1280x720 HD",
-        ( 854,  480) => "854x480 SD",
-        _            => "Custom",
+        (1280, 720) => "1280x720 HD",
+        (854, 480) => "854x480 SD",
+        _ => "Custom",
     }
 }
 
 fn fps_label(r: Rational) -> &'static str {
     match (r.num, r.den) {
-        (24,  1) => "24 fps",
-        (25,  1) => "25 fps",
-        (30,  1) => "30 fps",
-        (60,  1) => "60 fps",
+        (24, 1) => "24 fps",
+        (25, 1) => "25 fps",
+        (30, 1) => "30 fps",
+        (60, 1) => "60 fps",
         (120, 1) => "120 fps",
-        _        => "? fps",
+        _ => "? fps",
     }
 }
