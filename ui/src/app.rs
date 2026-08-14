@@ -1,88 +1,107 @@
-use egui::Context;
-use egui_wgpu::{Renderer, ScreenDescriptor};
-use egui_winit::State;
-use winit::window::Window;
-use winit::event::WindowEvent;
-use nexir::render::device::GpuDevice;
-use nexir::project::Project;
-use nexir::render::shader::registry::ShaderRegistry;
-use nexir::render::compute::ComputePipelineCache;
-use nexir::timeline::query::query_active;
-use nexir::io::demuxer::Demuxer;
-use nexir::render::shader::registry::BuiltinShader;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use crate::history::HistoryState;
 use crate::layout::inspector::InspectorState;
 use crate::layout::media_pool::MediaPoolState;
 use crate::layout::timeline::TimelineState;
-use crate::history::HistoryState;
+use egui::Context;
+use egui_wgpu::{Renderer, ScreenDescriptor};
+use egui_winit::State;
 use nexir::audio::audio_decoder::AudioDecoder;
-use nexir::project_file::ProjectFile;
 use nexir::audio::output_stream::AudioOutputStream;
 use nexir::audio::ring_buffer::AudioRingBuffer;
+use nexir::io::demuxer::Demuxer;
+use nexir::project::Project;
+use nexir::project_file::ProjectFile;
+use nexir::render::compute::ComputePipelineCache;
+use nexir::render::device::GpuDevice;
+use nexir::render::shader::registry::BuiltinShader;
+use nexir::render::shader::registry::ShaderRegistry;
 use nexir::sync::master_clock::MasterClock;
+use nexir::timeline::query::query_active;
 use nexir::timeline::rational::Rational;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use winit::event::WindowEvent;
+use winit::window::Window;
 
-use nexir::io::io_layer::IoLayer;
-use nexir::io::slot_pool::FrameSlotPool;
-use nexir::io::frame_cache::FrameCache;
-use nexir::io::prefetch::{PrefetchRequest, PrefetchWorker, spawn_prefetch_worker};
-use nexir::scheduler::frame_scheduler::FrameScheduler;
-use nexir::render::graph::RenderGraphCompiler;
-use nexir::render::nodes::yuv_upload::YuvUploadNode;
-use nexir::render::nodes::composite::CompositeNode;
-use nexir::render::resource::ResourceId;
+use crate::layout::export_settings::ExportSettings;
 use nexir::export::progress::ProgressReceiver;
 use nexir::interop::capability::InteropCapability;
 use nexir::interop::cuda_context::CudaContext;
-use crate::layout::export_settings::ExportSettings;
+use nexir::io::frame_cache::FrameCache;
+use nexir::io::io_layer::IoLayer;
+use nexir::io::prefetch::{PrefetchRequest, PrefetchWorker, spawn_prefetch_worker};
+use nexir::io::slot_pool::FrameSlotPool;
+use nexir::render::graph::RenderGraphCompiler;
+use nexir::render::nodes::composite::CompositeNode;
+use nexir::render::nodes::yuv_upload::YuvUploadNode;
+use nexir::render::resource::ResourceId;
+use nexir::scheduler::frame_scheduler::FrameScheduler;
+
+use crate::image_still::{StillImageCache, StillImageUploadNode};
 
 pub struct PreviewState {
-    pub texture:      Option<wgpu::Texture>,
-    pub texture_id:   Option<egui::TextureId>,
-    pub width:        u32,   // texture / panel size
-    pub height:       u32,
-    pub video_width:  u32,   // actual decoded frame dimensions
+    pub texture: Option<wgpu::Texture>,
+    pub texture_id: Option<egui::TextureId>,
+    pub width: u32, // texture / panel size
+    pub height: u32,
+    pub video_width: u32, // actual decoded frame dimensions
     pub video_height: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ActiveClipAudioInfo {
+    pub clip_id: nexir::timeline::ids::ClipId,
+    pub path: PathBuf,
+    pub volume: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub speed: f32,
+    pub pitch: f32,
+    pub source_pts: i64,
+    pub timeline_pts: i64,
+    pub source_in_pts: i64,
+    pub source_out_pts: i64,
+}
 
 pub struct NexirApp {
-    egui_ctx:         Context,
-    egui_state:       State,
+    egui_ctx: Context,
+    egui_state: State,
     pub egui_renderer: Renderer,
-    pub preview:      PreviewState,
-    pub inspector:    InspectorState,
-    pub media_pool:   MediaPoolState,
-    pub timeline:     TimelineState,
-    pub history:      HistoryState,
-    pub project:      Project,
-    pub shaders:      Arc<ShaderRegistry>,
+    pub preview: PreviewState,
+    pub inspector: InspectorState,
+    pub media_pool: MediaPoolState,
+    pub timeline: TimelineState,
+    pub history: HistoryState,
+    pub project: Project,
+    pub shaders: Arc<ShaderRegistry>,
     pub compute_cache: Arc<ComputePipelineCache>,
 
     // Backend rendering state
-    io_layer:         Arc<IoLayer>,
-    frame_scheduler:  FrameScheduler,
-    last_playhead:    i64,
+    io_layer: Arc<IoLayer>,
+    frame_scheduler: FrameScheduler,
+    last_playhead: i64,
 
     // UI blit resources
-    blit_bgl:         wgpu::BindGroupLayout,
-    blit_pipeline:    wgpu::RenderPipeline,
-    sampler:          wgpu::Sampler,
+    blit_bgl: wgpu::BindGroupLayout,
+    blit_pipeline: wgpu::RenderPipeline,
+    sampler: wgpu::Sampler,
 
     // Audio engine
-    _audio_out:        Option<AudioOutputStream>,
-    audio_ring:        Arc<AudioRingBuffer>,
-    audio_clock:       Arc<MasterClock>,
-    audio_shutdown:    Arc<AtomicBool>,
-    audio_seek:        Arc<Mutex<Option<(i64, i64)>>>,
-    audio_path:        Option<std::path::PathBuf>,  // currently playing audio file
-    audio_volume:      f32,
-    audio_pan:         f32,
-    audio_muted:       bool,
-    audio_speed:       f32,
-    audio_pitch:       f32,
+    _audio_out: Option<AudioOutputStream>,
+    audio_ring: Arc<AudioRingBuffer>,
+    audio_clock: Arc<MasterClock>,
+    audio_shutdown: Arc<AtomicBool>,
+    audio_seek: Arc<Mutex<Option<(i64, i64)>>>,
+    audio_path: Option<std::path::PathBuf>, // currently playing audio file
+    audio_volume: f32,
+    audio_pan: f32,
+    audio_muted: bool,
+    audio_speed: f32,
+    audio_pitch: f32,
     audio_was_playing: bool,
+
+    // Waveform display cache
+    waveform_cache: crate::waveform::WaveformCache,
 
     // Project file management
     current_project_path: Option<PathBuf>,
@@ -99,6 +118,7 @@ pub struct NexirApp {
     export_settings: ExportSettings,
     interop_capability: InteropCapability,
     cuda_ctx: Option<Arc<CudaContext>>,
+    still_cache: Mutex<StillImageCache>,
 }
 
 pub struct AppResponse {
@@ -120,11 +140,19 @@ impl NexirApp {
         egui_ctx.set_style(style);
 
         let egui_state = State::new(
-            egui_ctx.clone(), egui::ViewportId::ROOT, window,
-            Some(window.scale_factor() as f32), None,
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window,
+            Some(window.scale_factor() as f32),
+            None,
         );
         log::info!("NexirApp::new: creating egui_renderer...");
-        let egui_renderer = Renderer::new(device.device.as_ref(), *device.surface_format.lock().unwrap(), None, 1);
+        let egui_renderer = Renderer::new(
+            device.device.as_ref(),
+            *device.surface_format.lock().unwrap(),
+            None,
+            1,
+        );
         log::info!("NexirApp::new: egui_renderer created");
 
         let mut project = Project::new("Untitled Project");
@@ -135,18 +163,21 @@ impl NexirApp {
         log::info!("NexirApp::new: compiling shaders...");
         let shaders = Arc::new(ShaderRegistry::compile_all(&device).unwrap());
         log::info!("NexirApp::new: shaders compiled successfully");
-        
+
         let compute_cache = Arc::new(ComputePipelineCache::new());
 
         // Initialize Backend Systems
-        let project_tb = Rational { num: 1, den: 90_000 };
-        
+        let project_tb = Rational {
+            num: 1,
+            den: 90_000,
+        };
+
         let pool = Arc::new(FrameSlotPool::new(&device));
         let cache = Arc::new(FrameCache::new(pool.clone(), 32));
         log::info!("NexirApp::new: pool and cache created");
-        
+
         let (prefetch_tx, prefetch_rx) = std::sync::mpsc::sync_channel::<PrefetchRequest>(16);
-        
+
         let io_layer = Arc::new(IoLayer::new(
             device.device.clone(),
             pool,
@@ -156,11 +187,11 @@ impl NexirApp {
             project_tb,
         ));
         log::info!("NexirApp::new: io_layer created");
-        
+
         let prefetch_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker = PrefetchWorker::new(prefetch_rx, io_layer.clone(), cache, prefetch_shutdown);
         spawn_prefetch_worker(worker);
-        
+
         // Setup FrameScheduler — use project canvas resolution
         let canvas_w = project.settings.width;
         let canvas_h = project.settings.height;
@@ -168,38 +199,66 @@ impl NexirApp {
         log::info!("NexirApp::new: frame_scheduler created");
 
         // Blit pipeline for preview
-        let blit_bgl = device.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("app_blit_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
-                    count: None },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None },
-            ],
-        });
-        let blit_pipeline_layout = device.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("app_blit_pl"), bind_group_layouts: &[&blit_bgl], push_constant_ranges: &[],
-        });
+        let blit_bgl = device
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("app_blit_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let blit_pipeline_layout =
+            device
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("app_blit_pl"),
+                    bind_group_layouts: &[&blit_bgl],
+                    push_constant_ranges: &[],
+                });
         let blit_shader = shaders.get(BuiltinShader::Blit);
-        let blit_pipeline = device.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("app_blit_pipeline"), layout: Some(&blit_pipeline_layout),
-            vertex: wgpu::VertexState { module: &blit_shader, entry_point: "vs_main", buffers: &[] },
-            fragment: Some(wgpu::FragmentState {
-                module: &blit_shader, entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    blend: None, write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None,
-        });
+        let blit_pipeline = device
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("app_blit_pipeline"),
+                layout: Some(&blit_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &blit_shader,
+                    entry_point: "vs_main",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &blit_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
 
         let sampler = device.device.create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
@@ -207,29 +266,44 @@ impl NexirApp {
         log::info!("NexirApp::new: blit resources created");
 
         // Set up audio engine
-        let project_tb = Rational { num: 1, den: 90_000 };
+        let project_tb = Rational {
+            num: 1,
+            den: 90_000,
+        };
         let audio_ring = AudioRingBuffer::new(1 << 17); // 131072 samples
         let audio_clock = MasterClock::new(project_tb, 48_000);
         let audio_shutdown = Arc::new(AtomicBool::new(false));
         let audio_seek = Arc::new(Mutex::new(None::<(i64, i64)>));
 
         log::info!("NexirApp::new: CPAL audio stream opening...");
-        let audio_out = AudioOutputStream::open(
-            Arc::clone(&audio_ring),
-            Arc::clone(&audio_clock),
-        ).map_err(|e| eprintln!("[audio] Failed to open output: {:?}", e)).ok();
-        log::info!("NexirApp::new: CPAL audio stream status: {:?}", audio_out.is_some());
+        let audio_out = AudioOutputStream::open(Arc::clone(&audio_ring), Arc::clone(&audio_clock))
+            .map_err(|e| eprintln!("[audio] Failed to open output: {:?}", e))
+            .ok();
+        log::info!(
+            "NexirApp::new: CPAL audio stream status: {:?}",
+            audio_out.is_some()
+        );
 
         log::info!("NexirApp::new: InteropCapability probing...");
         let interop_capability = InteropCapability::probe(&device);
-        log::info!("NexirApp::new: InteropCapability probed: {:?}", interop_capability);
+        log::info!(
+            "NexirApp::new: InteropCapability probed: {:?}",
+            interop_capability
+        );
 
         log::info!("NexirApp::new: completed successfully!");
         Self {
             egui_ctx,
             egui_state,
             egui_renderer,
-            preview: PreviewState { texture: None, texture_id: None, width: 0, height: 0, video_width: 0, video_height: 0 },
+            preview: PreviewState {
+                texture: None,
+                texture_id: None,
+                width: 0,
+                height: 0,
+                video_width: 0,
+                video_height: 0,
+            },
             inspector: InspectorState::default(),
             media_pool: MediaPoolState::default(),
             timeline: TimelineState::default(),
@@ -256,6 +330,7 @@ impl NexirApp {
             audio_speed: 1.0,
             audio_pitch: 0.0,
             audio_was_playing: false,
+            waveform_cache: crate::waveform::WaveformCache::new(),
             device,
             export_progress: None,
             export_status: None,
@@ -265,12 +340,15 @@ impl NexirApp {
             export_settings: ExportSettings::default(),
             interop_capability,
             cuda_ctx: None,
+            still_cache: Mutex::new(StillImageCache::default()),
         }
     }
 
     pub fn handle_event(&mut self, window: &Window, event: &WindowEvent) -> AppResponse {
         let response = self.egui_state.on_window_event(window, event);
-        AppResponse { consumed: response.consumed }
+        AppResponse {
+            consumed: response.consumed,
+        }
     }
 
     pub fn update(&mut self, window: &Window) -> egui::Vec2 {
@@ -281,7 +359,8 @@ impl NexirApp {
             let cmd = i.modifiers.command || i.modifiers.ctrl;
             (
                 cmd && i.key_pressed(egui::Key::Z) && !i.modifiers.shift,
-                (cmd && i.key_pressed(egui::Key::Y)) || (cmd && i.modifiers.shift && i.key_pressed(egui::Key::Z)),
+                (cmd && i.key_pressed(egui::Key::Y))
+                    || (cmd && i.modifiers.shift && i.key_pressed(egui::Key::Z)),
             )
         });
         if undo_pressed && self.history.undo(&mut self.project) {
@@ -297,7 +376,12 @@ impl NexirApp {
             let can_redo = self.history.can_redo();
             let mut action: Option<crate::layout::top_bar::TopBarAction> = None;
             egui::TopBottomPanel::top("top_bar").show(&self.egui_ctx, |ui| {
-                action = crate::layout::top_bar::draw(ui, can_undo, can_redo, &mut self.project.settings);
+                action = crate::layout::top_bar::draw(
+                    ui,
+                    can_undo,
+                    can_redo,
+                    &mut self.project.settings,
+                );
             });
             action
         };
@@ -337,8 +421,18 @@ impl NexirApp {
             .resizable(true)
             .default_height(300.0)
             .show(&self.egui_ctx, |ui| {
-                crate::layout::timeline::draw(ui, &mut self.project, &mut self.timeline, &mut self.media_pool.dragging_item, &mut self.history);
+                crate::layout::timeline::draw(
+                    ui,
+                    &mut self.project,
+                    &mut self.timeline,
+                    &mut self.media_pool.dragging_item,
+                    &mut self.history,
+                    &self.waveform_cache,
+                    &self.still_cache,
+                );
             });
+
+        let just_started_playing = self.timeline.playing && !self.audio_was_playing;
 
         egui::SidePanel::left("media_pool")
             .resizable(true)
@@ -349,30 +443,50 @@ impl NexirApp {
 
         // Process media imports: probe file and register with video dimensions
         for entry in &self.media_pool.entries {
-            let already = self.project.sources.read().unwrap().path_registered(&entry.path);
+            let already = self
+                .project
+                .sources
+                .read()
+                .unwrap()
+                .path_registered(&entry.path);
             if !already {
                 let (vid_info, aud_info) = {
-                    use nexir::timeline::source::{VideoStreamInfo, AudioStreamInfo, PixelFormat, ColorSpace, SampleFormat};
                     use nexir::timeline::rational::Rational;
+                    use nexir::timeline::source::{
+                        AudioStreamInfo, ColorSpace, PixelFormat, SampleFormat, VideoStreamInfo,
+                    };
                     if let Ok(demuxer) = Demuxer::open(&entry.path) {
-                        let project_tb = Rational { num: 1, den: 90_000 };
-                        
+                        let project_tb = Rational {
+                            num: 1,
+                            den: 90_000,
+                        };
+                        let is_still_image =
+                            nexir::timeline::source::is_still_image_path(&entry.path);
+
                         let vi = demuxer.video_stream.as_ref().map(|s| VideoStreamInfo {
-                            width:        s.width.unwrap_or(1920),
-                            height:       s.height.unwrap_or(1080),
-                            frame_rate:   s.frame_rate.unwrap_or(Rational { num: 30, den: 1 }),
-                            pixel_fmt:    PixelFormat::Yuv420p,
-                            color_space:  ColorSpace::Bt709,
+                            width: s.width.unwrap_or(1920),
+                            height: s.height.unwrap_or(1080),
+                            frame_rate: if is_still_image {
+                                Rational { num: 0, den: 1 }
+                            } else {
+                                s.frame_rate.unwrap_or(Rational { num: 30, den: 1 })
+                            },
+                            pixel_fmt: PixelFormat::Yuv420p,
+                            color_space: ColorSpace::Bt709,
                             // convert from stream timebase to project timebase
-                            duration_pts: project_tb.from_pts(s.duration, s.time_base),
-                            is_vfr:       s.is_vfr,
-                            time_base:    s.time_base,
+                            duration_pts: if is_still_image {
+                                0
+                            } else {
+                                project_tb.from_pts(s.duration, s.time_base)
+                            },
+                            is_vfr: !is_still_image && s.is_vfr,
+                            time_base: s.time_base,
                         });
 
                         let ai = demuxer.audio_stream.as_ref().map(|s| AudioStreamInfo {
-                            sample_rate:  48000,
-                            channels:     2,
-                            sample_fmt:   SampleFormat::F32Interleaved,
+                            sample_rate: 48000,
+                            channels: 2,
+                            sample_fmt: SampleFormat::F32Interleaved,
                             duration_pts: project_tb.from_pts(s.duration, s.time_base),
                         });
 
@@ -381,9 +495,14 @@ impl NexirApp {
                         (None, None)
                     }
                 };
-                self.project.register_source(entry.path.clone(), vid_info, aud_info);
+                self.project
+                    .register_source(entry.path.clone(), vid_info, aud_info);
+                // Evict this specific path from still-image cache
+                self.still_cache.lock().unwrap().evict(&entry.path);
             }
         }
+
+        self.advance_playhead(just_started_playing);
 
         egui::SidePanel::right("inspector")
             .resizable(true)
@@ -422,15 +541,6 @@ impl NexirApp {
             self.media_pool.dragging_item = None;
         }
 
-        // Check if playback just started this frame
-        let just_started_playing = self.timeline.playing && !self.audio_was_playing;
-
-        // Sync playhead to audio clock if playing (and not just started, to avoid pulling it back to old clock)
-        if self.timeline.playing && self.audio_path.is_some() && !just_started_playing {
-            let clock_pts = self.audio_clock.pts();
-            self.timeline.playhead_frame = self.project.pts_to_frame(clock_pts);
-        }
-        
         if self.timeline.playing != self.audio_was_playing {
             if let Some(audio_out) = &self._audio_out {
                 if self.timeline.playing {
@@ -451,11 +561,11 @@ impl NexirApp {
             // 3. We jumped more than 2s forward (definitely not normal playback)
             // 4. We moved while PAUSED (always a scrub, even if it's a small forward move)
             let pts_delta = playhead_pts - self.last_playhead;
-            let mut force_seek = just_started_playing 
-                              || pts_delta < 0 
-                              || pts_delta > 180_000 
-                              || !self.timeline.playing; // Moved while paused
-                              
+            let mut force_seek = just_started_playing
+                || pts_delta < 0
+                || pts_delta > 180_000
+                || !self.timeline.playing; // Moved while paused
+
             self.last_playhead = playhead_pts;
 
             // Respect mute / solo: pre-compute whether any track is soloed.
@@ -474,7 +584,14 @@ impl NexirApp {
                             // Only use embedded audio if the track is not muted/solo'd out.
                             if track_active && fallback_video_audio.is_none() {
                                 let source_id = self.project.clips.source_id_at(clip.store_index);
-                                if self.project.sources.read().unwrap().audio_info(source_id).is_ok() {
+                                if self
+                                    .project
+                                    .sources
+                                    .read()
+                                    .unwrap()
+                                    .audio_info(source_id)
+                                    .is_ok()
+                                {
                                     fallback_video_audio = Some(clip.clone());
                                 }
                             }
@@ -500,6 +617,11 @@ impl NexirApp {
                 let audio_muted = self.project.clips.audio_muted_at(clip.store_index);
                 let speed = self.project.clips.speed_at(clip.store_index);
                 let pitch = self.project.clips.pitch_at(clip.store_index);
+                let source_in_pts = self.project.clips.source_in_at(clip.store_index);
+                let pts_out = self.project.clips.pts_out_at(clip.store_index);
+                let pts_in = self.project.clips.pts_in_at(clip.store_index);
+                let duration_pts = pts_out - pts_in;
+                let source_out_pts = source_in_pts + (duration_pts as f32 * speed).round() as i64;
                 let path = {
                     let sources = self.project.sources.read().unwrap();
                     sources.path(source_id).map(|p| p.as_ref().clone())
@@ -515,30 +637,53 @@ impl NexirApp {
                         || self.audio_pitch != pitch;
                     if need_new_decoder {
                         // Stop current decoder if running
-                        self.audio_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.audio_shutdown
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         // Give it a brief moment to exit
                         std::thread::sleep(std::time::Duration::from_millis(5));
-                        
+
                         self.audio_ring.clear();
-                        self.audio_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        
+                        self.audio_shutdown =
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
                         let clock = std::sync::Arc::clone(&self.audio_clock);
                         let ring = std::sync::Arc::clone(&self.audio_ring);
                         let seek = std::sync::Arc::clone(&self.audio_seek);
                         let shutdown = std::sync::Arc::clone(&self.audio_shutdown);
-                        let project_tb = nexir::timeline::rational::Rational { num: 1, den: 90_000 };
-                        
+                        let project_tb = nexir::timeline::rational::Rational {
+                            num: 1,
+                            den: 90_000,
+                        };
+
                         let path_clone = path.clone();
-                        eprintln!("[app] Starting audio decoder for {:?} (volume: {}, pan: {}, muted: {}, speed: {}, pitch: {})", path_clone, volume, pan, audio_muted, speed, pitch);
+                        eprintln!(
+                            "[app] Starting audio decoder for {:?} (volume: {}, pan: {}, muted: {}, speed: {}, pitch: {})",
+                            path_clone, volume, pan, audio_muted, speed, pitch
+                        );
                         std::thread::spawn(move || {
                             match AudioDecoder::new(
-                                &path_clone, ring, clock, project_tb, shutdown, seek, volume, pan, audio_muted, speed, pitch
+                                &path_clone,
+                                ring,
+                                clock,
+                                project_tb,
+                                shutdown,
+                                seek,
+                                volume,
+                                pan,
+                                audio_muted,
+                                speed,
+                                pitch,
+                                source_in_pts,
+                                source_out_pts,
                             ) {
                                 Ok(decoder) => decoder.run(),
-                                Err(e) => eprintln!("Failed to open audio decoder for {:?}: {:?}", path_clone, e),
+                                Err(e) => eprintln!(
+                                    "Failed to open audio decoder for {:?}: {:?}",
+                                    path_clone, e
+                                ),
                             }
                         });
-                        
+
                         self.audio_path = Some(path);
                         self.audio_volume = volume;
                         self.audio_pan = pan;
@@ -547,7 +692,7 @@ impl NexirApp {
                         self.audio_pitch = pitch;
                         force_seek = true; // force a seek when opening a new file
                     }
-                    
+
                     if force_seek {
                         *self.audio_seek.lock().unwrap() = Some((source_pts, playhead_pts));
                         self.audio_clock.seek(playhead_pts);
@@ -558,16 +703,19 @@ impl NexirApp {
             // ── AUDIO MUTE: kill the decoder immediately when the audio track is
             //    muted (or unsolo'd), so the ring drains to silence.
             if top_audio_clip.is_none() && self.audio_path.is_some() {
-                self.audio_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.audio_shutdown
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 self.audio_path = None;
                 self.audio_ring.clear();
-                self.audio_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                self.audio_shutdown =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             }
         }
 
         // Stop audio decoder when user pauses / stops playback
         if !self.timeline.playing && self.audio_path.is_some() {
-            self.audio_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.audio_shutdown
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.audio_path = None;
             self.audio_ring.clear();
             // Reset clock so next play starts fresh
@@ -635,13 +783,52 @@ impl NexirApp {
         viewport_size
     }
 
+    fn advance_playhead(&mut self, just_started_playing: bool) {
+        if !self.timeline.playing {
+            return;
+        }
+
+        let max_frame = self.project.duration_frames();
+        if max_frame <= 0 {
+            self.timeline.playhead_frame = 0;
+            self.timeline.last_tick = Some(std::time::Instant::now());
+            return;
+        }
+
+        let now = std::time::Instant::now();
+
+        if self.audio_path.is_some() && !just_started_playing {
+            let clock_pts = self.audio_clock.pts();
+            self.timeline.playhead_frame = self.project.pts_to_frame(clock_pts);
+        } else if let Some(last) = self.timeline.last_tick {
+            let fps = self.project.settings.frame_rate.num.max(1);
+            let elapsed_secs = now.duration_since(last).as_secs_f64();
+            let frames_to_advance = (elapsed_secs * fps as f64) as i64;
+            if frames_to_advance > 0 {
+                self.timeline.playhead_frame += frames_to_advance;
+                self.timeline.last_tick = Some(now);
+            }
+        } else {
+            self.timeline.last_tick = Some(now);
+        }
+
+        if self.timeline.playhead_frame >= max_frame {
+            self.timeline.playhead_frame = 0;
+            self.timeline.last_tick = Some(now);
+            self.audio_clock.seek(0);
+        }
+
+        self.egui_ctx.request_repaint();
+    }
+
     // ─────────────────────────────────────────────
     // Project file management
     // ─────────────────────────────────────────────
 
     /// Stop any running audio decoder and reset audio state.
     fn stop_audio(&mut self) {
-        self.audio_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.audio_shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.audio_path = None;
         self.audio_ring.clear();
         self.audio_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -660,6 +847,8 @@ impl NexirApp {
         // then point the project to use that same Arc so future registrations are visible.
         self.io_layer.reset_for_new_project(&self.project.sources);
         self.project.sources = self.io_layer.source_reg.clone();
+        // Clear still-image cache because source registry changed.
+        self.still_cache.lock().unwrap().clear();
         self.current_project_path = None;
         self.history = crate::history::HistoryState::default();
         self.timeline.clear_interaction();
@@ -682,6 +871,8 @@ impl NexirApp {
                     // then point the project to use that same Arc.
                     self.io_layer.reset_for_new_project(&project.sources);
                     project.sources = self.io_layer.source_reg.clone();
+                    // Clear still-image cache because source registry changed.
+                    self.still_cache.lock().unwrap().clear();
                     self.project = project;
                     self.current_project_path = Some(path);
                     self.history = crate::history::HistoryState::default();
@@ -741,7 +932,14 @@ impl NexirApp {
         frame: &nexir::render::frame_state::FrameState,
         canvas_width: u32,
         canvas_height: u32,
-    ) -> Result<(nexir::render::graph::CompiledGraph, Vec<Box<dyn nexir::render::graph::RenderNode>>, ResourceId), nexir::render::graph::GraphError> {
+    ) -> Result<
+        (
+            nexir::render::graph::CompiledGraph,
+            Vec<Box<dyn nexir::render::graph::RenderNode>>,
+            ResourceId,
+        ),
+        nexir::render::graph::GraphError,
+    > {
         let mut compiler = RenderGraphCompiler::new();
         let mut id_counter = 2; // 0=FINAL_COLOR, 1=SCREEN
 
@@ -754,6 +952,33 @@ impl NexirApp {
         );
 
         for clip in &frame.clips {
+            // If this clip's source is a still image, use the StillImageUploadNode
+            let is_still = self
+                .project
+                .sources
+                .read()
+                .unwrap()
+                .path(clip.source_id)
+                .map(|p| nexir::timeline::source::is_still_image_path(p.as_ref()))
+                .unwrap_or(false);
+
+            if is_still {
+                if let Some(path) = self.project.sources.read().unwrap().path(clip.source_id) {
+                    log::info!("compile_export_graph: clip source_id={:?} path={:?} detected as still", clip.source_id, path);
+                    if let Some(cached) = self.still_cache.lock().unwrap().get_or_load(device, path.as_ref()) {
+                        let rgba_id = ResourceId::next(&mut id_counter);
+                        compiler.add_node(Box::new(StillImageUploadNode::new(cached, rgba_id)));
+                        comp_node.input_textures.push(rgba_id);
+                        continue;
+                    } else {
+                        log::warn!("Still image load failed for {:?}", path);
+                    }
+                } else {
+                    log::warn!("compile_export_graph: clip source_id={:?} has no registered path", clip.source_id);
+                }
+                // Fallthrough to YUV path if still image failed to load.
+            }
+
             let tier = (clip.texture_slot >> 16) as u8;
             let index = (clip.texture_slot & 0xFFFF) as u16;
             let slot_id = nexir::io::slot_pool::FrameSlotId { tier, index };
@@ -761,9 +986,8 @@ impl NexirApp {
             let y_id = ResourceId::next(&mut id_counter);
             let uv_id = ResourceId::next(&mut id_counter);
 
-            let upload_node = YuvUploadNode::new(
-                device, 0, clip.clip_width, clip.clip_height, y_id, uv_id,
-            );
+            let mut upload_node =
+                YuvUploadNode::new(device, 0, clip.clip_width, clip.clip_height, y_id, uv_id);
 
             // Upload YUV data from the slot pool into staging buffers
             self.io_layer.pool.with_buffer_read(slot_id, |data| {
@@ -774,13 +998,20 @@ impl NexirApp {
 
             // Add YuvToRgb node
             let rgba_id = ResourceId::next(&mut id_counter);
-            compiler.add_node(Box::new(nexir::render::nodes::yuv_to_rgb::YuvToRgbNode::new(
-                device, &self.shaders, &self.compute_cache,
-                y_id, uv_id, rgba_id,
-                clip.clip_width, clip.clip_height,
-                nexir::timeline::source::ColorSpace::Bt709,
-                true, // limited range
-            )));
+            compiler.add_node(Box::new(
+                nexir::render::nodes::yuv_to_rgb::YuvToRgbNode::new(
+                    device,
+                    &self.shaders,
+                    &self.compute_cache,
+                    y_id,
+                    uv_id,
+                    rgba_id,
+                    clip.clip_width,
+                    clip.clip_height,
+                    nexir::timeline::source::ColorSpace::Bt709,
+                    true, // limited range
+                ),
+            ));
 
             // Provide RGBA texture to compositor
             comp_node.input_textures.push(rgba_id);
@@ -824,10 +1055,13 @@ impl NexirApp {
         };
 
         // Build export job from current project state
-        let project_tb = Rational { num: 1, den: 90_000 };
+        let project_tb = Rational {
+            num: 1,
+            den: 90_000,
+        };
         let fps = self.project.settings.frame_rate;
         let total_duration = self.project.frame_to_pts(self.project.duration_frames());
-        let width  = self.project.settings.width;
+        let width = self.project.settings.width;
         let height = self.project.settings.height;
 
         let job = ExportJob {
@@ -850,9 +1084,12 @@ impl NexirApp {
         // NOTE (Encode Interop): Prepare CudaContext if hardware interop is available and not forced to CPU.
         // This enables the zero-copy GPU path (wgpu -> CUDA -> NVENC), drastically improving export speed
         // by avoiding CPU memory readbacks and providing hardware HEVC/H.264 encode capabilities.
-        let cuda_ctx = if self.interop_capability.is_available() && !self.export_settings.force_cpu {
+        let cuda_ctx = if self.interop_capability.is_available() && !self.export_settings.force_cpu
+        {
             if self.cuda_ctx.is_none() {
-                self.cuda_ctx = CudaContext::new(&self.interop_capability).ok().map(Arc::new);
+                self.cuda_ctx = CudaContext::new(&self.interop_capability)
+                    .ok()
+                    .map(Arc::new);
             }
             self.cuda_ctx.clone()
         } else {
@@ -868,7 +1105,7 @@ impl NexirApp {
         // benefit. A live prefetch worker causes a deadlock: it fills all 32 pool
         // slots, evicts one, then tries to lock that slot's buffer mutex while the
         // render thread holds it in upload_frame_data.
-        let export_pool  = Arc::new(FrameSlotPool::new(&self.device));
+        let export_pool = Arc::new(FrameSlotPool::new(&self.device));
         let export_cache = Arc::new(FrameCache::new(export_pool.clone(), 16));
         let (export_prefetch_tx, _export_prefetch_rx) =
             std::sync::mpsc::sync_channel::<PrefetchRequest>(1);
@@ -886,7 +1123,10 @@ impl NexirApp {
             job,
             export_scheduler,
             Arc::new(std::sync::RwLock::new(self.project.clips.clone())),
-            Arc::new(std::sync::RwLock::new(self.project.sources.read().unwrap().clone())),
+            Arc::new(std::sync::RwLock::new(self.project.tracks.clone())),
+            Arc::new(std::sync::RwLock::new(
+                self.project.sources.read().unwrap().clone(),
+            )),
             self.interop_capability.clone(),
             cuda_ctx,
             self.export_settings.force_cpu,
@@ -903,7 +1143,13 @@ impl NexirApp {
         }
     }
 
-    pub fn render(&mut self, device: &GpuDevice, surface: &wgpu::Surface, window: &Window, viewport_size: egui::Vec2) {
+    pub fn render(
+        &mut self,
+        device: &GpuDevice,
+        surface: &wgpu::Surface,
+        window: &Window,
+        viewport_size: egui::Vec2,
+    ) {
         let width = viewport_size.x as u32;
         let height = viewport_size.y as u32;
 
@@ -911,16 +1157,24 @@ impl NexirApp {
             if self.preview.width != width || self.preview.height != height {
                 let texture = device.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Preview Texture"),
-                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                    mip_level_count: 1, sample_count: 1,
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 });
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                 let tex_id = self.egui_renderer.register_native_texture(
-                    device.device.as_ref(), &view, wgpu::FilterMode::Linear,
+                    device.device.as_ref(),
+                    &view,
+                    wgpu::FilterMode::Linear,
                 );
                 if let Some(old_id) = self.preview.texture_id {
                     self.egui_renderer.free_texture(&old_id);
@@ -933,14 +1187,20 @@ impl NexirApp {
         }
 
         let output = self.egui_ctx.end_frame();
-        let clipped_primitives = self.egui_ctx.tessellate(output.shapes, output.pixels_per_point);
+        let clipped_primitives = self
+            .egui_ctx
+            .tessellate(output.shapes, output.pixels_per_point);
 
         let surface_texture = match surface.get_current_texture() {
-            Ok(t)  => t,
+            Ok(t) => t,
             Err(wgpu::SurfaceError::Outdated) => return,
-            Err(e) => { log::error!("Dropped frame: {:?}", e); return; }
+            Err(e) => {
+                log::error!("Dropped frame: {:?}", e);
+                return;
+            }
         };
-        let surface_view = surface_texture.texture
+        let surface_view = surface_texture
+            .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = device.begin_frame();
@@ -950,35 +1210,52 @@ impl NexirApp {
         let frame = self.frame_scheduler.schedule_frame(
             playhead_pts,
             &self.project.clips,
-            &self.project.sources.read().unwrap()
+            &self.project.tracks,
+            &self.project.sources.read().unwrap(),
         );
 
         if !frame.clips.is_empty() {
             if let Some(ref preview_texture) = self.preview.texture {
-                if let Ok((graph, _nodes, rtt_id)) = self.compile_export_graph(device, &frame, self.preview.width, self.preview.height) {
+                if let Ok((graph, _nodes, rtt_id)) = self.compile_export_graph(
+                    device,
+                    &frame,
+                    self.preview.width,
+                    self.preview.height,
+                ) {
                     graph.execute_with_callback(&mut encoder, device, &frame, |enc, ctx| {
                         let final_res = ctx.get(rtt_id);
-                        
-                        let preview_view = preview_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+                        let preview_view =
+                            preview_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
                         let bg = device.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("blit_bg"), layout: &self.blit_bgl,
+                            label: Some("blit_bg"),
+                            layout: &self.blit_bgl,
                             entries: &[
-                                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(final_res.view) },
-                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(final_res.view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                },
                             ],
                         });
 
                         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("blit_pass"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &preview_view, resolve_target: None,
+                                view: &preview_view,
+                                resolve_target: None,
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                                     store: wgpu::StoreOp::Store,
                                 },
                             })],
-                            depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
                         });
                         pass.set_pipeline(&self.blit_pipeline);
                         pass.set_bind_group(0, &bg, &[]);
@@ -992,42 +1269,71 @@ impl NexirApp {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("preview_clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &preview_view, resolve_target: None,
+                    view: &preview_view,
+                    resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.05, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05,
+                            g: 0.05,
+                            b: 0.05,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
             });
         }
 
         // egui textures
         for (id, image_delta) in &output.textures_delta.set {
-            self.egui_renderer.update_texture(device.device.as_ref(), device.queue.as_ref(), *id, image_delta);
+            self.egui_renderer.update_texture(
+                device.device.as_ref(),
+                device.queue.as_ref(),
+                *id,
+                image_delta,
+            );
         }
 
         let screen_descriptor = ScreenDescriptor {
-            size_in_pixels: [surface_texture.texture.width(), surface_texture.texture.height()],
+            size_in_pixels: [
+                surface_texture.texture.width(),
+                surface_texture.texture.height(),
+            ],
             pixels_per_point: window.scale_factor() as f32,
         };
         self.egui_renderer.update_buffers(
-            device.device.as_ref(), device.queue.as_ref(), &mut encoder, &clipped_primitives, &screen_descriptor,
+            device.device.as_ref(),
+            device.queue.as_ref(),
+            &mut encoder,
+            &clipped_primitives,
+            &screen_descriptor,
         );
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("egui_render_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surface_view, resolve_target: None,
+                    view: &surface_view,
+                    resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.1, b: 0.1, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.1,
+                            b: 0.1,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
             });
-            self.egui_renderer.render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+            self.egui_renderer
+                .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
         }
 
         device.submit(encoder);
