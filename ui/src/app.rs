@@ -1025,6 +1025,8 @@ impl NexirApp {
     }
 
     fn open_export_settings(&mut self) {
+        self.stop_audio();
+
         let file = rfd::FileDialog::new()
             .add_filter("Video Files", &["mp4", "mkv", "mov"])
             .set_title("Export Video")

@@ -462,7 +462,60 @@ pub fn draw(
             }
 
             // ── Track rows ─────────────────────────────────────────
-            for track in project.tracks.iter() {
+            // Sort tracks for display: Video on top, then Audio, etc.
+            let mut sorted_tracks: Vec<&nexir::timeline::track::Track> = project.tracks.iter().collect();
+            sorted_tracks.sort_by(|a, b| {
+                fn kind_order(kind: &TrackKind) -> u8 {
+                    match kind {
+                        TrackKind::Video => 0,
+                        TrackKind::Audio { .. } => 1,
+                        TrackKind::Text => 2,
+                        TrackKind::Effect => 3,
+                    }
+                }
+                kind_order(&a.kind).cmp(&kind_order(&b.kind))
+            });
+
+            let mut prev_kind_order = None;
+
+            for track in sorted_tracks.iter() {
+                let current_kind_order = match track.kind {
+                    TrackKind::Video => 0,
+                    TrackKind::Audio { .. } => 1,
+                    TrackKind::Text => 2,
+                    TrackKind::Effect => 3,
+                };
+
+                // Add aesthetic grouping separator if kind changed
+                if let Some(prev) = prev_kind_order {
+                    if prev != current_kind_order {
+                        let gap_h = 24.0;
+                        let (gap_rect, _) = ui.allocate_exact_size(Vec2::new(canvas_w + GUTTER_W, gap_h), Sense::hover());
+                        let mid_y = gap_rect.center().y;
+                        
+                        // subtle separator spanning the entire width
+                        ui.painter().line_segment(
+                            [egui::pos2(gap_rect.left(), mid_y), egui::pos2(gap_rect.right(), mid_y)],
+                            egui::Stroke::new(2.0, Color32::from_rgb(20, 20, 20)),
+                        );
+
+                        // Category label
+                        let category_name = match current_kind_order {
+                            1 => "AUDIO",
+                            2 => "TEXT",
+                            3 => "EFFECTS",
+                            _ => "OTHER",
+                        };
+                        ui.painter().text(
+                            egui::pos2(gap_rect.left() + GUTTER_W + 10.0, mid_y),
+                            Align2::LEFT_CENTER,
+                            category_name,
+                            egui::FontId::proportional(12.0),
+                            Color32::from_rgb(100, 100, 100),
+                        );
+                    }
+                }
+                prev_kind_order = Some(current_kind_order);
                 let is_active = track.is_active(any_soloed);
                 let track_h = track.height_px as f32;
 
@@ -941,13 +994,13 @@ pub fn draw(
                     }
                     TrackMutation::AddVideoTrack => {
                         history.record(project);
-                        let n = project.tracks.len();
-                        let _ = project.add_video_track(format!("Video {}", n + 1));
+                        let count = project.tracks.iter().filter(|t| matches!(t.kind, TrackKind::Video)).count();
+                        let _ = project.add_video_track(format!("Video {}", count + 1));
                     }
                     TrackMutation::AddAudioTrack => {
                         history.record(project);
-                        let n = project.tracks.len();
-                        let _ = project.add_audio_track(format!("Audio {}", n + 1));
+                        let count = project.tracks.iter().filter(|t| matches!(t.kind, TrackKind::Audio { .. })).count();
+                        let _ = project.add_audio_track(format!("Audio {}", count + 1));
                     }
                 }
             }
