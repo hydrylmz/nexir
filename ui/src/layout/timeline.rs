@@ -489,7 +489,7 @@ pub fn draw(
                 // Add aesthetic grouping separator if kind changed
                 if let Some(prev) = prev_kind_order {
                     if prev != current_kind_order {
-                        let gap_h = 24.0;
+                        let gap_h = 12.0;
                         let (gap_rect, _) = ui.allocate_exact_size(Vec2::new(canvas_w + GUTTER_W, gap_h), Sense::hover());
                         let mid_y = gap_rect.center().y;
                         
@@ -497,21 +497,6 @@ pub fn draw(
                         ui.painter().line_segment(
                             [egui::pos2(gap_rect.left(), mid_y), egui::pos2(gap_rect.right(), mid_y)],
                             egui::Stroke::new(2.0, Color32::from_rgb(20, 20, 20)),
-                        );
-
-                        // Category label
-                        let category_name = match current_kind_order {
-                            1 => "AUDIO",
-                            2 => "TEXT",
-                            3 => "EFFECTS",
-                            _ => "OTHER",
-                        };
-                        ui.painter().text(
-                            egui::pos2(gap_rect.left() + GUTTER_W + 10.0, mid_y),
-                            Align2::LEFT_CENTER,
-                            category_name,
-                            egui::FontId::proportional(12.0),
-                            Color32::from_rgb(100, 100, 100),
                         );
                     }
                 }
@@ -1501,8 +1486,8 @@ pub fn draw(
                                 nexir::timeline::source::is_still_image_path(&path);
                             let vi = demuxer.video_stream.as_ref().map(|s| {
                                 nexir::timeline::source::VideoStreamInfo {
-                                    width: s.width.unwrap_or(1920),
-                                    height: s.height.unwrap_or(1080),
+                                    width: s.width.unwrap_or(project.settings.width),
+                                    height: s.height.unwrap_or(project.settings.height),
                                     frame_rate: if is_still_image {
                                         nexir::timeline::rational::Rational { num: 0, den: 1 }
                                     } else {

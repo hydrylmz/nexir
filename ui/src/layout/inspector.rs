@@ -168,13 +168,13 @@ fn draw_inner(
 
                         ui.label("Position X");
                         transform_changed |= ui
-                            .add(egui::Slider::new(&mut state.pos_x, -1920.0..=1920.0).suffix("px"))
+                            .add(egui::Slider::new(&mut state.pos_x, -(project.settings.width as f32)..=(project.settings.width as f32)).suffix("px"))
                             .changed();
                         ui.end_row();
 
                         ui.label("Position Y");
                         transform_changed |= ui
-                            .add(egui::Slider::new(&mut state.pos_y, -1080.0..=1080.0).suffix("px"))
+                            .add(egui::Slider::new(&mut state.pos_y, -(project.settings.height as f32)..=(project.settings.height as f32)).suffix("px"))
                             .changed();
                         ui.end_row();
 

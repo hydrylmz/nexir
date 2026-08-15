@@ -371,6 +371,8 @@ impl NexirApp {
             self.timeline.selected_clip = None;
         }
 
+        let prev_settings = self.project.settings.clone();
+
         let top_bar_action = {
             let can_undo = self.history.can_undo();
             let can_redo = self.history.can_redo();
@@ -385,6 +387,14 @@ impl NexirApp {
             });
             action
         };
+        
+        if prev_settings.width != self.project.settings.width || prev_settings.height != self.project.settings.height {
+            self.frame_scheduler = FrameScheduler::new(
+                self.io_layer.clone(),
+                self.project.settings.width,
+                self.project.settings.height,
+            );
+        }
         if let Some(action) = top_bar_action {
             match action {
                 crate::layout::top_bar::TopBarAction::Undo => {
@@ -826,7 +836,7 @@ impl NexirApp {
     // ─────────────────────────────────────────────
 
     /// Stop any running audio decoder and reset audio state.
-    fn stop_audio(&mut self) {
+    fn stop_playback(&mut self) {
         self.audio_shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.audio_path = None;
@@ -838,7 +848,7 @@ impl NexirApp {
 
     /// Reset the project to a blank slate, clearing history.
     fn new_project(&mut self) {
-        self.stop_audio();
+        self.stop_playback();
         self.project = Project::new("Untitled Project");
         let _ = self.project.add_video_track("Video 1");
         let _ = self.project.add_video_track("Video 2");
@@ -866,7 +876,7 @@ impl NexirApp {
         if let Some(path) = file {
             match ProjectFile::load(&path) {
                 Ok(mut project) => {
-                    self.stop_audio();
+                    self.stop_playback();
                     // Sync IoLayer: copy loaded registry into IoLayer's shared Arc,
                     // then point the project to use that same Arc.
                     self.io_layer.reset_for_new_project(&project.sources);
@@ -1025,7 +1035,7 @@ impl NexirApp {
     }
 
     fn open_export_settings(&mut self) {
-        self.stop_audio();
+        self.stop_playback();
 
         let file = rfd::FileDialog::new()
             .add_filter("Video Files", &["mp4", "mkv", "mov"])

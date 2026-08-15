@@ -10,8 +10,10 @@ fn clip_corners_ui(
     clip_w: f32,
     clip_h: f32,
     draw_rect: Rect,
+    canvas_w: f32,
+    canvas_h: f32,
 ) -> [egui::Pos2; 4] {
-    let m = transform.to_matrix(clip_w, clip_h, 1920.0, 1080.0);
+    let m = transform.to_matrix(clip_w, clip_h, canvas_w, canvas_h);
 
     let map_corner = |u: f32, v: f32| -> egui::Pos2 {
         let ndc_x = u * m[0] + v * m[3] + m[6];
@@ -88,9 +90,8 @@ pub fn draw(
     let (rect, response) = ui.allocate_exact_size(viewport_size, egui::Sense::click());
     ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
 
-    // Assume canvas is 1920x1080
-    let canvas_w = 1920.0;
-    let canvas_h = 1080.0;
+    let canvas_w = project.settings.width as f32;
+    let canvas_h = project.settings.height as f32;
     let canvas_ar = canvas_w / canvas_h;
     let panel_ar = rect.width() / rect.height();
 
@@ -142,7 +143,7 @@ pub fn draw(
                     let clip_h = info.height as f32;
                     let transform = project.clips.transform_at(clip.store_index);
 
-                    let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect);
+                    let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect, canvas_w, canvas_h);
                     if is_point_in_quad(pos, &corners) {
                         clicked_idx = Some(clip.store_index);
                         break;
@@ -168,7 +169,7 @@ pub fn draw(
                     let transform = *project.clips.transform_at(idx);
                     let clip_id = project.clips.clip_id_at(idx);
 
-                    let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect);
+                    let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect, canvas_w, canvas_h);
 
                     // Draw outline
                     for i in 0..4 {
