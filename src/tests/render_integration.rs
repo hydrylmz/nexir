@@ -4,7 +4,7 @@ mod render_integration {
     use std::sync::Arc;
     use crate::render::device::GpuDevice;
     use crate::render::graph::{RenderGraphCompiler, RenderNode, GraphError};
-    use crate::render::resource::{ResourceId, ResolutionSource, ResourceDescriptor, ResourceBuilder};
+    use crate::render::resource::{ResourceId, ResolutionSource, ResourceDescriptor, ResourceBuilder, TextureAccess};
     use crate::render::context::RenderContext;
     use crate::render::frame_state::{FrameState, ClipRenderEntry};
     use crate::timeline::ids::SourceId;
@@ -23,24 +23,14 @@ mod render_integration {
                 label: Some("FinalColor".into()),
                 size: ResolutionSource::Fixed(W, H),
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING
-            });
-            // Just for the test, we override FINAL_COLOR's meaning if it's not 0, 
-            // but actually ResourceBuilder::create returns a new ID.
-            // Wait, ResourceBuilder increments a counter. FINAL_COLOR is defined as 0.
-            // We can't use builder.create() and get ResourceId(0).
-            // We should just write(ResourceId::FINAL_COLOR) and rely on the compiler recognizing it as an external or we just create it as a transient texture.
-            // Wait, if it's transient, CompiledGraph needs its descriptor. So we need to put it into creates manually.
-            // Let's just have it write(FINAL_COLOR), and the test setup will register it... wait, CompiledGraph only allocates textures for `creates`.
-            // So if no node `creates` FINAL_COLOR, it will panic when we `get(FINAL_COLOR)`.
-            // We can inject `FINAL_COLOR` descriptor by making a node that explicitly adds it to `creates`.
+            }, TextureAccess::ColorAttachment);
+            
             builder.creates.push((ResourceId::FINAL_COLOR, ResourceDescriptor {
                 label: Some("FinalColor".into()),
                 size: ResolutionSource::Fixed(W, H),
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING
             }));
-            builder.writes.push(ResourceId::FINAL_COLOR);
+            builder.write(ResourceId::FINAL_COLOR, TextureAccess::ColorAttachment);
         }
         fn record(&self, _encoder: &mut wgpu::CommandEncoder, _ctx: &RenderContext, _frame: &FrameState) {}
     }
@@ -52,10 +42,10 @@ mod render_integration {
     impl RenderNode for CopyTestTexturesNode {
         fn name(&self) -> &str { "CopyTestTextures" }
         fn declare_resources(&self, builder: &mut ResourceBuilder) {
-            builder.creates.push((self.t1, ResourceDescriptor { label: None, size: ResolutionSource::Fixed(W, H), format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST }));
-            builder.creates.push((self.t2, ResourceDescriptor { label: None, size: ResolutionSource::Fixed(W, H), format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST }));
-            builder.writes.push(self.t1);
-            builder.writes.push(self.t2);
+            builder.creates.push((self.t1, ResourceDescriptor { label: None, size: ResolutionSource::Fixed(W, H), format: wgpu::TextureFormat::Rgba8Unorm }));
+            builder.creates.push((self.t2, ResourceDescriptor { label: None, size: ResolutionSource::Fixed(W, H), format: wgpu::TextureFormat::Rgba8Unorm }));
+            builder.write(self.t1, TextureAccess::CopyDst);
+            builder.write(self.t2, TextureAccess::CopyDst);
         }
         fn record(&self, encoder: &mut wgpu::CommandEncoder, ctx: &RenderContext, _f: &FrameState) {
             let out1 = ctx.get(self.t1);
@@ -79,7 +69,7 @@ mod render_integration {
     impl RenderNode for ReadbackNode {
         fn name(&self) -> &str { "Readback" }
         fn declare_resources(&self, builder: &mut ResourceBuilder) {
-            builder.read(ResourceId::FINAL_COLOR);
+            builder.read(ResourceId::FINAL_COLOR, TextureAccess::CopySrc);
         }
         fn record(&self, encoder: &mut wgpu::CommandEncoder, ctx: &RenderContext, _f: &FrameState) {
             let out = ctx.get(ResourceId::FINAL_COLOR);
@@ -182,8 +172,8 @@ mod render_integration {
     impl RenderNode for NodeA {
         fn name(&self) -> &str { "NodeA" }
         fn declare_resources(&self, builder: &mut ResourceBuilder) {
-            builder.read(ResourceId(100)); // R
-            builder.write(ResourceId(200)); // S
+            builder.read(ResourceId(100), TextureAccess::Sampled); // R
+            builder.write(ResourceId(200), TextureAccess::Sampled); // S
         }
         fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
     }
@@ -192,8 +182,8 @@ mod render_integration {
     impl RenderNode for NodeB {
         fn name(&self) -> &str { "NodeB" }
         fn declare_resources(&self, builder: &mut ResourceBuilder) {
-            builder.read(ResourceId(200)); // S
-            builder.write(ResourceId(100)); // R
+            builder.read(ResourceId(200), TextureAccess::Sampled); // S
+            builder.write(ResourceId(100), TextureAccess::Sampled); // R
         }
         fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
     }

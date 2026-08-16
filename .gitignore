@@ -10,3 +10,4 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+/nexir_dist/

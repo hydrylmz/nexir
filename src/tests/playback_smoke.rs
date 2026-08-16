@@ -8,7 +8,7 @@ mod playback_smoke {
     use crate::io::frame_cache::FrameCache;
     use crate::io::io_layer::IoLayer;
     use crate::render::device::GpuDevice;
-    use crate::timeline::source::{SourceRegistry, VideoStreamInfo, PixelFormat, ColorSpace};
+    use crate::timeline::source::{SourceRegistry, VideoStreamInfo, PixelFormat};
     use crate::timeline::ids::SourceId;
     use crate::timeline::rational::Rational;
 

@@ -70,6 +70,12 @@ extern "C" {
     /// Get height from codec parameters.
     pub fn avcodecpar_get_height(par: *const AVCodecParameters) -> std::ffi::c_int;
 
+    pub fn avcodecpar_get_color_space(par: *const AVCodecParameters) -> std::ffi::c_int;
+    pub fn avcodecpar_get_color_range(par: *const AVCodecParameters) -> std::ffi::c_int;
+    pub fn avcodecpar_get_color_trc(par: *const AVCodecParameters) -> std::ffi::c_int;
+    pub fn avcodecpar_get_color_primaries(par: *const AVCodecParameters) -> std::ffi::c_int;
+    pub fn avcodecpar_get_bit_depth(par: *const AVCodecParameters) -> std::ffi::c_int;
+
     /// Set the hardware device context before `avcodec_open2`.
     pub fn avcodec_set_hw_device_ctx(
         avctx:      *mut AVCodecContext,

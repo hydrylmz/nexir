@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 use crate::render::graph::RenderNode;
-use crate::render::resource::{ResourceBuilder, ResourceId};
+use crate::render::resource::{ResourceBuilder, ResourceId, ViewId};
 use crate::render::context::RenderContext;
+use std::sync::Mutex;
 use crate::render::frame_state::FrameState;
 use crate::render::device::GpuDevice;
 use crate::render::compute::{ComputePipelineCache, ComputePassHelper, PipelineKey};
 use crate::render::shader::registry::{ShaderRegistry, BuiltinShader};
-use crate::timeline::source::ColorSpace;
+use crate::timeline::source::{ColorInfo, ColorRange, MatrixCoefficients};
 
 /// Push constants for the YUV→RGB compute shader. 16 bytes.
 /// Must match the WGSL `struct YuvParams` layout exactly.
@@ -33,11 +34,11 @@ pub struct YuvToRgbNode {
     pub out_rgba:      ResourceId,
     pub width:         u32,
     pub height:        u32,
-    color_space:       ColorSpace,
-    limited_range:     bool,
+    color_info:        ColorInfo,
     pipeline:          Arc<wgpu::ComputePipeline>,
     bind_group_layout: wgpu::BindGroupLayout,
     device:            Arc<wgpu::Device>,
+    bg_cache:          Mutex<Option<([ViewId; 3], wgpu::BindGroup)>>,
 }
 
 impl YuvToRgbNode {
@@ -50,8 +51,7 @@ impl YuvToRgbNode {
         out_rgba:       ResourceId,
         width:          u32,
         height:         u32,
-        color_space:    ColorSpace,
-        limited_range:  bool,
+        color_info:     ColorInfo,
     ) -> Self {
         // Step 1 — Build bind group layout: Y(r8), UV(rg8), RGBA(rgba16f)
         let bind_group_layout = device.device.create_bind_group_layout(
@@ -122,11 +122,11 @@ impl YuvToRgbNode {
             out_rgba,
             width,
             height,
-            color_space,
-            limited_range,
+            color_info,
             pipeline,
             bind_group_layout,
             device: Arc::clone(&device.device),
+            bg_cache: Mutex::new(None),
         }
     }
 }
@@ -135,16 +135,15 @@ impl RenderNode for YuvToRgbNode {
     fn name(&self) -> &str { "YuvToRgb" }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        use crate::render::resource::{ResourceDescriptor, ResolutionSource};
+        use crate::render::resource::{ResourceDescriptor, ResolutionSource, TextureAccess};
         builder.creates.push((self.out_rgba, ResourceDescriptor {
             label: Some(format!("YuvToRgb_{}", self.out_rgba.0)),
             size: ResolutionSource::Fixed(self.width, self.height),
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         }));
-        builder.read(self.in_y);
-        builder.read(self.in_uv);
-        builder.write(self.out_rgba);
+        builder.read(self.in_y, TextureAccess::Sampled);
+        builder.read(self.in_uv, TextureAccess::Sampled);
+        builder.write(self.out_rgba, TextureAccess::StorageWrite);
     }
 
     fn record(
@@ -158,41 +157,40 @@ impl RenderNode for YuvToRgbNode {
         let uv_res   = ctx.get(self.in_uv);
         let rgba_res = ctx.get(self.out_rgba);
 
-        // Step 2 — Create format-specific views for storage textures
-        let y_view = y_res.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(wgpu::TextureFormat::R8Unorm),
-            ..Default::default()
-        });
-        let uv_view = uv_res.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(wgpu::TextureFormat::Rg8Unorm),
-            ..Default::default()
-        });
-        let rgba_view = rgba_res.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(wgpu::TextureFormat::Rgba16Float),
-            ..Default::default()
-        });
+        // Step 2 — Create per-frame bind group if cache missed
+        let mut cache = self.bg_cache.lock().unwrap();
+        let cache_key = [y_res.view_id, uv_res.view_id, rgba_res.view_id];
+        
+        if cache.is_none() || cache.as_ref().unwrap().0 != cache_key {
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yuv_to_rgb_bg"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(y_res.view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(uv_res.view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(rgba_res.view) },
+                ],
+            });
+            *cache = Some((cache_key, bind_group));
+        }
 
-        // Step 3 — Create per-frame bind group
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("yuv_to_rgb_bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&uv_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&rgba_view) },
-            ],
-        });
+        let bind_group = &cache.as_ref().unwrap().1;
 
-        // Step 4 — Build push constants
-        let color_space_u32 = match self.color_space {
-            ColorSpace::Bt601  => 0u32,
-            ColorSpace::Bt709  => 1u32,
-            ColorSpace::Bt2020 => 2u32,
-            ColorSpace::Srgb   => 1u32, // fallback to BT.709
+        // Step 4 — Build push constants from ColorInfo
+        let color_space_u32 = match self.color_info.matrix {
+            MatrixCoefficients::Bt601  => 0u32,
+            MatrixCoefficients::Bt709  => 1u32,
+            MatrixCoefficients::Bt2020 => 2u32,
+            MatrixCoefficients::Unknown => 1u32, // fallback to BT.709
+        };
+        let limited_range = match self.color_info.range {
+            ColorRange::Full    => 0u32,
+            ColorRange::Limited => 1u32,
+            ColorRange::Unknown => 1u32, // fallback to limited (broadcast)
         };
         let params = YuvParams {
             color_space:   color_space_u32,
-            limited_range: self.limited_range as u32,
+            limited_range,
             width:         self.width,
             height:        self.height,
         };
@@ -204,7 +202,7 @@ impl RenderNode for YuvToRgbNode {
             timestamp_writes: None,
         });
         ComputePassHelper::dispatch(
-            &mut pass, &self.pipeline, &bind_group,
+            &mut pass, &self.pipeline, bind_group,
             Some(push_bytes),
             self.width, self.height,
         );

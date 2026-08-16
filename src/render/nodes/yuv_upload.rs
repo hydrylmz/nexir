@@ -173,21 +173,19 @@ impl RenderNode for YuvUploadNode {
     }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        use crate::render::resource::{ResourceDescriptor, ResolutionSource};
+        use crate::render::resource::{ResourceDescriptor, ResolutionSource, TextureAccess};
         builder.creates.push((self.out_y, ResourceDescriptor {
             label: Some(format!("Yuv_Y_{}", self.out_y.0)),
             size: ResolutionSource::Fixed(self.width, self.height),
             format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
         }));
         builder.creates.push((self.out_uv, ResourceDescriptor {
             label: Some(format!("Yuv_UV_{}", self.out_uv.0)),
             size: ResolutionSource::Fixed(self.width / 2, self.height / 2),
             format: wgpu::TextureFormat::Rg8Unorm,
-            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
         }));
-        builder.write(self.out_y);
-        builder.write(self.out_uv);
+        builder.write(self.out_y, TextureAccess::CopyDst);
+        builder.write(self.out_uv, TextureAccess::CopyDst);
     }
 
     fn record(

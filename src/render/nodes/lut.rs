@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 use crate::render::graph::RenderNode;
-use crate::render::resource::{ResourceBuilder, ResourceId};
+use crate::render::resource::{ResourceBuilder, ResourceId, ViewId};
 use crate::render::context::RenderContext;
+use std::sync::Mutex;
 use crate::render::frame_state::FrameState;
 use crate::render::device::GpuDevice;
 use crate::render::compute::{ComputePipelineCache, ComputePassHelper, PipelineKey};
@@ -32,6 +33,7 @@ pub struct LutNode {
     pipeline:          Arc<wgpu::ComputePipeline>,
     bind_group_layout: wgpu::BindGroupLayout,
     device:            Arc<wgpu::Device>,
+    bg_cache:          Mutex<Option<([ViewId; 2], wgpu::BindGroup)>>,
 }
 
 impl LutNode {
@@ -184,6 +186,7 @@ impl LutNode {
             pipeline,
             bind_group_layout,
             device: Arc::clone(&device.device),
+            bg_cache: Mutex::new(None),
         }
     }
 
@@ -198,8 +201,9 @@ impl RenderNode for LutNode {
     fn name(&self) -> &str { "Lut3D" }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        builder.read(self.in_rgba);
-        builder.write(self.out_rgba);
+        use crate::render::resource::TextureAccess;
+        builder.read(self.in_rgba, TextureAccess::StorageRead);
+        builder.write(self.out_rgba, TextureAccess::StorageWrite);
         // lut_texture is node-owned, not a graph resource
     }
 
@@ -212,25 +216,26 @@ impl RenderNode for LutNode {
         let in_res  = ctx.get(self.in_rgba);
         let out_res = ctx.get(self.out_rgba);
 
-        let in_view = in_res.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(wgpu::TextureFormat::Rgba16Float),
-            ..Default::default()
-        });
-        let out_view = out_res.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(wgpu::TextureFormat::Rgba16Float),
-            ..Default::default()
-        });
+        // Views are already native format from pool
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lut_bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&in_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&out_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.lut_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.lut_sampler) },
-            ],
-        });
+        let mut cache = self.bg_cache.lock().unwrap();
+        let cache_key = [in_res.view_id, out_res.view_id];
+
+        if cache.is_none() || cache.as_ref().unwrap().0 != cache_key {
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("lut_bg"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(in_res.view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(out_res.view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.lut_view) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.lut_sampler) },
+                ],
+            });
+            *cache = Some((cache_key, bind_group));
+        }
+
+        let bind_group = &cache.as_ref().unwrap().1;
 
         let push_bytes = bytemuck::bytes_of(&self.params);
 
@@ -239,7 +244,7 @@ impl RenderNode for LutNode {
             timestamp_writes: None,
         });
         ComputePassHelper::dispatch(
-            &mut pass, &self.pipeline, &bind_group,
+            &mut pass, &self.pipeline, bind_group,
             Some(push_bytes),
             self.params.width, self.params.height,
         );

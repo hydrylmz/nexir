@@ -93,6 +93,8 @@ fn main() {
         device: cuda_ctx.raw_context() as *mut _,
         reserved: std::ptr::null_mut(),
         api_version: orig_api,
+        reserved1: [0u32; 253],
+        reserved2: [std::ptr::null_mut(); 64],
     };
 
     let ret = unsafe { open_session(&params, &mut session) };
@@ -103,7 +105,6 @@ fn main() {
 
     // 2. Discover version-based values
     // NVENCAPI_STRUCT_VERSION(ver) = (NVENCAPI_VERSION | (ver << 16) | (0x7 << 28))
-    // Let's try major_ver from 8 to 15
     for test_major in (8..=15).rev() {
         let test_api = test_major;
         // Try struct version 1 and 2
@@ -117,17 +118,16 @@ fn main() {
                 device: cuda_ctx.raw_context() as *mut _,
                 reserved: std::ptr::null_mut(),
                 api_version: test_api,
+                reserved1: [0u32; 253],
+                reserved2: [std::ptr::null_mut(); 64],
             };
 
             let ret = unsafe { open_session(&test_params, &mut test_session) };
             if ret == NV_ENC_SUCCESS {
                 println!("--> Test SUCCESS: test_major={}, struct_ver={} (struct_ver_val=0x{:X}): ret = {}", test_major, struct_ver, test_struct_ver, ret);
-                // clean up
-                // we don't have destroy_encoder easily cast in this test, but it's ok for one-off exit.
             } else {
-                // If it is 9 (NV_ENC_ERR_INVALID_EVENT or whatever), or other error
+                // Filter out unsupported device/no device if possible
                 if ret != 4 && ret != 1 {
-                    // Filter out unsupported device/no device if possible
                     println!(
                         "Test (major={}, struct_ver={}): ret = {}",
                         test_major, struct_ver, ret

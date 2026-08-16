@@ -15,6 +15,7 @@ pub struct BlitToScreenNode {
     bind_group_layout:     wgpu::BindGroupLayout,
     pub current_surface_view: Option<wgpu::TextureView>,
     device:                Arc<wgpu::Device>,
+    bg_cache:              std::sync::Mutex<Option<(crate::render::resource::ViewId, wgpu::BindGroup)>>,
 }
 
 impl BlitToScreenNode {
@@ -95,6 +96,7 @@ impl BlitToScreenNode {
             bind_group_layout,
             current_surface_view: None,
             device: Arc::clone(&device.device),
+            bg_cache: std::sync::Mutex::new(None),
         }
     }
 }
@@ -105,7 +107,8 @@ impl RenderNode for BlitToScreenNode {
     }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        builder.read(self.in_color);
+        use crate::render::resource::TextureAccess;
+        builder.read(self.in_color, TextureAccess::Sampled);
     }
 
     fn record(
@@ -118,20 +121,27 @@ impl RenderNode for BlitToScreenNode {
             .expect("BlitToScreenNode::current_surface_view not set before record()");
 
         let rtt = ctx.get(self.in_color);
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blit_bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(rtt.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        
+        let mut cache = self.bg_cache.lock().unwrap();
+        if cache.is_none() || cache.as_ref().unwrap().0 != rtt.view_id {
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blit_bg"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(rtt.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            *cache = Some((rtt.view_id, bind_group));
+        }
+        
+        let bind_group = &cache.as_ref().unwrap().1;
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("blit_pass"),

@@ -33,6 +33,11 @@ rusttype = "0.9.3"
 [dev-dependencies]
 pollster = "0.3"
 
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+required-features = []
+
 [build-dependencies]
 pkg-config = "0.3"
 cc = "1.0"

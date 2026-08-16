@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 use crate::render::graph::RenderNode;
-use crate::render::resource::{ResourceBuilder, ResourceId};
+use crate::render::resource::{ResourceBuilder, ResourceId, ViewId};
 use crate::render::context::RenderContext;
+use std::sync::Mutex;
 use crate::render::frame_state::FrameState;
 use crate::render::device::GpuDevice;
 use crate::render::shader::registry::{ShaderRegistry, BuiltinShader};
@@ -32,6 +33,8 @@ pub struct CompositeNode {
     queue:               Arc<wgpu::Queue>,
     out_format:          wgpu::TextureFormat,
     has_binding_arrays:  bool,
+    bg_array_cache:      Mutex<Option<(Vec<ViewId>, wgpu::BindGroup)>>,
+    bg_single_cache:     Mutex<Vec<Option<(ViewId, wgpu::BindGroup)>>>,
 }
 
 impl CompositeNode {
@@ -144,6 +147,8 @@ impl CompositeNode {
             queue: Arc::clone(&device.queue),
             out_format: surface_format,
             has_binding_arrays: device.has_binding_arrays,
+            bg_array_cache: Mutex::new(None),
+            bg_single_cache: Mutex::new((0..max_instances).map(|_| None).collect()),
         }
     }
 
@@ -178,17 +183,22 @@ impl RenderNode for CompositeNode {
     }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        use crate::render::resource::{ResourceDescriptor, ResolutionSource};
+        use crate::render::resource::{ResourceDescriptor, ResolutionSource, TextureAccess};
         builder.creates.push((self.out_color, ResourceDescriptor {
             label: Some("FinalColor".into()),
             size: ResolutionSource::Canvas,
             format: self.out_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
         }));
         for &id in &self.input_textures {
-            builder.read(id);
+            builder.read(id, TextureAccess::Sampled);
         }
-        builder.write(self.out_color);
+        builder.write(self.out_color, crate::render::resource::TextureAccess::ColorAttachment);
+
+        // Explicitly inject usages required by external consumers of the graph's final output:
+        // - UI preview uses it as a TextureBinding (Sampled)
+        // - FFmpeg CPU export copies it to a staging buffer (CopySrc)
+        builder.read(self.out_color, crate::render::resource::TextureAccess::Sampled);
+        builder.read(self.out_color, crate::render::resource::TextureAccess::CopySrc);
     }
 
     fn record(
@@ -203,59 +213,58 @@ impl RenderNode for CompositeNode {
         }
 
         let mut views = Vec::with_capacity(self.max_instances as usize);
+        let mut view_ids = Vec::with_capacity(self.max_instances as usize);
+        
         for id in &self.input_textures {
-            views.push(ctx.get(*id).view);
+            let res = ctx.get(*id);
+            views.push(res.view);
+            view_ids.push(res.view_id);
         }
         // Pad the rest with the first view if needed to satisfy the array length
         let fallback_view = *views.first().unwrap();
+        let fallback_view_id = *view_ids.first().unwrap();
         while views.len() < self.max_instances as usize {
             views.push(fallback_view);
+            view_ids.push(fallback_view_id);
         }
-
-        let mut single_bg = None;
-        let mut multiple_bgs = Vec::new();
 
         if self.has_binding_arrays {
-            single_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("composite_bg"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.instance_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureViewArray(&views),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            }));
-        } else {
-            for i in 0..count {
-                multiple_bgs.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("composite_bg_single"),
+            let mut cache = self.bg_array_cache.lock().unwrap();
+            if cache.is_none() || cache.as_ref().unwrap().0 != view_ids {
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("composite_bg"),
                     layout: &self.bind_group_layout,
                     entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.instance_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(views[i as usize]),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
+                        wgpu::BindGroupEntry { binding: 0, resource: self.instance_buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureViewArray(&views) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     ],
-                }));
+                });
+                *cache = Some((view_ids.clone(), bg));
+            }
+            // we will borrow it inside the pass
+        } else {
+            let mut cache = self.bg_single_cache.lock().unwrap();
+            for i in 0..count {
+                let idx = i as usize;
+                let v_id = view_ids[idx];
+                if cache[idx].is_none() || cache[idx].as_ref().unwrap().0 != v_id {
+                    let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("composite_bg_single"),
+                        layout: &self.bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: self.instance_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(views[idx]) },
+                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                        ],
+                    });
+                    cache[idx] = Some((v_id, bg));
+                }
             }
         }
+
+        let cache_array = self.has_binding_arrays.then(|| self.bg_array_cache.lock().unwrap());
+        let cache_single = (!self.has_binding_arrays).then(|| self.bg_single_cache.lock().unwrap());
 
         let out = ctx.get(self.out_color);
 
@@ -277,11 +286,12 @@ impl RenderNode for CompositeNode {
         pass.set_pipeline(&self.pipeline);
 
         if self.has_binding_arrays {
-            pass.set_bind_group(0, single_bg.as_ref().unwrap(), &[]);
+            pass.set_bind_group(0, &cache_array.as_ref().unwrap().as_ref().unwrap().1, &[]);
             pass.draw(0..6, 0..count);
         } else {
+            let cache = cache_single.as_ref().unwrap();
             for i in 0..count {
-                pass.set_bind_group(0, &multiple_bgs[i as usize], &[]);
+                pass.set_bind_group(0, &cache[i as usize].as_ref().unwrap().1, &[]);
                 pass.draw(0..6, i..(i + 1));
             }
         }

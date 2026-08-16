@@ -21,7 +21,7 @@ pub struct VideoStreamInfo {
     pub height: u32,
     pub frame_rate: Rational,
     pub pixel_fmt: PixelFormat,
-    pub color_space: ColorSpace,
+    pub color_info: ColorInfo,
     pub duration_pts: i64,
     pub is_vfr: bool,
     pub time_base: Rational,
@@ -46,11 +46,45 @@ pub enum PixelFormat {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum ColorSpace {
-    Bt601,
+pub enum TransferFunction {
     Bt709,
     Bt2020,
+    Pq,
+    Hlg,
     Srgb,
+    Linear,
+    Unknown,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ColorRange {
+    Full,
+    Limited,
+    Unknown,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MatrixCoefficients {
+    Bt709,
+    Bt601,
+    Bt2020,
+    Unknown,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ColorPrimaries {
+    Bt709,
+    Bt2020,
+    Unknown,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ColorInfo {
+    pub transfer_fn: TransferFunction,
+    pub range: ColorRange,
+    pub matrix: MatrixCoefficients,
+    pub primaries: ColorPrimaries,
+    pub bit_depth: u8,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

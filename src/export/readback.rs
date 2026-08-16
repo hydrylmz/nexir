@@ -85,7 +85,11 @@ impl FrameReadback {
         let slice = self.buffers[slot].slice(..);
         
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |v| { tx.send(v).unwrap(); });
+        slice.map_async(wgpu::MapMode::Read, move |v| {
+            if let Err(_) = tx.send(v) {
+                log::warn!("[readback] map_async channel closed before result was delivered");
+            }
+        });
 
         // Only wait for the specific submission that wrote this buffer, not all
         // pending work (which would include the *next* frame's render commands).
@@ -138,7 +142,11 @@ impl FrameReadback {
         // Map the readback buffer.
         let slice = self.buffers[slot].slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |v| { tx.send(v).unwrap(); });
+        slice.map_async(wgpu::MapMode::Read, move |v| {
+            if let Err(_) = tx.send(v) {
+                log::warn!("[readback] map_strip_unmap channel closed before result was delivered");
+            }
+        });
         device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
         if let Err(_) = rx.recv().map_err(|e| e.to_string())? {
             return Err("Failed to map buffer".to_string());

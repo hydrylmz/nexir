@@ -50,7 +50,6 @@ impl<'a> EffectChainBuilder<'a> {
             label: None,
             size: ResolutionSource::Fixed(self.canvas_width, self.canvas_height),
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         };
 
         for (_effect_id, kind, params) in store.iter_clip_effects(effect_start, effect_count) {

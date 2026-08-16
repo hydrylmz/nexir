@@ -52,10 +52,6 @@ pub mod swscale_ffi {
 pub struct VideoEncoder {
     ctx:         *mut crate::io::ffi::avcodec::AVCodecContext,
     sws:         *mut swscale_ffi::SwsContext,
-    /// True when `sws` was created with AV_PIX_FMT_RGBAF16LE as input;
-    /// the raw GPU readback bytes are passed directly without conversion.
-    /// False means fallback RGBA8 path (rgba16_to_rgba8 is applied first).
-    sws_use_f16: bool,
     yuv_frame:   *mut crate::io::ffi::avutil::AVFrame,
     packet:      *mut crate::io::ffi::avutil::AVPacket,
     frame_count: i64,
@@ -152,14 +148,11 @@ impl VideoEncoder {
                 swscale_ffi::SWS_POINT,
                 std::ptr::null(), std::ptr::null(), std::ptr::null()
             );
-            let sws_use_f16 = false;
-
             let packet = av_packet_alloc();
 
             Ok(Self {
                 ctx,
                 sws,
-                sws_use_f16,
                 yuv_frame,
                 packet,
                 frame_count: 0,
@@ -293,15 +286,10 @@ impl VideoEncoder {
         let width  = unsafe { av_frame_get_width(self.yuv_frame)  as u32 };
         let height = unsafe { av_frame_get_height(self.yuv_frame) as u32 };
 
-        // Fast path: RGBAF16LE — feed raw GPU readback bytes directly (8 bytes/pixel).
-        // Slow fallback: RGBA8 — convert f16→u8 first (used when swscale
-        // was built without RGBAF16LE support, which is rare on FFmpeg ≥ 4.0).
-        let (src_ptr, bytes_per_row) = if self.sws_use_f16 {
-            (frame.data.as_ptr(), width * 8)
-        } else {
-            self.rgba16_to_rgba8(&frame.data, width, height);
-            (self.rgba8_buf.as_ptr(), width * 4)
-        };
+        // Fast path for swscale: convert f16→u8 first using Rust SIMD.
+        self.rgba16_to_rgba8(&frame.data, width, height);
+        let src_ptr = self.rgba8_buf.as_ptr();
+        let bytes_per_row = width * 4;
 
         unsafe {
             let mut src_data: [*const u8; 8] = [std::ptr::null(); 8];
@@ -488,7 +476,11 @@ impl VideoEncoderBackend {
 
             Self::CudaNvenc { enc, .. } => {
                 // Encode via NVENC directly.
-                let (bytes, pts) = enc.encode_frame(frame.pts)
+                // The pipelined renderer loop calls nvenc_interop_mut() and passes the
+                // correct ping-pong slot explicitly. This arm is a fallback for any
+                // non-pipelined callers; slot 0 is safe because both slots hold the same
+                // registered resource type and NVENC selects based on the mapped handle.
+                let (bytes, pts) = enc.encode_frame(frame.pts, 0)
                     .map_err(|e| EncodeError::Interop(format!("{:?}", e)))?;
 
                 if bytes.is_empty() {
@@ -552,6 +544,13 @@ impl VideoEncoderBackend {
     }
 
     pub fn nvenc_interop(&self) -> Option<&crate::interop::encode_interop::EncodeInterop> {
+        match self {
+            Self::CudaNvenc { enc, .. } => Some(enc),
+            _ => None,
+        }
+    }
+
+    pub fn nvenc_interop_mut(&mut self) -> Option<&mut crate::interop::encode_interop::EncodeInterop> {
         match self {
             Self::CudaNvenc { enc, .. } => Some(enc),
             _ => None,

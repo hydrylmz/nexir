@@ -106,7 +106,7 @@ impl From<ProjectFile> for Project {
                                     })
                                 },
                                 pixel_fmt: crate::timeline::source::PixelFormat::Yuv420p,
-                                color_space: crate::timeline::source::ColorSpace::Bt709,
+                                color_info: s.color_info,
                                 duration_pts: if is_still_image {
                                     0
                                 } else {

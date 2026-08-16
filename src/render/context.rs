@@ -1,20 +1,15 @@
 // src/render/context.rs
 
-use std::collections::HashMap;
-use crate::render::resource::{ResourceId, ResolvedResource};
+use crate::render::resource::{ResourceId, ResolvedResource, ViewId};
 
 pub struct RenderContext {
-    textures: HashMap<ResourceId, wgpu::Texture>,
-    views:    HashMap<ResourceId, wgpu::TextureView>,
+    resources: Vec<Option<(wgpu::Texture, wgpu::TextureView, ViewId)>>,
 }
 
 impl RenderContext {
     /// Construct from the resolved allocations produced by CompiledGraph::execute().
-    pub fn new(
-        textures: HashMap<ResourceId, wgpu::Texture>,
-        views:    HashMap<ResourceId, wgpu::TextureView>,
-    ) -> Self {
-        Self { textures, views }
+    pub fn new(resources: Vec<Option<(wgpu::Texture, wgpu::TextureView, ViewId)>>) -> Self {
+        Self { resources }
     }
 
     /// Look up a resolved resource by its ResourceId.
@@ -22,38 +17,30 @@ impl RenderContext {
     /// # Panics
     /// Panics if `id` was not declared by any node's declare_resources().
     pub fn get(&self, id: ResourceId) -> ResolvedResource<'_> {
-        let texture = self.textures.get(&id).unwrap_or_else(|| panic!("ResourceId {:?} not allocated", id));
-        let view = self.views.get(&id).unwrap_or_else(|| panic!("ResourceId {:?} view not created", id));
-        
-        ResolvedResource {
-            texture,
-            view,
-            format: texture.format(),
-            width: texture.width(),
-            height: texture.height(),
-        }
+        self.try_get(id).unwrap_or_else(|| panic!("Resource {:?} not found in context", id))
     }
 
     /// Check if a resource was allocated (safe alternative to get()).
     pub fn contains(&self, id: ResourceId) -> bool {
-        self.textures.contains_key(&id)
+        self.resources.get(id.0 as usize).map_or(false, |opt| opt.is_some())
     }
 
-    /// Optionally look up a resolved resource — returns None if not allocated.
+    /// Try to get a resolved resource
     pub fn try_get(&self, id: ResourceId) -> Option<ResolvedResource<'_>> {
-        let texture = self.textures.get(&id)?;
-        let view    = self.views.get(&id)?;
-        Some(ResolvedResource {
-            texture,
-            view,
-            format: texture.format(),
-            width:  texture.width(),
-            height: texture.height(),
-        })
+        self.resources.get(id.0 as usize)
+            .and_then(|opt| opt.as_ref())
+            .map(|(tex, view, view_id)| ResolvedResource {
+                texture: tex,
+                view,
+                view_id: *view_id,
+                format:  tex.format(),
+                width:   tex.width(),
+                height:  tex.height(),
+            })
     }
 
-    /// Extract the owned textures back out for pool release.
-    pub fn into_textures(self) -> HashMap<ResourceId, wgpu::Texture> {
-        self.textures
+    /// Take ownership of all allocated textures, returning them so they can be pooled
+    pub fn into_resources(self) -> Vec<Option<(wgpu::Texture, wgpu::TextureView, ViewId)>> {
+        self.resources
     }
 }

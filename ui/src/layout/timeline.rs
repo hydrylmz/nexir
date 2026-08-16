@@ -1566,7 +1566,13 @@ pub fn draw(
                                         )
                                     },
                                     pixel_fmt: nexir::timeline::source::PixelFormat::Yuv420p,
-                                    color_space: nexir::timeline::source::ColorSpace::Bt709,
+                                    color_info: nexir::timeline::source::ColorInfo {
+                                        transfer_fn: nexir::timeline::source::TransferFunction::Bt709,
+                                        range: nexir::timeline::source::ColorRange::Limited,
+                                        matrix: nexir::timeline::source::MatrixCoefficients::Bt709,
+                                        primaries: nexir::timeline::source::ColorPrimaries::Bt709,
+                                        bit_depth: 8,
+                                    },
                                     duration_pts: if is_still_image {
                                         0
                                     } else {

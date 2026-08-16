@@ -1,14 +1,18 @@
 use nexir::export::engine::ExportEngine;
-use nexir::export::job::{AudioCodec, Container, ExportJob, VideoCodec, VideoQuality};
+use nexir::export::job::{AudioCodec, Container, CpuPreset, ExportJob, VideoCodec, VideoQuality};
+use nexir::io::frame_cache::FrameCache;
+use nexir::io::slot_pool::FrameSlotPool;
+use nexir::io::io_layer::IoLayer;
+use nexir::io::prefetch::PrefetchWorker;
 use nexir::render::device::GpuDevice;
 use nexir::timeline::rational::Rational;
 use nexir::timeline::store::TimelineStore;
+use nexir::timeline::track::TrackList;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 fn main() {
     let device = Arc::new(pollster::block_on(GpuDevice::new_headless()).unwrap());
-    let mut store = TimelineStore::new();
 
     let job = ExportJob {
         output_path: PathBuf::from("test_export.mp4"),
@@ -24,25 +28,51 @@ fn main() {
         project_tb: Rational::new(1, 90000),
         pts_in: 0,
         pts_out: 3000,
+        cpu_preset: CpuPreset::Medium,
     };
 
     println!("Starting export...");
 
     let capability = nexir::interop::capability::InteropCapability::none();
-    let io_layer = Arc::new(nexir::io::io_layer::IoLayer::new(&device, 1024, 8));
-    let scheduler = Arc::new(nexir::scheduler::frame_scheduler::FrameScheduler::new(
-        io_layer, 1920, 1080,
-    ));
     let sources = Arc::new(std::sync::RwLock::new(
         nexir::timeline::source::SourceRegistry::new(),
     ));
-    let store_arc = Arc::new(std::sync::RwLock::new(store));
+
+    // Build the IoLayer with the current 6-argument API.
+    let pool  = Arc::new(FrameSlotPool::new(&device));
+    let cache = Arc::new(FrameCache::new(Arc::clone(&pool), 128));
+    let (prefetch_tx, prefetch_rx) = std::sync::mpsc::sync_channel(64);
+    let io_layer = Arc::new(IoLayer::new(
+        Arc::clone(&device.device),
+        Arc::clone(&pool),
+        Arc::clone(&cache),
+        Arc::clone(&sources),
+        prefetch_tx,
+        Rational::new(1, 90000),
+    ));
+    // Spawn the prefetch worker so the channel doesn't block.
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker = nexir::io::prefetch::PrefetchWorker::new(
+        prefetch_rx,
+        Arc::clone(&io_layer),
+        Arc::clone(&cache),
+        Arc::clone(&shutdown),
+    );
+    let _prefetch_thread = nexir::io::prefetch::spawn_prefetch_worker(worker);
+
+    let scheduler = Arc::new(nexir::scheduler::frame_scheduler::FrameScheduler::new(
+        io_layer, 1920, 1080,
+    ));
+
+    let store_arc  = Arc::new(std::sync::RwLock::new(TimelineStore::new()));
+    let tracks_arc = Arc::new(std::sync::RwLock::new(TrackList::new()));
 
     let engine = ExportEngine::new(
         device.clone(),
         job,
         scheduler,
         store_arc,
+        tracks_arc,
         sources,
         capability,
         None,
@@ -53,7 +83,7 @@ fn main() {
         Arc::new(nexir::render::shader::registry::ShaderRegistry::compile_all(&device).unwrap());
     let compute = Arc::new(nexir::render::compute::ComputePipelineCache::new());
     match engine.start(shaders, compute) {
-        Ok(_) => println!("Export started"),
+        Ok(_)  => println!("Export started"),
         Err(e) => println!("Export failed: {:?}", e),
     }
 }

@@ -169,18 +169,16 @@ impl RenderNode for StillImageUploadNode {
     }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
+        use crate::render::resource::{ResourceDescriptor, ResolutionSource, TextureAccess};
         builder.creates.push((
             self.out_rgba,
             ResourceDescriptor {
                 label: Some(format!("StillImage_{}", self.out_rgba.0)),
                 size: ResolutionSource::Fixed(self.image.width, self.image.height),
                 format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::STORAGE_BINDING,
             },
         ));
-        builder.write(self.out_rgba);
+        builder.write(self.out_rgba, TextureAccess::CopyDst);
     }
 
     fn record(

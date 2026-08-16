@@ -194,7 +194,7 @@ impl ExportEngine {
                 let is_gpu_thread = is_gpu;
                 let muxer_for_dispatch_clone = Arc::clone(&muxer_for_dispatch);
 
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || -> Result<(), String> {
                     let mut renderer = ExportRenderer::new(
                         Arc::clone(&device_clone),
                         Arc::clone(&scheduler_clone),
@@ -211,7 +211,7 @@ impl ExportEngine {
                         log::info!("[export] starting segment {i}/{}", segments.len());
                         renderer
                             .render_segment(seg, &queue, &prog_tx)
-                            .expect(&format!("render_segment {i} failed"));
+                            .map_err(|e| format!("render_segment {i} failed: {e:?}"))?;
                         log::info!("[export] segment {i} complete");
                     }
                     queue.push(QueueItem::AllDone);
@@ -225,9 +225,12 @@ impl ExportEngine {
                         } = renderer.backend
                         {
                             let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
-                                muxer_for_dispatch_clone.write_packet(pkt, true).unwrap();
+                                if let Err(e) = muxer_for_dispatch_clone.write_packet(pkt, true) {
+                                    log::error!("[export] NVENC flush mux write failed: {e:?}");
+                                }
                             };
-                            video_enc.flush(&mut sink).unwrap();
+                            video_enc.flush(&mut sink)
+                                .map_err(|e| format!("NVENC flush failed: {e:?}"))?;
                         }
 
                         // Spin-wait until audio thread finishes and drops its Arc<Muxer>
@@ -235,22 +238,30 @@ impl ExportEngine {
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                         if let Ok(m) = Arc::try_unwrap(muxer_for_dispatch_clone) {
-                            m.finalise().unwrap();
+                            m.finalise().map_err(|e| format!("muxer finalise failed: {e:?}"))?;
                         }
                     }
+                    Ok(())
                 }));
 
-                if let Err(e) = result {
-                    let msg = if let Some(s) = e.downcast_ref::<String>() {
-                        s.clone()
-                    } else if let Some(s) = e.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else {
-                        "(unknown panic payload)".to_string()
-                    };
-                    log::error!("[export] dispatch thread PANICKED: {msg}");
-                    // Ensure the encoder thread unblocks
-                    queue_err.push(QueueItem::AllDone);
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        log::error!("[export] dispatch thread error: {e}");
+                        queue_err.push(QueueItem::AllDone);
+                    }
+                    Err(e) => {
+                        let msg = if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "(unknown panic payload)".to_string()
+                        };
+                        log::error!("[export] dispatch thread PANICKED: {msg}");
+                        // Ensure the encoder thread unblocks
+                        queue_err.push(QueueItem::AllDone);
+                    }
                 }
             })
             .map_err(ExportError::ThreadSpawn)?;
@@ -266,33 +277,49 @@ impl ExportEngine {
     ) {
         use crate::export::progress::ExportPhase;
         let mut frames_encoded = 0;
-        loop {
-            match queue.pop() {
-                Some(QueueItem::Frame(raw)) => {
-                    let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
-                        muxer.write_packet(pkt, true).unwrap();
-                    };
-                    video_enc.encode_frame(&raw, &mut sink).unwrap();
-                    frames_encoded += 1;
-                    prog_tx.report(frames_encoded, ExportPhase::Encoding);
-                }
-                Some(QueueItem::SegmentDone { .. }) => {}
-                Some(QueueItem::AllDone) | None => {
-                    let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
-                        muxer.write_packet(pkt, true).unwrap();
-                    };
-                    video_enc.flush(&mut sink).unwrap();
-                    prog_tx.report(frames_encoded, ExportPhase::Done);
-                    break;
+
+        let mut run = || -> Result<(), String> {
+            loop {
+                match queue.pop() {
+                    Some(QueueItem::Frame(raw)) => {
+                        let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
+                            if let Err(e) = muxer.write_packet(pkt, true) {
+                                log::error!("[encoder] write_packet failed: {e:?}");
+                            }
+                        };
+                        video_enc.encode_frame(&raw, &mut sink)
+                            .map_err(|e| format!("encode_frame failed: {e:?}"))?;
+                        frames_encoded += 1;
+                        prog_tx.report(frames_encoded, ExportPhase::Encoding);
+                    }
+                    Some(QueueItem::SegmentDone { .. }) => {}
+                    Some(QueueItem::AllDone) | None => {
+                        let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
+                            if let Err(e) = muxer.write_packet(pkt, true) {
+                                log::error!("[encoder] flush write_packet failed: {e:?}");
+                            }
+                        };
+                        video_enc.flush(&mut sink)
+                            .map_err(|e| format!("flush failed: {e:?}"))?;
+                        prog_tx.report(frames_encoded, ExportPhase::Done);
+                        break;
+                    }
                 }
             }
+            Ok(())
+        };
+
+        if let Err(e) = run() {
+            log::error!("[export] encoder_thread error: {e}");
         }
 
         while Arc::strong_count(&muxer) > 1 {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         if let Ok(m) = Arc::try_unwrap(muxer) {
-            m.finalise().unwrap();
+            if let Err(e) = m.finalise() {
+                log::error!("[export] encoder_thread: muxer finalise failed: {e:?}");
+            }
         }
     }
 
@@ -348,7 +375,9 @@ impl ExportEngine {
 
         // Packet sink for muxing audio packets
         let mut mux_sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
-            muxer.write_packet(pkt, false).unwrap();
+            if let Err(e) = muxer.write_packet(pkt, false) {
+                log::error!("[audio] write_packet failed: {e:?}");
+            }
         };
 
         let frame_size = audio_enc.frame_size();

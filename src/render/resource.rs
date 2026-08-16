@@ -2,6 +2,18 @@
 
 use crate::render::device::GpuDevice;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static VIEW_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ViewId(pub u64);
+
+impl ViewId {
+    pub fn new() -> Self {
+        ViewId(VIEW_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 /// A stable name for a texture resource within the Render Graph.
 /// Nodes use ResourceIds to declare dependencies — they never own textures.
@@ -23,6 +35,29 @@ impl ResourceId {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureAccess {
+    Sampled,
+    StorageRead,
+    StorageWrite,
+    ColorAttachment,
+    CopySrc,
+    CopyDst,
+}
+
+impl TextureAccess {
+    pub fn to_wgpu_usage(self) -> wgpu::TextureUsages {
+        match self {
+            Self::Sampled         => wgpu::TextureUsages::TEXTURE_BINDING,
+            Self::StorageRead     => wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            Self::StorageWrite    => wgpu::TextureUsages::STORAGE_BINDING,
+            Self::ColorAttachment => wgpu::TextureUsages::RENDER_ATTACHMENT,
+            Self::CopySrc         => wgpu::TextureUsages::COPY_SRC,
+            Self::CopyDst         => wgpu::TextureUsages::COPY_DST,
+        }
+    }
+}
+
 /// Describes how a texture resource should be created if it doesn't already exist.
 #[derive(Clone, Debug)]
 pub struct ResourceDescriptor {
@@ -31,7 +66,6 @@ pub struct ResourceDescriptor {
     /// or `ResolutionSource::Fixed(w,h)` for fixed-size intermediates.
     pub size:   ResolutionSource,
     pub format: wgpu::TextureFormat,
-    pub usage:  wgpu::TextureUsages,
 }
 
 #[derive(Clone, Debug)]
@@ -45,8 +79,8 @@ pub enum ResolutionSource {
 /// Declares the resources a node reads and writes.
 /// Passed to `RenderNode::declare_resources()` during graph compilation.
 pub struct ResourceBuilder {
-    pub reads:   Vec<ResourceId>,
-    pub writes:  Vec<ResourceId>,
+    pub reads:   Vec<(ResourceId, TextureAccess)>,
+    pub writes:  Vec<(ResourceId, TextureAccess)>,
     pub creates: Vec<(ResourceId, ResourceDescriptor)>,
     id_counter:  u32,
 }
@@ -62,20 +96,20 @@ impl ResourceBuilder {
     }
 
     /// Declare that this node reads an existing resource.
-    pub fn read(&mut self, id: ResourceId) {
-        self.reads.push(id);
+    pub fn read(&mut self, id: ResourceId, access: TextureAccess) {
+        self.reads.push((id, access));
     }
 
     /// Declare that this node writes to an existing resource.
-    pub fn write(&mut self, id: ResourceId) {
-        self.writes.push(id);
+    pub fn write(&mut self, id: ResourceId, access: TextureAccess) {
+        self.writes.push((id, access));
     }
 
     /// Declare that this node creates a new transient resource and immediately writes it.
-    pub fn create(&mut self, descriptor: ResourceDescriptor) -> ResourceId {
+    pub fn create(&mut self, descriptor: ResourceDescriptor, write_access: TextureAccess) -> ResourceId {
         let id = ResourceId::next(&mut self.id_counter);
         self.creates.push((id, descriptor));
-        self.writes.push(id);
+        self.writes.push((id, write_access));
         id
     }
 }
@@ -85,6 +119,7 @@ impl ResourceBuilder {
 pub struct ResolvedResource<'a> {
     pub texture: &'a wgpu::Texture,
     pub view:    &'a wgpu::TextureView,
+    pub view_id: ViewId,
     pub format:  wgpu::TextureFormat,
     pub width:   u32,
     pub height:  u32,
@@ -95,13 +130,14 @@ pub struct ResolvedResource<'a> {
 /// across frames without reallocation.
 pub struct TransientTexturePool {
     /// Key: (format, width, height)
-    /// Value: stack of available textures
-    buckets: HashMap<TextureKey, Vec<wgpu::Texture>>,
+    /// Value: stack of available textures, their pre-created views, and their unique ViewIds
+    buckets: HashMap<TextureKey, Vec<(wgpu::Texture, wgpu::TextureView, ViewId)>>,
 }
 
 #[derive(PartialEq, Eq, Hash)]
 struct TextureKey {
     format: wgpu::TextureFormat,
+    usage:  wgpu::TextureUsages,
     width:  u32,
     height: u32,
 }
@@ -124,43 +160,37 @@ impl TransientTexturePool {
         &mut self,
         device: &GpuDevice,
         format: wgpu::TextureFormat,
+        usage:  wgpu::TextureUsages,
         width:  u32,
         height: u32,
-    ) -> wgpu::Texture {
-        let key = TextureKey { format, width, height };
-        if let Some(tex) = self.buckets.get_mut(&key).and_then(|v| v.pop()) {
-            tex
+    ) -> (wgpu::Texture, wgpu::TextureView, ViewId) {
+        let key = TextureKey { format, usage, width, height };
+        if let Some(res) = self.buckets.get_mut(&key).and_then(|v| v.pop()) {
+            res
         } else {
-            let mut usages = wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST;
-            
-            // Only add STORAGE_BINDING for compatible formats
-            if format == wgpu::TextureFormat::Rgba8Unorm || format == wgpu::TextureFormat::Rgba16Float || format == wgpu::TextureFormat::Rgba8UnormSrgb || format == wgpu::TextureFormat::Bgra8Unorm {
-                usages |= wgpu::TextureUsages::STORAGE_BINDING;
-            }
-
-            device.create_texture(
+            let tex = device.create_texture(
                 Some("transient_texture"),
                 width,
                 height,
                 format,
-                usages,
-            )
+                usage,
+            );
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            (tex, view, ViewId::new())
         }
     }
 
     /// Return a texture to the pool for reuse next frame.
-    pub fn release(&mut self, tex: wgpu::Texture) {
+    pub fn release(&mut self, resource: (wgpu::Texture, wgpu::TextureView, ViewId)) {
         let key = TextureKey {
-            format: tex.format(),
-            width: tex.width(),
-            height: tex.height(),
+            format: resource.0.format(),
+            usage:  resource.0.usage(),
+            width:  resource.0.width(),
+            height: resource.0.height(),
         };
         let bucket = self.buckets.entry(key).or_default();
         if bucket.len() < 8 {
-            bucket.push(tex);
+            bucket.push(resource);
         }
     }
 }

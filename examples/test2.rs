@@ -1,5 +1,5 @@
 use nexir::export::audio_encoder::AudioMuxEncoder;
-use nexir::export::job::{AudioCodec, Container, ExportJob, VideoCodec, VideoQuality};
+use nexir::export::job::{AudioCodec, Container, CpuPreset, ExportJob, VideoCodec, VideoQuality};
 use nexir::export::muxer::Muxer;
 use nexir::export::video_encoder::{VideoEncoder, VideoEncoderBackend};
 use nexir::io::ffi::avutil::AVRational;
@@ -21,6 +21,7 @@ fn main() {
         project_tb: Rational::new(1, 90000),
         pts_in: 0,
         pts_out: 3000,
+        cpu_preset: CpuPreset::Medium,
     };
 
     let video_enc = VideoEncoderBackend::FfmpegCpu(VideoEncoder::open(&job).unwrap());

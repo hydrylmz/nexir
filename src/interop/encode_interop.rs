@@ -146,22 +146,34 @@ struct NvencFunctions {
     destroy_encoder:    functions::DestroyEncoder,
 }
 
-/// Holds the NVENC session and the interop-imported ABGR10 texture it reads from.
+/// Holds the NVENC session and two ping-pong interop-imported ABGR10 textures.
+///
+/// Two textures allow the GPU to render frame N into slot N%2 while NVENC
+/// simultaneously encodes the previous frame from slot (N-1)%2, eliminating
+/// the serialised render→wait→encode stall of a single-buffer design.
 pub struct EncodeInterop {
-    session:              NvEncodeSession,
-    abgr10_texture:       wgpu::Texture,
-    /// Held for Drop semantics: keeps the CUDA external memory import alive for the
-    /// lifetime of the encode session.
+    session:               NvEncodeSession,
+    /// Slot 0 ABGR10 texture (R32Uint packed, written by Abgr10RepackNode).
+    abgr10_texture_0:      wgpu::Texture,
+    /// Slot 1 ABGR10 texture — the second ping-pong buffer.
+    abgr10_texture_1:      wgpu::Texture,
+    /// Keeps the CUDA external memory import for slot 0 alive.
     #[allow(dead_code)]
-    abgr10_external:      ExternalTexture,
-    registered_resource:  *mut std::ffi::c_void,
-    bitstream_buffer:     *mut std::ffi::c_void,
-    funcs:                NvencFunctions,
-    width:                u32,
-    height:               u32,
+    abgr10_external_0:     ExternalTexture,
+    /// Keeps the CUDA external memory import for slot 1 alive.
+    #[allow(dead_code)]
+    abgr10_external_1:     ExternalTexture,
+    /// NVENC registered resource handle for slot 0.
+    registered_resource_0: *mut std::ffi::c_void,
+    /// NVENC registered resource handle for slot 1.
+    registered_resource_1: *mut std::ffi::c_void,
+    bitstream_buffer:      *mut std::ffi::c_void,
+    funcs:                 NvencFunctions,
+    width:                 u32,
+    height:                u32,
     /// The NVENC API major version we probed successfully; used to construct
     /// per-struct version fields for encode-time calls.
-    api_version:          u32,
+    api_version:           u32,
 }
 
 unsafe impl Send for EncodeInterop {}
@@ -214,8 +226,6 @@ impl EncodeInterop {
         transport: crate::interop::capability::InteropTransport,
         codec:     VideoCodec,
     ) -> Result<Self, EncodeInteropError> {
-        let _ = (cuda_ctx, device, job, transport, codec);
-        return Err(EncodeInteropError::ApiLoad);
         // NVENC uses a vtable-style C API: NvEncodeAPICreateInstance fills a
         // function-pointer struct, and all subsequent calls go through it.
         // We allocate the struct as a raw block and read out the function pointers.
@@ -372,25 +382,31 @@ impl EncodeInterop {
         };
         let init_params_ver = nvenc_struct_ver(probed_api_version, 5);
         let mut init_params = NvEncInitializeParams {
-            version:           init_params_ver,
+            version:                      init_params_ver,
             encode_guid,
-            preset_guid:       NV_ENC_PRESET_P4_GUID,
-            encode_width:      job.width,
-            encode_height:     job.height,
-            dar_width:         job.width,
-            dar_height:        job.height,
-            frame_rate_num:    job.frame_rate.num as u32,
-            frame_rate_den:    job.frame_rate.den as u32,
-            enable_ptd_flags:  1, // enablePTD = 1
-            priv_data_size:    0,
-            priv_data:         std::ptr::null_mut(),
-            encode_config:     std::ptr::null_mut(),
-            max_encode_width:  job.width,
-            max_encode_height: job.height,
-            sync_obj:          std::ptr::null_mut(),
-            buffer_format:     0,
-            tuning_info:       0,
-            reserved:          [0u32; 286],
+            preset_guid:                  NV_ENC_PRESET_P4_GUID,
+            encode_width:                 job.width,
+            encode_height:                job.height,
+            dar_width:                    job.width,
+            dar_height:                   job.height,
+            frame_rate_num:               job.frame_rate.num as u32,
+            frame_rate_den:               job.frame_rate.den as u32,
+            enable_encode_async:          0, // sync mode
+            enable_ptd:                   1, // let NVENC pick frame types
+            flags:                        0,
+            priv_data_size:               0,
+            reserved_u32:                 0,
+            priv_data:                    std::ptr::null_mut(),
+            encode_config:                std::ptr::null_mut(),
+            max_encode_width:             job.width,
+            max_encode_height:            job.height,
+            max_me_hint_counts_per_block: [0u32; 2],
+            tuning_info:                  0,
+            buffer_format:                0,
+            num_state_buffers:            0,
+            output_stats_level:           0,
+            reserved1:                    [0u32; 284],
+            reserved2:                    [std::ptr::null_mut(); 64],
         };
         let mut ret = unsafe { (funcs.initialize)(session, &mut init_params) };
         if ret != NV_ENC_SUCCESS {
@@ -404,9 +420,12 @@ impl EncodeInterop {
             return Err(EncodeInteropError::Initialize(ret));
         }
 
-        // Step 4 — Allocate the ABGR10 interop texture (R32Uint packed).
-        let abgr10_desc = wgpu::TextureDescriptor {
-            label: Some("EncodeInterop ABGR10"),
+        // Step 4 — Allocate two ping-pong ABGR10 interop textures (R32Uint packed).
+        //
+        // Having two textures allows the GPU to render frame N into slot N%2 while
+        // NVENC concurrently encodes the previously completed frame from slot (N-1)%2.
+        let make_abgr10_texture = |label: &'static str| wgpu::TextureDescriptor {
+            label: Some(label),
             size: wgpu::Extent3d { width: job.width, height: job.height, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
@@ -415,41 +434,73 @@ impl EncodeInterop {
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         };
-        let abgr10_texture = device.device.create_texture(&abgr10_desc);
-        let abgr10_external = ExternalTexture::import(
-            cuda_ctx, device, &abgr10_texture, transport, job.width, job.height,
+
+        let abgr10_texture_0 = device.device.create_texture(&make_abgr10_texture("EncodeInterop ABGR10 slot-0"));
+        let abgr10_external_0 = ExternalTexture::import(
+            cuda_ctx, device, &abgr10_texture_0, transport, job.width, job.height,
         ).map_err(EncodeInteropError::Cuda)?;
 
-        // Step 5 — Register the imported CUarray as an NVENC input resource.
+        let abgr10_texture_1 = device.device.create_texture(&make_abgr10_texture("EncodeInterop ABGR10 slot-1"));
+        let abgr10_external_1 = ExternalTexture::import(
+            cuda_ctx, device, &abgr10_texture_1, transport, job.width, job.height,
+        ).map_err(EncodeInteropError::Cuda)?;
+
+        // Step 5 — Register both imported CUarrays as NVENC input resources.
         let register_resource_ver = nvenc_struct_ver(probed_api_version, 4);
-        let mut register = NvEncRegisterResource {
+
+        let mut register_0 = NvEncRegisterResource {
             version:              register_resource_ver,
             resource_type:        NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
             width:                job.width,
             height:               job.height,
             pitch:                0,
-            resource_to_register: abgr10_external.cuda_array() as *mut _,
+            resource_to_register: abgr10_external_0.cuda_array() as *mut _,
             registered_resource:  std::ptr::null_mut(),
             buffer_format:        NV_ENC_BUFFER_FORMAT_ABGR10,
             buffer_usage:         0,
             p_input_fence_point:  std::ptr::null_mut(),
             reserved: [0u32; 249],
         };
-        let ret = unsafe { (funcs.register_resource)(session, &mut register) };
+        let ret = unsafe { (funcs.register_resource)(session, &mut register_0) };
         if ret != NV_ENC_SUCCESS {
             unsafe { (funcs.destroy_encoder)(session) };
             return Err(EncodeInteropError::Register(ret));
         }
 
-        // Allocate a bitstream output buffer (opaque NVENC handle)
-        // In a full implementation: nvEncCreateBitstreamBuffer
+        let mut register_1 = NvEncRegisterResource {
+            version:              register_resource_ver,
+            resource_type:        NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
+            width:                job.width,
+            height:               job.height,
+            pitch:                0,
+            resource_to_register: abgr10_external_1.cuda_array() as *mut _,
+            registered_resource:  std::ptr::null_mut(),
+            buffer_format:        NV_ENC_BUFFER_FORMAT_ABGR10,
+            buffer_usage:         0,
+            p_input_fence_point:  std::ptr::null_mut(),
+            reserved: [0u32; 249],
+        };
+        let ret = unsafe { (funcs.register_resource)(session, &mut register_1) };
+        if ret != NV_ENC_SUCCESS {
+            // Unregister slot 0 before returning so we don't leak a registered resource.
+            // Slot 0 was registered successfully; NVENC requires explicit unregister on cleanup.
+            // We have no unregister fn in the table yet — destroy_encoder will handle it.
+            unsafe { (funcs.destroy_encoder)(session) };
+            return Err(EncodeInteropError::Register(ret));
+        }
+
+        // Allocate a bitstream output buffer (opaque NVENC handle).
+        // TODO: replace with nvEncCreateBitstreamBuffer when wiring full bitstream path.
         let bitstream_buffer: *mut std::ffi::c_void = std::ptr::null_mut();
 
         Ok(Self {
             session,
-            abgr10_texture,
-            abgr10_external,
-            registered_resource: register.registered_resource,
+            abgr10_texture_0,
+            abgr10_texture_1,
+            abgr10_external_0,
+            abgr10_external_1,
+            registered_resource_0: register_0.registered_resource,
+            registered_resource_1: register_1.registered_resource,
             bitstream_buffer,
             funcs,
             width: job.width,
@@ -458,10 +509,25 @@ impl EncodeInterop {
         })
     }
 
-    /// Encode one frame. The ABGR10 texture must have already been written by
-    /// Abgr10RepackNode earlier in the same render-graph submission.
+    /// Return the ABGR10 wgpu texture for the given ping-pong slot (0 or 1).
+    ///
+    /// The caller (ExportRenderer) alternates between slots each frame:
+    /// - GPU writes into `slot N%2` via `Abgr10RepackNode`.
+    /// - NVENC reads from `slot (N-1)%2` after waiting for its submission index.
+    pub fn abgr10_texture_for_slot(&self, slot: usize) -> &wgpu::Texture {
+        if slot == 0 { &self.abgr10_texture_0 } else { &self.abgr10_texture_1 }
+    }
+
+    /// Return the NVENC registered resource handle for the given ping-pong slot.
+    fn registered_resource_for_slot(&self, slot: usize) -> *mut std::ffi::c_void {
+        if slot == 0 { self.registered_resource_0 } else { self.registered_resource_1 }
+    }
+
+    /// Encode one frame. The ABGR10 texture for `slot` must have already been
+    /// written by `Abgr10RepackNode` and its GPU submission must have completed
+    /// (caller uses `poll(WaitForSubmissionIndex)` before calling this).
     /// Returns (bitstream_bytes, pts) ready for Phase 6's Muxer::write_packet.
-    pub fn encode_frame(&mut self, pts: i64) -> Result<(Vec<u8>, i64), EncodeInteropError> {
+    pub fn encode_frame(&mut self, pts: i64, slot: usize) -> Result<(Vec<u8>, i64), EncodeInteropError> {
         // Step 1 — Map the registered input resource for this encode call.
         #[repr(C)]
         struct NvEncMapInputResource {
@@ -478,7 +544,7 @@ impl EncodeInterop {
             version:             map_ver,
             subresource_index:   0,
             input_resource:      std::ptr::null_mut(),
-            registered_resource: self.registered_resource,
+            registered_resource: self.registered_resource_for_slot(slot),
             mapped_resource:     std::ptr::null_mut(),
             mapped_buffer_fmt:   0,
             reserved: [0u32; 251],
@@ -570,18 +636,14 @@ impl EncodeInterop {
 
         Ok((bytes, pts))
     }
-
-    /// Convenience accessor for the ABGR10 texture (written by Abgr10RepackNode).
-    pub fn abgr10_texture(&self) -> &wgpu::Texture {
-        &self.abgr10_texture
-    }
 }
 
 impl Drop for EncodeInterop {
     fn drop(&mut self) {
         unsafe {
-            // Unregister the input resource, then destroy the session.
-            // The ExternalTexture and underlying wgpu::Texture clean up via their own Drop impls.
+            // Destroying the encoder session implicitly unregisters all input resources
+            // and releases internal NVENC state. The ExternalTextures (slot 0 and slot 1)
+            // and the underlying wgpu::Textures clean up via their own Drop impls after this.
             let _ = (self.funcs.destroy_encoder)(self.session);
         }
     }

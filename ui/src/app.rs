@@ -465,7 +465,7 @@ impl NexirApp {
                 let (vid_info, aud_info) = {
                     use nexir::timeline::rational::Rational;
                     use nexir::timeline::source::{
-                        AudioStreamInfo, ColorSpace, PixelFormat, SampleFormat, VideoStreamInfo,
+                        AudioStreamInfo, PixelFormat, SampleFormat, VideoStreamInfo,
                     };
                     if let Ok(demuxer) = Demuxer::open(&entry.path) {
                         let project_tb = Rational {
@@ -484,7 +484,7 @@ impl NexirApp {
                                 s.frame_rate.unwrap_or(Rational { num: 30, den: 1 })
                             },
                             pixel_fmt: PixelFormat::Yuv420p,
-                            color_space: ColorSpace::Bt709,
+                            color_info: s.color_info,
                             // convert from stream timebase to project timebase
                             duration_pts: if is_still_image {
                                 0
@@ -1043,8 +1043,13 @@ impl NexirApp {
                     rgba_id,
                     clip.clip_width,
                     clip.clip_height,
-                    nexir::timeline::source::ColorSpace::Bt709,
-                    true, // limited range
+                    nexir::timeline::source::ColorInfo {
+                        transfer_fn: nexir::timeline::source::TransferFunction::Bt709,
+                        range: nexir::timeline::source::ColorRange::Limited,
+                        matrix: nexir::timeline::source::MatrixCoefficients::Bt709,
+                        primaries: nexir::timeline::source::ColorPrimaries::Bt709,
+                        bit_depth: 8,
+                    },
                 ),
             ));
 

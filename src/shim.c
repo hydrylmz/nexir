@@ -4,6 +4,7 @@
 #include <libswresample/swresample.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/pixdesc.h>
 
 int get_av_pix_fmt_rgbaf16le() {
 #ifdef AV_PIX_FMT_RGBAF16LE
@@ -53,6 +54,17 @@ AVCodecParameters* avstream_get_codecpar_mut(AVStream* st) { return st->codecpar
 enum AVCodecID avcodecpar_get_codec_id(AVCodecParameters* par) { return par->codec_id; }
 int avcodecpar_get_width(AVCodecParameters* par) { return par->width; }
 int avcodecpar_get_height(AVCodecParameters* par) { return par->height; }
+int avcodecpar_get_color_space(AVCodecParameters* par) { return par->color_space; }
+int avcodecpar_get_color_range(AVCodecParameters* par) { return par->color_range; }
+int avcodecpar_get_color_trc(AVCodecParameters* par) { return par->color_trc; }
+int avcodecpar_get_color_primaries(AVCodecParameters* par) { return par->color_primaries; }
+int avcodecpar_get_bit_depth(AVCodecParameters* par) {
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(par->format);
+    if (desc) {
+        return desc->comp[0].depth;
+    }
+    return 8; // fallback
+}
 
 int av_packet_stream_index(AVPacket* pkt) { return pkt->stream_index; }
 int64_t av_packet_pts(AVPacket* pkt) { return pkt->pts; }

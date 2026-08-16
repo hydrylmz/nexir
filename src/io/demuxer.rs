@@ -6,8 +6,13 @@ use std::ffi::CString;
 use std::path::Path;
 use std::ptr;
 use crate::io::ffi::avformat::*;
-use crate::io::ffi::avcodec::{avstream_get_codecpar, avcodecpar_get_codec_id,
-                               avcodecpar_get_width, avcodecpar_get_height};
+use crate::io::ffi::avcodec::{
+    avstream_get_codecpar, avcodecpar_get_codec_id,
+    avcodecpar_get_width, avcodecpar_get_height,
+    avcodecpar_get_color_space, avcodecpar_get_color_range,
+    avcodecpar_get_color_trc, avcodecpar_get_color_primaries,
+    avcodecpar_get_bit_depth
+};
 use crate::io::ffi::avutil::{
     AVPacket, av_packet_alloc, av_packet_free, av_packet_unref,
     AVERROR_EOF, av_err_to_string,
@@ -69,6 +74,7 @@ pub struct StreamInfo {
     pub width:      Option<u32>,
     pub height:     Option<u32>,
     pub is_vfr:     bool,
+    pub color_info: crate::timeline::source::ColorInfo,
     /// We need the raw codec parameters to initialize the decoder
     pub codecpar:   *mut crate::io::ffi::avcodec::AVCodecParameters,
 }
@@ -305,6 +311,51 @@ impl Demuxer {
             let codec_id  = avcodecpar_get_codec_id(codecpar);
             let width     = avcodecpar_get_width(codecpar);
             let height    = avcodecpar_get_height(codecpar);
+            
+            let cs_raw = avcodecpar_get_color_space(codecpar);
+            let cr_raw = avcodecpar_get_color_range(codecpar);
+            let trc_raw = avcodecpar_get_color_trc(codecpar);
+            let pri_raw = avcodecpar_get_color_primaries(codecpar);
+            let bit_depth = avcodecpar_get_bit_depth(codecpar) as u8;
+
+            use crate::timeline::source::{ColorInfo, ColorRange, ColorPrimaries, MatrixCoefficients, TransferFunction};
+
+            let range = match cr_raw {
+                1 => ColorRange::Limited,
+                2 => ColorRange::Full,
+                _ => ColorRange::Limited, // Fallback to limited (MPEG)
+            };
+
+            let matrix = match cs_raw {
+                1 => MatrixCoefficients::Bt709,
+                5 | 6 => MatrixCoefficients::Bt601,
+                9 | 10 => MatrixCoefficients::Bt2020,
+                _ => MatrixCoefficients::Bt709, // Fallback
+            };
+
+            let primaries = match pri_raw {
+                1 => ColorPrimaries::Bt709,
+                9 => ColorPrimaries::Bt2020,
+                _ => ColorPrimaries::Bt709, // Fallback
+            };
+
+            let transfer_fn = match trc_raw {
+                1 => TransferFunction::Bt709,
+                8 => TransferFunction::Linear,
+                13 => TransferFunction::Srgb,
+                14 | 15 => TransferFunction::Bt2020,
+                16 => TransferFunction::Pq,
+                18 => TransferFunction::Hlg,
+                _ => TransferFunction::Bt709, // Fallback
+            };
+
+            let color_info = ColorInfo {
+                range,
+                matrix,
+                primaries,
+                transfer_fn,
+                bit_depth,
+            };
 
             StreamInfo {
                 index,
@@ -315,6 +366,7 @@ impl Demuxer {
                 width:  if width  > 0 { Some(width  as u32) } else { None },
                 height: if height > 0 { Some(height as u32) } else { None },
                 is_vfr,
+                color_info,
                 codecpar,
             }
         }

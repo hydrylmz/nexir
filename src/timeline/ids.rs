@@ -49,6 +49,7 @@ impl EffectId {
 }
 
 impl SourceId {
+    pub fn new(id: u32) -> Self { Self(id) }
     pub fn index(self) -> usize {
         self.0 as usize
     }
