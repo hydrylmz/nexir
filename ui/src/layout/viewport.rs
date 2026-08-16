@@ -139,8 +139,17 @@ pub fn draw(
 
                 let (clip_w, clip_h) = {
                     let kind = project.clips.kind_at(clip.store_index);
-                    if let nexir::timeline::store::ClipKind::Text { text, font_size, .. } = kind {
-                        let (w, h) = nexir::render::text_renderer::measure_text(text, *font_size);
+                    if let nexir::timeline::store::ClipKind::Text {
+                        text, font_size, stroke_color, stroke_width, background_color, bg_padding, ..
+                    } = kind {
+                        let (w, h) = nexir::render::text_renderer::measure_text(
+                            text,
+                            *font_size,
+                            *stroke_width,
+                            stroke_color.is_some(),
+                            background_color.is_some(),
+                            *bg_padding,
+                        );
                         (w as f32, h as f32)
                     } else {
                         let source_id = project.clips.source_id_at(clip.store_index);
@@ -173,8 +182,17 @@ pub fn draw(
             if is_video_track {
                 let (clip_w, clip_h) = {
                     let kind = project.clips.kind_at(idx);
-                    if let nexir::timeline::store::ClipKind::Text { text, font_size, .. } = kind {
-                        let (w, h) = nexir::render::text_renderer::measure_text(text, *font_size);
+                    if let nexir::timeline::store::ClipKind::Text {
+                        text, font_size, stroke_color, stroke_width, background_color, bg_padding, ..
+                    } = kind {
+                        let (w, h) = nexir::render::text_renderer::measure_text(
+                            text,
+                            *font_size,
+                            *stroke_width,
+                            stroke_color.is_some(),
+                            background_color.is_some(),
+                            *bg_padding,
+                        );
                         (w as f32, h as f32)
                     } else {
                         let source_id = project.clips.source_id_at(idx);

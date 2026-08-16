@@ -22,6 +22,10 @@ pub enum ClipKind {
         /// Solid background fill behind the text. None = transparent.
         #[serde(default)]
         background_color: Option<[f32; 4]>,
+        /// Extra padding around text for the background box, in pixels (per side).
+        /// Default 0 = rasteriser uses 10% of font_size automatically.
+        #[serde(default)]
+        bg_padding: f32,
     },
 }
 

@@ -25,6 +25,7 @@ pub struct InspectorState {
     // Background
     pub bg_enabled: bool,
     pub bg_color: [f32; 4],
+    pub bg_padding: f32,
 
     /// The clip store-index we last loaded values from.
     last_loaded_clip: Option<usize>,
@@ -50,6 +51,7 @@ impl Default for InspectorState {
             stroke_width: 2.0,
             bg_enabled: false,
             bg_color: [0.0, 0.0, 0.0, 0.85],
+            bg_padding: 12.0,
             last_loaded_clip: None,
         }
     }
@@ -97,7 +99,7 @@ fn draw_inner(
             // Load text clip properties
             match project.clips.kind_at(idx) {
                 nexir::timeline::store::ClipKind::Text {
-                    text, font_size, color, stroke_color, stroke_width, background_color
+                    text, font_size, color, stroke_color, stroke_width, background_color, bg_padding
                 } => {
                     state.text_content = text.clone();
                     state.font_size = *font_size;
@@ -115,6 +117,7 @@ fn draw_inner(
                     } else {
                         state.bg_enabled = false;
                     }
+                    state.bg_padding = *bg_padding;
                 }
                 _ => {
                     state.text_content = String::new();
@@ -259,6 +262,12 @@ fn draw_inner(
                                     text_changed = true;
                                 }
                                 ui.end_row();
+
+                                ui.label("  Padding");
+                                text_changed |= ui
+                                    .add(egui::Slider::new(&mut state.bg_padding, 0.0..=100.0).suffix("px"))
+                                    .changed();
+                                ui.end_row();
                             }
                         });
                 });
@@ -279,6 +288,7 @@ fn draw_inner(
                         } else {
                             None
                         },
+                        bg_padding: state.bg_padding,
                     });
                 }
                 ui.add_space(6.0);

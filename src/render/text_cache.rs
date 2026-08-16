@@ -34,6 +34,7 @@ pub struct TextKey {
     // Background
     pub has_bg: bool,
     pub bg_color_bits: [u32; 4],
+    pub bg_padding_bits: u32,
 }
 
 impl TextKey {
@@ -44,6 +45,7 @@ impl TextKey {
         stroke_color: Option<[f32; 4]>,
         stroke_width: f32,
         background_color: Option<[f32; 4]>,
+        bg_padding: f32,
     ) -> Self {
         Self {
             text: text.to_string(),
@@ -57,6 +59,7 @@ impl TextKey {
             stroke_width_bits: stroke_width.to_bits(),
             has_bg: background_color.is_some(),
             bg_color_bits: background_color.unwrap_or([0.0; 4]).map(f32::to_bits),
+            bg_padding_bits: bg_padding.to_bits(),
         }
     }
 }
@@ -77,14 +80,15 @@ impl TextCache {
         stroke_color: Option<[f32; 4]>,
         stroke_width: f32,
         background_color: Option<[f32; 4]>,
+        bg_padding: f32,
     ) -> CachedText {
-        let key = TextKey::new(text, font_size, color, stroke_color, stroke_width, background_color);
+        let key = TextKey::new(text, font_size, color, stroke_color, stroke_width, background_color, bg_padding);
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
         }
 
         let (width, height, rgba_data) =
-            rasterize_text(text, font_size, color, stroke_color, stroke_width, background_color);
+            rasterize_text(text, font_size, color, stroke_color, stroke_width, background_color, bg_padding);
 
         // Pack pixels as Rgba16Float with 256-byte row alignment.
         let bytes_per_pixel = 8u32; // 4 channels × 2 bytes (f16)

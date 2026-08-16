@@ -1624,6 +1624,7 @@ pub fn draw(
                                 stroke_color: None,
                                 stroke_width: 2.0,
                                 background_color: None,
+                                bg_padding: 12.0,
                             }
 
                         } else {
