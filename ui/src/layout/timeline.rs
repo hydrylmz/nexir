@@ -70,6 +70,14 @@ pub struct TimelineState {
     resize: Option<ClipResize>,
     viewport_resize: Option<ViewportResize>,
     viewport_move: Option<ViewportMove>,
+    viewport_rotate: Option<ViewportRotate>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ViewportRotate {
+    pub clip_id: ClipId,
+    pub start_pointer: egui::Pos2,
+    pub start_transform: ClipTransform,
 }
 
 impl Default for TimelineState {
@@ -85,6 +93,7 @@ impl Default for TimelineState {
             resize: None,
             viewport_resize: None,
             viewport_move: None,
+            viewport_rotate: None,
         }
     }
 }
@@ -95,6 +104,7 @@ impl TimelineState {
             || self.resize.is_some()
             || self.viewport_resize.is_some()
             || self.viewport_move.is_some()
+            || self.viewport_rotate.is_some()
     }
 
     pub fn start_viewport_resize(
@@ -141,11 +151,33 @@ impl TimelineState {
         self.viewport_move = None;
     }
 
+    pub fn start_viewport_rotate(
+        &mut self,
+        clip_id: ClipId,
+        start_pointer: egui::Pos2,
+        start_transform: ClipTransform,
+    ) {
+        self.viewport_rotate = Some(ViewportRotate {
+            clip_id,
+            start_pointer,
+            start_transform,
+        });
+    }
+
+    pub fn viewport_rotate(&self) -> Option<ViewportRotate> {
+        self.viewport_rotate
+    }
+
+    pub fn finish_viewport_rotate(&mut self) {
+        self.viewport_rotate = None;
+    }
+
     pub fn clear_interaction(&mut self) {
         self.drag = None;
         self.resize = None;
         self.viewport_resize = None;
         self.viewport_move = None;
+        self.viewport_rotate = None;
     }
 }
 

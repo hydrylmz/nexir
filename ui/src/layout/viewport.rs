@@ -204,6 +204,13 @@ pub fn draw(
                 let handle_rects = corners.map(|corner| {
                     Rect::from_center_size(corner, Vec2::splat(handle_radius * 3.0))
                 });
+                
+                // Rotate handle (above top-center)
+                let top_center = corners[0].lerp(corners[1], 0.5);
+                let up_vector = (corners[0] - corners[3]).normalized(); 
+                let rotate_center = top_center - up_vector * 25.0; // Extend outward above the top edge
+                let rotate_rect = Rect::from_center_size(rotate_center, Vec2::splat(handle_radius * 3.0));
+
                 let tr = corners[1];
                 let del_center = tr + egui::vec2(12.0, -12.0);
                 let del_rect =
@@ -224,11 +231,12 @@ pub fn draw(
                     egui::Sense::drag(),
                 );
 
-                if move_resp.drag_started() && state.viewport_resize().is_none() {
+                if move_resp.drag_started() && state.viewport_resize().is_none() && state.viewport_rotate().is_none() {
                     if let Some(pointer) = ui.ctx().pointer_interact_pos() {
                         let started_on_handle =
                             handle_rects.iter().any(|rect| rect.contains(pointer));
                         if !started_on_handle
+                            && !rotate_rect.contains(pointer)
                             && !del_rect.contains(pointer)
                             && is_point_in_quad(pointer, &corners)
                         {
@@ -264,6 +272,29 @@ pub fn draw(
                         egui::Stroke::new(1.0, Color32::BLACK),
                     );
                 }
+
+                // Draw Rotate Handle
+                let rotate_resp = ui.interact(rotate_rect, egui::Id::new(("viewport_rotate", idx)), egui::Sense::drag());
+                if rotate_resp.drag_started() {
+                    if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                        history.record(project);
+                        state.start_viewport_rotate(clip_id, pointer, transform);
+                    }
+                }
+                
+                // Draw connecting line to rotate handle
+                ui.painter().line_segment(
+                    [top_center, rotate_center],
+                    egui::Stroke::new(1.5, Color32::LIGHT_BLUE),
+                );
+                
+                let rot_color = if rotate_resp.hovered() { Color32::WHITE } else { Color32::from_rgb(150, 255, 150) };
+                ui.painter().circle_filled(rotate_center, handle_radius, rot_color);
+                ui.painter().circle_stroke(
+                    rotate_center,
+                    handle_radius,
+                    egui::Stroke::new(1.0, Color32::BLACK),
+                );
 
                 if let Some(movement) = state.viewport_move() {
                     if movement.clip_id == clip_id && state.viewport_resize().is_none() {
@@ -327,10 +358,42 @@ pub fn draw(
 
                             project.clips.set_transform_at(idx, new_transform);
                             ui.ctx().request_repaint();
+                            if ui.input(|input| input.pointer.any_released()) {
+                                state.finish_viewport_resize();
+                            }
+                        }
+                    }
+                }
+
+                if let Some(rotate) = state.viewport_rotate() {
+                    if rotate.clip_id == clip_id {
+                        if let Some(pointer) = ui
+                            .ctx()
+                            .pointer_interact_pos()
+                            .or_else(|| ui.ctx().pointer_hover_pos())
+                        {
+                            let center_px = (corners[0] + corners[2].to_vec2()) * 0.5;
+                            
+                            // Angle from center to drag start
+                            let start_vec = rotate.start_pointer - center_px;
+                            let start_angle = start_vec.y.atan2(start_vec.x);
+                            
+                            // Angle from center to current pointer
+                            let curr_vec = pointer - center_px;
+                            let curr_angle = curr_vec.y.atan2(curr_vec.x);
+                            
+                            let delta_angle = curr_angle - start_angle;
+                            
+                            let mut new_transform = rotate.start_transform;
+                            // Add delta; rotation is counterclockwise in transform so we negate delta to match screen Y-down
+                            new_transform.rotation -= delta_angle;
+                            
+                            project.clips.set_transform_at(idx, new_transform);
+                            ui.ctx().request_repaint();
                         }
 
                         if ui.input(|input| input.pointer.any_released()) {
-                            state.finish_viewport_resize();
+                            state.finish_viewport_rotate();
                         }
                     }
                 }
@@ -383,6 +446,9 @@ pub fn draw(
     }
     if state.viewport_move().is_some() && ui.input(|input| input.pointer.any_released()) {
         state.finish_viewport_move();
+    }
+    if state.viewport_rotate().is_some() && ui.input(|input| input.pointer.any_released()) {
+        state.finish_viewport_rotate();
     }
 
     ui.add_space(8.0);
