@@ -226,7 +226,7 @@ pub fn draw(
                 // Rotate handle (above top-center)
                 let top_center = corners[0].lerp(corners[1], 0.5);
                 let up_vector = (corners[0] - corners[3]).normalized(); 
-                let rotate_center = top_center - up_vector * 25.0; // Extend outward above the top edge
+                let rotate_center = top_center + up_vector * 25.0; // Extend outward above the top edge
                 let rotate_rect = Rect::from_center_size(rotate_center, Vec2::splat(handle_radius * 3.0));
 
                 let tr = corners[1];
@@ -326,6 +326,18 @@ pub fn draw(
                             new_transform.position[0] += delta.x * canvas_w / draw_rect.width();
                             new_transform.position[1] +=
                                 delta.y * canvas_h / draw_rect.height();
+
+                            if state.viewport_snap {
+                                // Snap if within 15 pixels screen distance
+                                let snap_w = 15.0 * canvas_w / draw_rect.width();
+                                let snap_h = 15.0 * canvas_h / draw_rect.height();
+                                if new_transform.position[0].abs() < snap_w {
+                                    new_transform.position[0] = 0.0;
+                                }
+                                if new_transform.position[1].abs() < snap_h {
+                                    new_transform.position[1] = 0.0;
+                                }
+                            }
 
                             project.clips.set_transform_at(idx, new_transform);
                             ui.ctx().request_repaint();

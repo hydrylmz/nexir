@@ -64,6 +64,7 @@ pub struct TimelineState {
     pub playing: bool,
     pub last_tick: Option<std::time::Instant>,
     pub selected_clip: Option<usize>,
+    pub viewport_snap: bool,
     /// Active clip drag state.
     drag: Option<ClipDrag>,
     /// Active clip resize state.
@@ -89,6 +90,7 @@ impl Default for TimelineState {
             playing: false,
             last_tick: None,
             selected_clip: None,
+            viewport_snap: true,
             drag: None,
             resize: None,
             viewport_resize: None,
@@ -342,6 +344,16 @@ pub fn draw(
                 let clip_id = project.clips.clip_id_at(idx);
                 pending_clip_actions.push(ClipAction::RippleDelete(clip_id));
             }
+        }
+
+        ui.separator();
+        let mut snap = state.viewport_snap;
+        if ui
+            .add(egui::SelectableLabel::new(snap, "🧲 Snap"))
+            .on_hover_text("Snap clip to center in preview")
+            .clicked()
+        {
+            state.viewport_snap = !snap;
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

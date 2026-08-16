@@ -77,7 +77,8 @@ pub fn rasterize_text(
 
     // 1. Draw glyph alpha mask
     let mut glyph_img = RgbaImage::new(width, height);
-    draw_text_mut(&mut glyph_img, Rgba([255, 255, 255, 255]), pad, pad, scale, &font, text);
+    let y_offset = (font_size * 0.10).ceil() as i32;
+    draw_text_mut(&mut glyph_img, Rgba([255, 255, 255, 255]), pad, pad - y_offset, scale, &font, text);
 
     let mut alpha_in = vec![0u8; (width * height) as usize];
     for y in 0..height {
