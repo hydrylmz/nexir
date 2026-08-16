@@ -65,8 +65,6 @@ impl TextCache {
 
         let (width, height, rgba_data) = rasterize_text(text, font_size, color);
 
-        let force_opaque = color[3] >= 1.0;
-
         // Pack pixels as Rgba16Float with 256-byte row alignment.
         let bytes_per_pixel = 8u32; // 4 channels × 2 bytes (f16)
         let row_bytes = width * bytes_per_pixel;
@@ -83,7 +81,7 @@ impl TextCache {
                 let sr = rgba_data[src] as f32 / 255.0;
                 let sg = rgba_data[src + 1] as f32 / 255.0;
                 let sb = rgba_data[src + 2] as f32 / 255.0;
-                let sa = if force_opaque { 1.0 } else { rgba_data[src + 3] as f32 / 255.0 };
+                let sa = rgba_data[src + 3] as f32 / 255.0;
 
                 let comps = [sr, sg, sb, sa];
                 for c in 0..4 {

@@ -51,10 +51,19 @@ pub fn build_islands(
         let layer      = store.layer_order_at(idx);
         let (effect_start, effect_count) = store.effect_range_at(idx);
         
-        let (clip_width, clip_height) = source_reg.video_info(source_id)
-            .map(|i| (i.width, i.height))
-            .unwrap_or((1920, 1080));
-        
+        let (clip_width, clip_height) = {
+            let kind = store.kind_at(idx);
+            if let crate::timeline::store::ClipKind::Text { text, font_size, .. } = kind {
+                // Measure the rasterised text size so the GPU transform matrix
+                // places it at natural size rather than stretching it to 1920×1080.
+                crate::render::text_renderer::measure_text(text, *font_size)
+            } else {
+                source_reg.video_info(source_id)
+                    .map(|i| (i.width, i.height))
+                    .unwrap_or((1920, 1080))
+            }
+        };
+
         let kind = store.kind_at(idx).clone();
 
         let clip = IslandClip {
