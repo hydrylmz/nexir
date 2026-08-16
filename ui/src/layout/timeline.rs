@@ -349,7 +349,7 @@ pub fn draw(
         ui.separator();
         let mut snap = state.viewport_snap;
         if ui
-            .add(egui::SelectableLabel::new(snap, "🧲 Snap"))
+            .add(egui::SelectableLabel::new(snap, "Snap"))
             .on_hover_text("Snap clip to center in preview")
             .clicked()
         {

@@ -331,11 +331,31 @@ pub fn draw(
                                 // Snap if within 15 pixels screen distance
                                 let snap_w = 15.0 * canvas_w / draw_rect.width();
                                 let snap_h = 15.0 * canvas_h / draw_rect.height();
+                                let mut snapped_x = false;
+                                let mut snapped_y = false;
+
                                 if new_transform.position[0].abs() < snap_w {
                                     new_transform.position[0] = 0.0;
+                                    snapped_x = true;
                                 }
                                 if new_transform.position[1].abs() < snap_h {
                                     new_transform.position[1] = 0.0;
+                                    snapped_y = true;
+                                }
+
+                                if snapped_x {
+                                    let x_pos = draw_rect.center().x;
+                                    ui.painter().line_segment(
+                                        [egui::pos2(x_pos, draw_rect.top()), egui::pos2(x_pos, draw_rect.bottom())],
+                                        egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 255, 128)),
+                                    );
+                                }
+                                if snapped_y {
+                                    let y_pos = draw_rect.center().y;
+                                    ui.painter().line_segment(
+                                        [egui::pos2(draw_rect.left(), y_pos), egui::pos2(draw_rect.right(), y_pos)],
+                                        egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 255, 128)),
+                                    );
                                 }
                             }
 
