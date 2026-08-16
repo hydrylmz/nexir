@@ -137,17 +137,26 @@ pub fn draw(
                     continue;
                 }
 
-                let source_id = project.clips.source_id_at(clip.store_index);
-                if let Ok(info) = project.sources.read().unwrap().video_info(source_id) {
-                    let clip_w = info.width as f32;
-                    let clip_h = info.height as f32;
-                    let transform = project.clips.transform_at(clip.store_index);
-
-                    let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect, canvas_w, canvas_h);
-                    if is_point_in_quad(pos, &corners) {
-                        clicked_idx = Some(clip.store_index);
-                        break;
+                let (clip_w, clip_h) = {
+                    let kind = project.clips.kind_at(clip.store_index);
+                    if let nexir::timeline::store::ClipKind::Text { text, font_size, .. } = kind {
+                        let (w, h) = nexir::render::text_renderer::measure_text(text, *font_size);
+                        (w as f32, h as f32)
+                    } else {
+                        let source_id = project.clips.source_id_at(clip.store_index);
+                        if let Ok(info) = project.sources.read().unwrap().video_info(source_id) {
+                            (info.width as f32, info.height as f32)
+                        } else {
+                            continue;
+                        }
                     }
+                };
+
+                let transform = project.clips.transform_at(clip.store_index);
+                let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect, canvas_w, canvas_h);
+                if is_point_in_quad(pos, &corners) {
+                    clicked_idx = Some(clip.store_index);
+                    break;
                 }
             }
             state.selected_clip = clicked_idx;
@@ -162,198 +171,208 @@ pub fn draw(
                 matches!(t.kind, nexir::timeline::track::TrackKind::Video)
             });
             if is_video_track {
-                let source_id = project.clips.source_id_at(idx);
-                if let Ok(info) = project.sources.read().unwrap().video_info(source_id) {
-                    let clip_w = info.width as f32;
-                    let clip_h = info.height as f32;
-                    let transform = *project.clips.transform_at(idx);
-                    let clip_id = project.clips.clip_id_at(idx);
-
-                    let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect, canvas_w, canvas_h);
-
-                    // Draw outline
-                    for i in 0..4 {
-                        ui.painter().line_segment(
-                            [corners[i], corners[(i + 1) % 4]],
-                            egui::Stroke::new(2.0, Color32::LIGHT_BLUE),
-                        );
-                    }
-
-                    let handle_radius = 6.0;
-                    let delete_radius = 8.0;
-                    let handle_rects = corners.map(|corner| {
-                        Rect::from_center_size(corner, Vec2::splat(handle_radius * 3.0))
-                    });
-                    let tr = corners[1];
-                    let del_center = tr + egui::vec2(12.0, -12.0);
-                    let del_rect =
-                        Rect::from_center_size(del_center, Vec2::splat(delete_radius * 2.5));
-
-                    let mut min = corners[0];
-                    let mut max = corners[0];
-                    for &corner in &corners[1..] {
-                        min.x = min.x.min(corner.x);
-                        min.y = min.y.min(corner.y);
-                        max.x = max.x.max(corner.x);
-                        max.y = max.y.max(corner.y);
-                    }
-                    let body_rect = Rect::from_min_max(min, max);
-                    let move_resp = ui.interact(
-                        body_rect,
-                        egui::Id::new(("viewport_move", idx)),
-                        egui::Sense::drag(),
-                    );
-
-                    if move_resp.drag_started() && state.viewport_resize().is_none() {
-                        if let Some(pointer) = ui.ctx().pointer_interact_pos() {
-                            let started_on_handle =
-                                handle_rects.iter().any(|rect| rect.contains(pointer));
-                            if !started_on_handle
-                                && !del_rect.contains(pointer)
-                                && is_point_in_quad(pointer, &corners)
-                            {
-                                history.record(project);
-                                state.start_viewport_move(clip_id, pointer, transform);
-                            }
-                        }
-                    }
-
-                    // Resize Handles
-                    for (i, (&corner, handle_rect)) in
-                        corners.iter().zip(handle_rects.iter()).enumerate()
-                    {
-                        let resize_id = egui::Id::new(("viewport_resize", idx, i));
-                        let resp = ui.interact(*handle_rect, resize_id, egui::Sense::drag());
-
-                        if resp.drag_started() {
-                            if let Some(pointer) = ui.ctx().pointer_interact_pos() {
-                                history.record(project);
-                                state.start_viewport_resize(clip_id, i, pointer, transform);
-                            }
-                        }
-
-                        let color = if resp.hovered() {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(200, 200, 255)
-                        };
-                        ui.painter().circle_filled(corner, handle_radius, color);
-                        ui.painter().circle_stroke(
-                            corner,
-                            handle_radius,
-                            egui::Stroke::new(1.0, Color32::BLACK),
-                        );
-                    }
-
-                    if let Some(movement) = state.viewport_move() {
-                        if movement.clip_id == clip_id && state.viewport_resize().is_none() {
-                            if let Some(pointer) = ui
-                                .ctx()
-                                .pointer_interact_pos()
-                                .or_else(|| ui.ctx().pointer_hover_pos())
-                            {
-                                let delta = pointer - movement.start_pointer;
-                                let mut new_transform = movement.start_transform;
-                                new_transform.position[0] += delta.x * canvas_w / draw_rect.width();
-                                new_transform.position[1] +=
-                                    delta.y * canvas_h / draw_rect.height();
-
-                                project.clips.set_transform_at(idx, new_transform);
-                                ui.ctx().request_repaint();
-                            }
-
-                            if ui.input(|input| input.pointer.any_released()) {
-                                state.finish_viewport_move();
-                            }
-                        }
-                    }
-
-                    if let Some(resize) = state.viewport_resize() {
-                        if resize.clip_id == clip_id {
-                            if let Some(pointer) = ui
-                                .ctx()
-                                .pointer_interact_pos()
-                                .or_else(|| ui.ctx().pointer_hover_pos())
-                            {
-                                let delta = pointer - resize.start_pointer;
-                                let scale_dir = match resize.handle_index {
-                                    0 => -delta.x - delta.y,
-                                    1 => delta.x - delta.y,
-                                    2 => delta.x + delta.y,
-                                    3 => -delta.x + delta.y,
-                                    _ => 0.0,
-                                };
-                                let scale_delta = scale_dir * 0.003;
-                                let mut new_transform = resize.start_transform;
-                                let sign_x = if resize.start_transform.scale[0] < 0.0 {
-                                    -1.0
-                                } else {
-                                    1.0
-                                };
-                                let sign_y = if resize.start_transform.scale[1] < 0.0 {
-                                    -1.0
-                                } else {
-                                    1.0
-                                };
-                                new_transform.scale[0] += scale_delta * sign_x;
-                                new_transform.scale[1] += scale_delta * sign_y;
-
-                                if new_transform.scale[0].abs() < 0.01 {
-                                    new_transform.scale[0] = 0.01 * sign_x;
-                                }
-                                if new_transform.scale[1].abs() < 0.01 {
-                                    new_transform.scale[1] = 0.01 * sign_y;
-                                }
-
-                                project.clips.set_transform_at(idx, new_transform);
-                                ui.ctx().request_repaint();
-                            }
-
-                            if ui.input(|input| input.pointer.any_released()) {
-                                state.finish_viewport_resize();
-                            }
-                        }
-                    }
-
-                    // Delete Button
-                    let del_resp = ui.interact(
-                        del_rect,
-                        egui::Id::new(("delete", idx)),
-                        egui::Sense::click(),
-                    );
-
-                    let del_color = if del_resp.hovered() {
-                        Color32::from_rgb(255, 50, 50)
+                let (clip_w, clip_h) = {
+                    let kind = project.clips.kind_at(idx);
+                    if let nexir::timeline::store::ClipKind::Text { text, font_size, .. } = kind {
+                        let (w, h) = nexir::render::text_renderer::measure_text(text, *font_size);
+                        (w as f32, h as f32)
                     } else {
-                        Color32::RED
-                    };
-                    ui.painter()
-                        .circle_filled(del_center, delete_radius, del_color);
-                    ui.painter().circle_stroke(
-                        del_center,
-                        delete_radius,
-                        egui::Stroke::new(1.0, Color32::WHITE),
-                    );
-                    ui.painter().line_segment(
-                        [
-                            del_center + egui::vec2(-3.0, -3.0),
-                            del_center + egui::vec2(3.0, 3.0),
-                        ],
-                        egui::Stroke::new(2.0, Color32::WHITE),
-                    );
-                    ui.painter().line_segment(
-                        [
-                            del_center + egui::vec2(3.0, -3.0),
-                            del_center + egui::vec2(-3.0, 3.0),
-                        ],
-                        egui::Stroke::new(2.0, Color32::WHITE),
-                    );
-
-                    if del_resp.clicked() {
-                        history.record(project);
-                        let _ = nexir::timeline::mutation::remove_clip(&mut project.clips, clip_id);
-                        state.selected_clip = None;
+                        let source_id = project.clips.source_id_at(idx);
+                        if let Ok(info) = project.sources.read().unwrap().video_info(source_id) {
+                            (info.width as f32, info.height as f32)
+                        } else {
+                            (1920.0, 1080.0) // Fallback should rarely happen
+                        }
                     }
+                };
+
+                let transform = *project.clips.transform_at(idx);
+                let clip_id = project.clips.clip_id_at(idx);
+
+                let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect, canvas_w, canvas_h);
+
+                // Draw outline
+                for i in 0..4 {
+                    ui.painter().line_segment(
+                        [corners[i], corners[(i + 1) % 4]],
+                        egui::Stroke::new(2.0, Color32::LIGHT_BLUE),
+                    );
+                }
+
+                let handle_radius = 6.0;
+                let delete_radius = 8.0;
+                let handle_rects = corners.map(|corner| {
+                    Rect::from_center_size(corner, Vec2::splat(handle_radius * 3.0))
+                });
+                let tr = corners[1];
+                let del_center = tr + egui::vec2(12.0, -12.0);
+                let del_rect =
+                    Rect::from_center_size(del_center, Vec2::splat(delete_radius * 2.5));
+
+                let mut min = corners[0];
+                let mut max = corners[0];
+                for &corner in &corners[1..] {
+                    min.x = min.x.min(corner.x);
+                    min.y = min.y.min(corner.y);
+                    max.x = max.x.max(corner.x);
+                    max.y = max.y.max(corner.y);
+                }
+                let body_rect = Rect::from_min_max(min, max);
+                let move_resp = ui.interact(
+                    body_rect,
+                    egui::Id::new(("viewport_move", idx)),
+                    egui::Sense::drag(),
+                );
+
+                if move_resp.drag_started() && state.viewport_resize().is_none() {
+                    if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                        let started_on_handle =
+                            handle_rects.iter().any(|rect| rect.contains(pointer));
+                        if !started_on_handle
+                            && !del_rect.contains(pointer)
+                            && is_point_in_quad(pointer, &corners)
+                        {
+                            history.record(project);
+                            state.start_viewport_move(clip_id, pointer, transform);
+                        }
+                    }
+                }
+
+                // Resize Handles
+                for (i, (&corner, handle_rect)) in
+                    corners.iter().zip(handle_rects.iter()).enumerate()
+                {
+                    let resize_id = egui::Id::new(("viewport_resize", idx, i));
+                    let resp = ui.interact(*handle_rect, resize_id, egui::Sense::drag());
+
+                    if resp.drag_started() {
+                        if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                            history.record(project);
+                            state.start_viewport_resize(clip_id, i, pointer, transform);
+                        }
+                    }
+
+                    let color = if resp.hovered() {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_rgb(200, 200, 255)
+                    };
+                    ui.painter().circle_filled(corner, handle_radius, color);
+                    ui.painter().circle_stroke(
+                        corner,
+                        handle_radius,
+                        egui::Stroke::new(1.0, Color32::BLACK),
+                    );
+                }
+
+                if let Some(movement) = state.viewport_move() {
+                    if movement.clip_id == clip_id && state.viewport_resize().is_none() {
+                        if let Some(pointer) = ui
+                            .ctx()
+                            .pointer_interact_pos()
+                            .or_else(|| ui.ctx().pointer_hover_pos())
+                        {
+                            let delta = pointer - movement.start_pointer;
+                            let mut new_transform = movement.start_transform;
+                            new_transform.position[0] += delta.x * canvas_w / draw_rect.width();
+                            new_transform.position[1] +=
+                                delta.y * canvas_h / draw_rect.height();
+
+                            project.clips.set_transform_at(idx, new_transform);
+                            ui.ctx().request_repaint();
+                        }
+
+                        if ui.input(|input| input.pointer.any_released()) {
+                            state.finish_viewport_move();
+                        }
+                    }
+                }
+
+                if let Some(resize) = state.viewport_resize() {
+                    if resize.clip_id == clip_id {
+                        if let Some(pointer) = ui
+                            .ctx()
+                            .pointer_interact_pos()
+                            .or_else(|| ui.ctx().pointer_hover_pos())
+                        {
+                            let delta = pointer - resize.start_pointer;
+                            let scale_dir = match resize.handle_index {
+                                0 => -delta.x - delta.y,
+                                1 => delta.x - delta.y,
+                                2 => delta.x + delta.y,
+                                3 => -delta.x + delta.y,
+                                _ => 0.0,
+                            };
+                            let scale_delta = scale_dir * 0.003;
+                            let mut new_transform = resize.start_transform;
+                            let sign_x = if resize.start_transform.scale[0] < 0.0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            let sign_y = if resize.start_transform.scale[1] < 0.0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            new_transform.scale[0] += scale_delta * sign_x;
+                            new_transform.scale[1] += scale_delta * sign_y;
+
+                            if new_transform.scale[0].abs() < 0.01 {
+                                new_transform.scale[0] = 0.01 * sign_x;
+                            }
+                            if new_transform.scale[1].abs() < 0.01 {
+                                new_transform.scale[1] = 0.01 * sign_y;
+                            }
+
+                            project.clips.set_transform_at(idx, new_transform);
+                            ui.ctx().request_repaint();
+                        }
+
+                        if ui.input(|input| input.pointer.any_released()) {
+                            state.finish_viewport_resize();
+                        }
+                    }
+                }
+
+                // Delete Button
+                let del_resp = ui.interact(
+                    del_rect,
+                    egui::Id::new(("delete", idx)),
+                    egui::Sense::click(),
+                );
+
+                let del_color = if del_resp.hovered() {
+                    Color32::from_rgb(255, 50, 50)
+                } else {
+                    Color32::RED
+                };
+                ui.painter()
+                    .circle_filled(del_center, delete_radius, del_color);
+                ui.painter().circle_stroke(
+                    del_center,
+                    delete_radius,
+                    egui::Stroke::new(1.0, Color32::WHITE),
+                );
+                ui.painter().line_segment(
+                    [
+                        del_center + egui::vec2(-3.0, -3.0),
+                        del_center + egui::vec2(3.0, 3.0),
+                    ],
+                    egui::Stroke::new(2.0, Color32::WHITE),
+                );
+                ui.painter().line_segment(
+                    [
+                        del_center + egui::vec2(3.0, -3.0),
+                        del_center + egui::vec2(-3.0, 3.0),
+                    ],
+                    egui::Stroke::new(2.0, Color32::WHITE),
+                );
+
+                if del_resp.clicked() {
+                    history.record(project);
+                    let _ = nexir::timeline::mutation::remove_clip(&mut project.clips, clip_id);
+                    state.selected_clip = None;
                 }
             }
         }
