@@ -8,6 +8,7 @@ use crate::timeline::transform::ClipTransform;
 pub struct ClipInsertParams {
     pub track_id: TrackId,
     pub source_id: SourceId,
+    pub kind: crate::timeline::store::ClipKind,
     pub pts_in: i64,
     pub pts_out: i64,
     pub source_in: i64,
@@ -43,6 +44,7 @@ pub fn insert_clip(
 
     store.track_ids.insert(pos, params.track_id);
     store.source_ids.insert(pos, params.source_id);
+    store.kind.insert(pos, params.kind);
     store.pts_in.insert(pos, params.pts_in);
     store.pts_out.insert(pos, params.pts_out);
     store.source_in.insert(pos, params.source_in);
@@ -95,6 +97,7 @@ pub fn insert_clip_overwrite(
         i64,
         SourceId,
         TrackId,
+        crate::timeline::store::ClipKind,
         u16,
         f32,
         ClipTransform,
@@ -118,6 +121,7 @@ pub fn insert_clip_overwrite(
                     store.source_in[i],
                     store.source_ids[i],
                     store.track_ids[i],
+                    store.kind[i].clone(),
                     store.layer_order[i],
                     store.opacity[i],
                     store.transform[i],
@@ -138,6 +142,7 @@ pub fn insert_clip_overwrite(
         ex_src_in,
         ex_src_id,
         ex_track,
+        ex_kind,
         ex_layer,
         ex_opacity,
         ex_transform,
@@ -163,6 +168,7 @@ pub fn insert_clip_overwrite(
                 ClipInsertParams {
                     track_id: ex_track,
                     source_id: ex_src_id,
+                    kind: ex_kind.clone(),
                     pts_in: ex_in,
                     pts_out: new_in,
                     source_in: ex_src_in,
@@ -182,6 +188,7 @@ pub fn insert_clip_overwrite(
                 ClipInsertParams {
                     track_id: ex_track,
                     source_id: ex_src_id,
+                    kind: ex_kind.clone(),
                     pts_in: new_out,
                     pts_out: ex_out,
                     source_in: tail_src_in,
@@ -203,6 +210,7 @@ pub fn insert_clip_overwrite(
                 ClipInsertParams {
                     track_id: ex_track,
                     source_id: ex_src_id,
+                    kind: ex_kind.clone(),
                     pts_in: ex_in,
                     pts_out: new_in,
                     source_in: ex_src_in,
@@ -225,6 +233,7 @@ pub fn insert_clip_overwrite(
                 ClipInsertParams {
                     track_id: ex_track,
                     source_id: ex_src_id,
+                    kind: ex_kind.clone(),
                     pts_in: new_out,
                     pts_out: ex_out,
                     source_in: new_src_in,
@@ -251,6 +260,7 @@ pub fn remove_clip(store: &mut TimelineStore, id: ClipId) -> Result<(), Mutation
     store.ids.remove(idx);
     store.track_ids.remove(idx);
     store.source_ids.remove(idx);
+    store.kind.remove(idx);
     store.pts_in.remove(idx);
     store.pts_out.remove(idx);
     store.source_in.remove(idx);
@@ -281,6 +291,7 @@ pub fn move_clip(
     let params = ClipInsertParams {
         track_id: store.track_ids[idx],
         source_id: store.source_ids[idx],
+            kind: store.kind[idx].clone(),
         pts_in: new_pts_in,
         pts_out: new_pts_out,
         source_in: store.source_in[idx],
@@ -321,6 +332,7 @@ pub fn trim_clip_in(
     let params = ClipInsertParams {
         track_id: store.track_ids[idx],
         source_id: store.source_ids[idx],
+            kind: store.kind[idx].clone(),
         pts_in: new_pts_in,
         pts_out: store.pts_out[idx],
         source_in: new_source_in,
@@ -371,6 +383,7 @@ pub fn split_clip(
     let params = ClipInsertParams {
         track_id: store.track_ids[idx],
         source_id: store.source_ids[idx],
+            kind: store.kind[idx].clone(),
         pts_in: split_pts,
         pts_out: pts_out,
         source_in: store.source_in[idx] + delta,
@@ -397,6 +410,7 @@ pub fn duplicate_clip(store: &mut TimelineStore, id: ClipId) -> Result<ClipId, M
     let params = ClipInsertParams {
         track_id: store.track_ids[idx],
         source_id: store.source_ids[idx],
+            kind: store.kind[idx].clone(),
         pts_in: store.pts_out[idx],
         pts_out: store.pts_out[idx] + duration,
         source_in: store.source_in[idx],
@@ -429,6 +443,7 @@ pub fn ripple_remove_clip(store: &mut TimelineStore, id: ClipId) -> Result<(), M
                 ClipInsertParams {
                     track_id: store.track_ids[i],
                     source_id: store.source_ids[i],
+            kind: store.kind[i].clone(),
                     pts_in: store.pts_in[i] - duration,
                     pts_out: store.pts_out[i] - duration,
                     source_in: store.source_in[i],
@@ -508,6 +523,7 @@ pub fn insert_clip_ripple(
             let head_params = ClipInsertParams {
                 track_id: store.track_ids[i],
                 source_id: store.source_ids[i],
+            kind: store.kind[i].clone(),
                 pts_in: ex_in,
                 pts_out: new_in,
                 source_in: store.source_in[i],
@@ -523,6 +539,7 @@ pub fn insert_clip_ripple(
             let tail_params = ClipInsertParams {
                 track_id: store.track_ids[i],
                 source_id: store.source_ids[i],
+            kind: store.kind[i].clone(),
                 pts_in: boundary,
                 pts_out: boundary + (ex_out - new_in),
                 source_in: store.source_in[i] + (new_in - ex_in),
@@ -548,6 +565,7 @@ pub fn insert_clip_ripple(
                     ClipInsertParams {
                         track_id: store.track_ids[i],
                         source_id: store.source_ids[i],
+            kind: store.kind[i].clone(),
                         pts_in: boundary,
                         pts_out: ex_out + shift_delta,
                         source_in: store.source_in[i],
@@ -592,6 +610,7 @@ pub fn insert_clip_ripple(
                     let l_head = ClipInsertParams {
                         track_id: store.track_ids[j],
                         source_id: store.source_ids[j],
+            kind: store.kind[j].clone(),
                         pts_in: ex_in,
                         pts_out: new_in,
                         source_in: store.source_in[j],
@@ -607,6 +626,7 @@ pub fn insert_clip_ripple(
                     let l_tail = ClipInsertParams {
                         track_id: store.track_ids[j],
                         source_id: store.source_ids[j],
+            kind: store.kind[j].clone(),
                         pts_in: tail.pts_in,
                         pts_out: tail.pts_in + (ex_out - new_in),
                         source_in: store.source_in[j] + (new_in - ex_in),
@@ -642,6 +662,7 @@ pub fn insert_clip_ripple(
                         ClipInsertParams {
                             track_id: store.track_ids[j],
                             source_id: store.source_ids[j],
+            kind: store.kind[j].clone(),
                             pts_in: store.pts_in[j] + shift_delta,
                             pts_out: store.pts_out[j] + shift_delta,
                             source_in: store.source_in[j],
@@ -701,6 +722,7 @@ pub fn move_clip_ripple(
     let params = ClipInsertParams {
         track_id: store.track_ids[idx],
         source_id: store.source_ids[idx],
+            kind: store.kind[idx].clone(),
         pts_in: new_pts_in,
         pts_out: new_pts_out,
         source_in: store.source_in[idx],

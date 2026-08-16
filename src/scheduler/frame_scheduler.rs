@@ -180,7 +180,8 @@ impl FrameScheduler {
             // If this is a still image and decode worker couldn't provide a
             // slot, still include a placeholder entry — UI will handle the
             // still-image upload path. Otherwise, require a valid slot.
-            if is_still_image && slot_info.is_none() {
+            let is_text = matches!(clip.kind, crate::timeline::store::ClipKind::Text { .. });
+            if (is_still_image || is_text) && slot_info.is_none() {
                 entries.push(ClipRenderEntry {
                     source_id: clip.source_id,
                     texture_slot: 0,
@@ -189,7 +190,7 @@ impl FrameScheduler {
                     clip_height: clip.clip_height,
                     transform: clip.transform,
                     opacity: clip.opacity,
-                    is_nv12: false,
+                    is_nv12: false, kind: clip.kind.clone(),
                 });
                 continue;
             }
@@ -208,7 +209,7 @@ impl FrameScheduler {
                 clip_height: clip.clip_height,
                 transform: clip.transform,
                 opacity: clip.opacity,
-                is_nv12,
+                is_nv12, kind: clip.kind.clone(),
             });
         }
 
@@ -262,7 +263,8 @@ impl FrameScheduler {
                 (clip.source_pts / frame_duration) * frame_duration
             };
 
-            if is_still_image {
+            let is_text = matches!(clip.kind, crate::timeline::store::ClipKind::Text { .. });
+            if is_still_image || is_text {
                 // For still images, don't attempt to decode via the video slot pool.
                 // Still-image upload is handled on the UI side (StillImageUploadNode),
                 // so include a placeholder entry with texture_slot=0. This prevents
@@ -276,7 +278,7 @@ impl FrameScheduler {
                     clip_height: clip.clip_height,
                     transform: clip.transform,
                     opacity: clip.opacity,
-                    is_nv12: false,
+                    is_nv12: false, kind: clip.kind.clone(),
                 });
                 continue;
             }
@@ -302,7 +304,7 @@ impl FrameScheduler {
                 clip_height: clip.clip_height,
                 transform: clip.transform,
                 opacity: clip.opacity,
-                is_nv12,
+                is_nv12, kind: clip.kind.clone(),
             });
         }
 

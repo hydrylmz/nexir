@@ -229,6 +229,7 @@ impl Project {
         let audio_muted = self.clips.audio_muted_at(idx);
         let speed = self.clips.speed_at(idx);
         let pitch = self.clips.pitch_at(idx);
+        let kind = self.clips.kind_at(idx).clone();
 
         // Ripple remove from old track (closes gap)
         ripple_remove_clip(&mut self.clips, id)?;
@@ -240,6 +241,7 @@ impl Project {
             ClipInsertParams {
                 track_id: new_track,
                 source_id,
+                kind,
                 pts_in: new_pts_in,
                 pts_out: new_pts_in + duration,
                 source_in,

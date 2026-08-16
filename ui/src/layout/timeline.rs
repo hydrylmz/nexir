@@ -271,23 +271,7 @@ pub fn draw(
 
         ui.separator();
 
-        // ── Add track buttons ─────────────────────────────────────────
-        if ui
-            .button("⊕ Video")
-            .on_hover_text("Add a new video track")
-            .clicked()
-        {
-            pending_track_mutations.push(TrackMutation::AddVideoTrack);
-        }
-        if ui
-            .button("⊕ Audio")
-            .on_hover_text("Add a new audio track")
-            .clicked()
-        {
-            pending_track_mutations.push(TrackMutation::AddAudioTrack);
-        }
 
-        ui.separator();
 
         // Timecode display — frame → HH:MM:SS:FF
         let fps = project.settings.frame_rate.num.max(1);
@@ -413,7 +397,7 @@ pub fn draw(
     }
 
     // ── Ruler + lanes canvas ─────────────────────────────────────────────
-    egui::ScrollArea::horizontal()
+    egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let canvas_w = total_frames as f32 * state.zoom + 60.0;
@@ -476,31 +460,33 @@ pub fn draw(
                 kind_order(&a.kind).cmp(&kind_order(&b.kind))
             });
 
-            let mut prev_kind_order = None;
+            for current_kind_order in 0..=3 {
+                let tracks_of_kind: Vec<_> = sorted_tracks.iter().filter(|t| {
+                    (match t.kind {
+                        TrackKind::Video => 0,
+                        TrackKind::Audio { .. } => 1,
+                        TrackKind::Text => 2,
+                        TrackKind::Effect => 3,
+                    }) == current_kind_order
+                }).collect();
 
-            for track in sorted_tracks.iter() {
-                let current_kind_order = match track.kind {
-                    TrackKind::Video => 0,
-                    TrackKind::Audio { .. } => 1,
-                    TrackKind::Text => 2,
-                    TrackKind::Effect => 3,
-                };
-
-                // Add aesthetic grouping separator if kind changed
-                if let Some(prev) = prev_kind_order {
-                    if prev != current_kind_order {
-                        let gap_h = 12.0;
-                        let (gap_rect, _) = ui.allocate_exact_size(Vec2::new(canvas_w + GUTTER_W, gap_h), Sense::hover());
-                        let mid_y = gap_rect.center().y;
-                        
-                        // subtle separator spanning the entire width
-                        ui.painter().line_segment(
-                            [egui::pos2(gap_rect.left(), mid_y), egui::pos2(gap_rect.right(), mid_y)],
-                            egui::Stroke::new(2.0, Color32::from_rgb(20, 20, 20)),
-                        );
-                    }
+                if tracks_of_kind.is_empty() && current_kind_order > 1 {
+                    continue;
                 }
-                prev_kind_order = Some(current_kind_order);
+
+                if current_kind_order > 0 {
+                    let gap_h = 12.0;
+                    let (gap_rect, _) = ui.allocate_exact_size(Vec2::new(canvas_w + GUTTER_W, gap_h), Sense::hover());
+                    let mid_y = gap_rect.center().y;
+                    
+                    // subtle separator spanning the entire width
+                    ui.painter().line_segment(
+                        [egui::pos2(gap_rect.left(), mid_y), egui::pos2(gap_rect.right(), mid_y)],
+                        egui::Stroke::new(2.0, Color32::from_rgb(20, 20, 20)),
+                    );
+                }
+
+                for &&track in tracks_of_kind.iter() {
                 let is_active = track.is_active(any_soloed);
                 let track_h = track.height_px as f32;
 
@@ -959,6 +945,46 @@ pub fn draw(
                 // Deselect on empty lane click
                 if lane_resp.clicked() && !clicked_a_clip && state.drag.is_none() {
                     state.selected_clip = None;
+                }
+                } // end per-track loop
+
+                // Draw add track button
+                if current_kind_order == 0 {
+                    let btn_h = 24.0;
+                    let (row_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(canvas_w + GUTTER_W, btn_h), Sense::hover());
+                    let gutter = Rect::from_min_size(row_rect.min, Vec2::new(GUTTER_W, btn_h));
+                    ui.painter().rect_filled(gutter, 0.0, Color32::from_rgb(28, 28, 28));
+                    let btn_rect = gutter.shrink2(egui::vec2(8.0, 4.0));
+                    let resp = ui.interact(btn_rect, egui::Id::new("add_video_btn"), Sense::click());
+                    let btn_color = if resp.hovered() { Color32::from_rgb(60, 60, 60) } else { Color32::from_rgb(40, 40, 40) };
+                    ui.painter().rect_filled(btn_rect, 4.0, btn_color);
+                    ui.painter().text(
+                        btn_rect.center(), Align2::CENTER_CENTER, "+",
+                        egui::FontId::proportional(14.0),
+                        if resp.hovered() { Color32::WHITE } else { Color32::LIGHT_GRAY },
+                    );
+                    if resp.clicked() {
+                        pending_track_mutations.push(TrackMutation::AddVideoTrack);
+                    }
+                } else if current_kind_order == 1 {
+                    let btn_h = 24.0;
+                    let (row_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(canvas_w + GUTTER_W, btn_h), Sense::hover());
+                    let gutter = Rect::from_min_size(row_rect.min, Vec2::new(GUTTER_W, btn_h));
+                    ui.painter().rect_filled(gutter, 0.0, Color32::from_rgb(28, 28, 28));
+                    let btn_rect = gutter.shrink2(egui::vec2(8.0, 4.0));
+                    let resp = ui.interact(btn_rect, egui::Id::new("add_audio_btn"), Sense::click());
+                    let btn_color = if resp.hovered() { Color32::from_rgb(60, 60, 60) } else { Color32::from_rgb(40, 40, 40) };
+                    ui.painter().rect_filled(btn_rect, 4.0, btn_color);
+                    ui.painter().text(
+                        btn_rect.center(), Align2::CENTER_CENTER, "+",
+                        egui::FontId::proportional(14.0),
+                        if resp.hovered() { Color32::WHITE } else { Color32::LIGHT_GRAY },
+                    );
+                    if resp.clicked() {
+                        pending_track_mutations.push(TrackMutation::AddAudioTrack);
+                    }
                 }
             } // end tracks loop
 
@@ -1558,6 +1584,15 @@ pub fn draw(
                     let _ = project.insert_clip_ripple(ClipInsertParams {
                         track_id,
                         source_id,
+                        kind: if path.to_string_lossy() == "nexir://internal/text" {
+                            nexir::timeline::store::ClipKind::Text {
+                                text: "Basic Text".to_string(),
+                                font_size: 48.0,
+                                color: [1.0, 1.0, 1.0, 1.0],
+                            }
+                        } else {
+                            nexir::timeline::store::ClipKind::Video
+                        },
                         pts_in,
                         pts_out,
                         source_in: 0,

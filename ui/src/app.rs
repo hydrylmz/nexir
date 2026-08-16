@@ -48,6 +48,19 @@ pub struct PreviewState {
     pub video_height: u32,
 }
 
+pub struct ActiveAudioDecoder {
+    shutdown: Arc<AtomicBool>,
+    seek: Arc<Mutex<Option<(i64, i64)>>>,
+    ring: Arc<AudioRingBuffer>,
+    /// cached params — used to detect if we need to restart the decoder
+    volume: f32,
+    pan: f32,
+    muted: bool,
+    speed: f32,
+    source_in_pts: i64,
+    source_out_pts: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ActiveClipAudioInfo {
     pub clip_id: nexir::timeline::ids::ClipId,
@@ -88,16 +101,10 @@ pub struct NexirApp {
 
     // Audio engine
     _audio_out: Option<AudioOutputStream>,
-    audio_ring: Arc<AudioRingBuffer>,
     audio_clock: Arc<MasterClock>,
-    audio_shutdown: Arc<AtomicBool>,
-    audio_seek: Arc<Mutex<Option<(i64, i64)>>>,
-    audio_path: Option<std::path::PathBuf>, // currently playing audio file
-    audio_volume: f32,
-    audio_pan: f32,
-    audio_muted: bool,
-    audio_speed: f32,
-    audio_pitch: f32,
+    audio_mixer_bufs: nexir::audio::output_stream::MixerBusList,
+    /// Map from ClipId -> (shutdown_flag, seek_channel, ring_buffer, cached params)
+    active_audio_decoders: std::collections::HashMap<nexir::timeline::ids::ClipId, ActiveAudioDecoder>,
     audio_was_playing: bool,
 
     // Waveform display cache
@@ -119,6 +126,7 @@ pub struct NexirApp {
     interop_capability: InteropCapability,
     cuda_ctx: Option<Arc<CudaContext>>,
     still_cache: Mutex<StillImageCache>,
+    text_cache: Mutex<nexir::render::text_cache::TextCache>,
 }
 
 pub struct AppResponse {
@@ -270,13 +278,11 @@ impl NexirApp {
             num: 1,
             den: 90_000,
         };
-        let audio_ring = AudioRingBuffer::new(1 << 17); // 131072 samples
+        let audio_mixer_bufs: nexir::audio::output_stream::MixerBusList = Arc::new(Mutex::new(Vec::new()));
         let audio_clock = MasterClock::new(project_tb, 48_000);
-        let audio_shutdown = Arc::new(AtomicBool::new(false));
-        let audio_seek = Arc::new(Mutex::new(None::<(i64, i64)>));
 
         log::info!("NexirApp::new: CPAL audio stream opening...");
-        let audio_out = AudioOutputStream::open(Arc::clone(&audio_ring), Arc::clone(&audio_clock))
+        let audio_out = AudioOutputStream::open(Arc::clone(&audio_mixer_bufs), Arc::clone(&audio_clock))
             .map_err(|e| eprintln!("[audio] Failed to open output: {:?}", e))
             .ok();
         log::info!(
@@ -318,17 +324,10 @@ impl NexirApp {
             blit_pipeline,
             sampler,
             _audio_out: audio_out,
-            audio_ring,
             audio_clock,
-            audio_shutdown,
-            audio_seek,
-            audio_path: None,
+            audio_mixer_bufs,
+            active_audio_decoders: std::collections::HashMap::new(),
             current_project_path: None,
-            audio_volume: 1.0,
-            audio_pan: 0.0,
-            audio_muted: false,
-            audio_speed: 1.0,
-            audio_pitch: 0.0,
             audio_was_playing: false,
             waveform_cache: crate::waveform::WaveformCache::new(),
             device,
@@ -341,6 +340,7 @@ impl NexirApp {
             interop_capability,
             cuda_ctx: None,
             still_cache: Mutex::new(StillImageCache::default()),
+            text_cache: Mutex::new(nexir::render::text_cache::TextCache::default()),
         }
     }
 
@@ -430,6 +430,7 @@ impl NexirApp {
         egui::TopBottomPanel::bottom("timeline")
             .resizable(true)
             .default_height(300.0)
+            .height_range(100.0..=400.0)
             .show(&self.egui_ctx, |ui| {
                 crate::layout::timeline::draw(
                     ui,
@@ -446,7 +447,8 @@ impl NexirApp {
 
         egui::SidePanel::left("media_pool")
             .resizable(true)
-            .default_width(350.0)
+            .default_width(300.0)
+            .width_range(150.0..=400.0)
             .show(&self.egui_ctx, |ui| {
                 crate::layout::media_pool::draw(ui, &mut self.media_pool);
             });
@@ -516,7 +518,8 @@ impl NexirApp {
 
         egui::SidePanel::right("inspector")
             .resizable(true)
-            .default_width(350.0)
+            .default_width(300.0)
+            .width_range(150.0..=400.0)
             .show(&self.egui_ctx, |ui| {
                 crate::layout::inspector::draw(
                     ui,
@@ -565,171 +568,163 @@ impl NexirApp {
         // Check if playhead moved OR if playback just started
         let playhead_pts = self.project.frame_to_pts(self.timeline.playhead_frame);
         if playhead_pts != self.last_playhead || just_started_playing {
-            // Detect a scrub/jump:
-            // 1. We just started playing (need to sync decoder to playhead)
-            // 2. We moved backward (always a jump)
-            // 3. We jumped more than 2s forward (definitely not normal playback)
-            // 4. We moved while PAUSED (always a scrub, even if it's a small forward move)
             let pts_delta = playhead_pts - self.last_playhead;
-            let mut force_seek = just_started_playing
+            let force_seek = just_started_playing
                 || pts_delta < 0
                 || pts_delta > 180_000
-                || !self.timeline.playing; // Moved while paused
-
+                || !self.timeline.playing;
             self.last_playhead = playhead_pts;
 
-            // Respect mute / solo: pre-compute whether any track is soloed.
-            let any_soloed = self.project.tracks.any_soloed();
+            if !self.timeline.playing {
+                // Paused: kill all decoders immediately
+                self.stop_all_audio_decoders();
+            } else {
+                // Build the set of currently-active audio clips
+                let any_soloed = self.project.tracks.any_soloed();
+                let mut desired: Vec<ActiveClipAudioInfo> = Vec::new();
 
-            // Separate active clips by track kind.
-            let mut top_audio_clip = None;
-            let mut fallback_video_audio = None;
-            for clip in &active_clips {
-                let track_id = self.project.clips.track_id_at(clip.store_index);
-                if let Some(track) = self.project.tracks.get(track_id) {
-                    let track_active = track.is_active(any_soloed);
-                    use nexir::timeline::track::TrackKind;
-                    match track.kind {
-                        TrackKind::Video => {
-                            // Only use embedded audio if the track is not muted/solo'd out.
-                            if track_active && fallback_video_audio.is_none() {
-                                let source_id = self.project.clips.source_id_at(clip.store_index);
-                                if self
-                                    .project
-                                    .sources
-                                    .read()
-                                    .unwrap()
-                                    .audio_info(source_id)
-                                    .is_ok()
-                                {
-                                    fallback_video_audio = Some(clip.clone());
+                for clip in &active_clips {
+                    let track_id = self.project.clips.track_id_at(clip.store_index);
+                    if let Some(track) = self.project.tracks.get(track_id) {
+                        if !track.is_active(any_soloed) { continue; }
+                        use nexir::timeline::track::TrackKind;
+                        let source_id = self.project.clips.source_id_at(clip.store_index);
+                        let has_audio = self.project.sources.read().unwrap().audio_info(source_id).is_ok();
+                        if !has_audio { continue; }
+                        match track.kind {
+                            TrackKind::Video | TrackKind::Audio { .. } => {
+                                let path = {
+                                    let sources = self.project.sources.read().unwrap();
+                                    sources.path(source_id).map(|p| p.as_ref().clone())
+                                };
+                                if let Some(path) = path {
+                                    let volume = self.project.clips.volume_at(clip.store_index);
+                                    let pan = self.project.clips.pan_at(clip.store_index);
+                                    let muted = self.project.clips.audio_muted_at(clip.store_index);
+                                    let speed = self.project.clips.speed_at(clip.store_index);
+                                    let pitch = self.project.clips.pitch_at(clip.store_index);
+                                    let source_in_pts = self.project.clips.source_in_at(clip.store_index);
+                                    let pts_out = self.project.clips.pts_out_at(clip.store_index);
+                                    let pts_in = self.project.clips.pts_in_at(clip.store_index);
+                                    let duration_pts = pts_out - pts_in;
+                                    let source_out_pts = source_in_pts + (duration_pts as f32 * speed).round() as i64;
+                                    let clip_id = self.project.clips.clip_id_at(clip.store_index);
+                                    desired.push(ActiveClipAudioInfo {
+                                        clip_id,
+                                        path,
+                                        volume,
+                                        pan,
+                                        muted,
+                                        speed,
+                                        pitch,
+                                        source_pts: clip.source_pts,
+                                        timeline_pts: playhead_pts,
+                                        source_in_pts,
+                                        source_out_pts,
+                                    });
                                 }
                             }
+                            _ => {}
                         }
-                        TrackKind::Audio { .. } => {
-                            // Dedicated audio tracks respect mute/solo.
-                            if track_active && top_audio_clip.is_none() {
-                                top_audio_clip = Some(clip.clone());
-                            }
-                        }
-                        _ => {}
                     }
                 }
-            }
-            let top_audio_clip = top_audio_clip.or(fallback_video_audio);
 
-            // ── HANDLE AUDIO CLIP ──
-            if let Some(ref clip) = top_audio_clip {
-                let source_id = self.project.clips.source_id_at(clip.store_index);
-                let source_pts = clip.source_pts;
-                let volume = self.project.clips.volume_at(clip.store_index);
-                let pan = self.project.clips.pan_at(clip.store_index);
-                let audio_muted = self.project.clips.audio_muted_at(clip.store_index);
-                let speed = self.project.clips.speed_at(clip.store_index);
-                let pitch = self.project.clips.pitch_at(clip.store_index);
-                let source_in_pts = self.project.clips.source_in_at(clip.store_index);
-                let pts_out = self.project.clips.pts_out_at(clip.store_index);
-                let pts_in = self.project.clips.pts_in_at(clip.store_index);
-                let duration_pts = pts_out - pts_in;
-                let source_out_pts = source_in_pts + (duration_pts as f32 * speed).round() as i64;
-                let path = {
-                    let sources = self.project.sources.read().unwrap();
-                    sources.path(source_id).map(|p| p.as_ref().clone())
-                };
+                // Shut down decoders no longer needed
+                let desired_ids: std::collections::HashSet<_> = desired.iter().map(|d| d.clip_id).collect();
+                let to_remove: Vec<_> = self.active_audio_decoders.keys()
+                    .filter(|id| !desired_ids.contains(id))
+                    .cloned().collect();
+                for id in to_remove {
+                    self.stop_audio_decoder(id);
+                }
 
-                if let Some(path) = path {
-                    // Check if we need to switch to a new audio file or if audio properties changed.
-                    let need_new_decoder = self.audio_path.as_ref() != Some(&path)
-                        || self.audio_volume != volume
-                        || self.audio_pan != pan
-                        || self.audio_muted != audio_muted
-                        || self.audio_speed != speed
-                        || self.audio_pitch != pitch;
-                    if need_new_decoder {
-                        // Stop current decoder if running
-                        self.audio_shutdown
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                        // Give it a brief moment to exit
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                // Start or update decoders
+                let project_tb = nexir::timeline::rational::Rational { num: 1, den: 90_000 };
+                for info in desired {
+                    let needs_restart = if let Some(existing) = self.active_audio_decoders.get(&info.clip_id) {
+                        force_seek
+                            || existing.volume != info.volume
+                            || existing.pan != info.pan
+                            || existing.muted != info.muted
+                            || existing.speed != info.speed
+                            || existing.source_in_pts != info.source_in_pts
+                            || existing.source_out_pts != info.source_out_pts
+                    } else {
+                        true // new clip
+                    };
 
-                        self.audio_ring.clear();
-                        self.audio_shutdown =
-                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    if needs_restart {
+                        // Kill any existing decoder for this clip
+                        if self.active_audio_decoders.contains_key(&info.clip_id) {
+                            self.stop_audio_decoder(info.clip_id);
+                        }
 
-                        let clock = std::sync::Arc::clone(&self.audio_clock);
-                        let ring = std::sync::Arc::clone(&self.audio_ring);
-                        let seek = std::sync::Arc::clone(&self.audio_seek);
-                        let shutdown = std::sync::Arc::clone(&self.audio_shutdown);
-                        let project_tb = nexir::timeline::rational::Rational {
-                            num: 1,
-                            den: 90_000,
-                        };
+                        // Spawn a fresh decoder with its own ring buffer
+                        let ring = AudioRingBuffer::new(32768); // ~680ms at 48kHz stereo
+                        let shutdown = Arc::new(AtomicBool::new(false));
+                        let seek = Arc::new(Mutex::new(Some((info.source_pts, playhead_pts))));
+                        let clock = Arc::clone(&self.audio_clock);
+                        let mixer_bufs = Arc::clone(&self.audio_mixer_bufs);
 
-                        let path_clone = path.clone();
-                        eprintln!(
-                            "[app] Starting audio decoder for {:?} (volume: {}, pan: {}, muted: {}, speed: {}, pitch: {})",
-                            path_clone, volume, pan, audio_muted, speed, pitch
-                        );
+                        // Register ring in the mixer list
+                        {
+                            let mut bufs = mixer_bufs.lock().unwrap();
+                            bufs.push(Arc::clone(&ring));
+                        }
+
+                        let ring_dec = Arc::clone(&ring);
+                        let shutdown_dec = Arc::clone(&shutdown);
+                        let seek_dec = Arc::clone(&seek);
+                        let info_clone = info.clone();
+
                         std::thread::spawn(move || {
                             match AudioDecoder::new(
-                                &path_clone,
-                                ring,
+                                &info_clone.path,
+                                ring_dec,
                                 clock,
                                 project_tb,
-                                shutdown,
-                                seek,
-                                volume,
-                                pan,
-                                audio_muted,
-                                speed,
-                                pitch,
-                                source_in_pts,
-                                source_out_pts,
+                                shutdown_dec,
+                                seek_dec,
+                                info_clone.volume,
+                                info_clone.pan,
+                                info_clone.muted,
+                                info_clone.speed,
+                                info_clone.pitch,
+                                info_clone.source_in_pts,
+                                info_clone.source_out_pts,
                             ) {
                                 Ok(decoder) => decoder.run(),
-                                Err(e) => eprintln!(
-                                    "Failed to open audio decoder for {:?}: {:?}",
-                                    path_clone, e
-                                ),
+                                Err(e) => eprintln!("[audio] Failed to open decoder for {:?}: {:?}", info_clone.path, e),
                             }
                         });
 
-                        self.audio_path = Some(path);
-                        self.audio_volume = volume;
-                        self.audio_pan = pan;
-                        self.audio_muted = audio_muted;
-                        self.audio_speed = speed;
-                        self.audio_pitch = pitch;
-                        force_seek = true; // force a seek when opening a new file
-                    }
-
-                    if force_seek {
-                        *self.audio_seek.lock().unwrap() = Some((source_pts, playhead_pts));
-                        self.audio_clock.seek(playhead_pts);
+                        self.active_audio_decoders.insert(info.clip_id, ActiveAudioDecoder {
+                            shutdown,
+                            seek,
+                            ring,
+                            volume: info.volume,
+                            pan: info.pan,
+                            muted: info.muted,
+                            speed: info.speed,
+                            source_in_pts: info.source_in_pts,
+                            source_out_pts: info.source_out_pts,
+                        });
+                    } else if force_seek {
+                        // Seek existing decoder
+                        if let Some(dec) = self.active_audio_decoders.get(&info.clip_id) {
+                            *dec.seek.lock().unwrap() = Some((info.source_pts, playhead_pts));
+                            dec.ring.clear();
+                        }
                     }
                 }
-            }
 
-            // ── AUDIO MUTE: kill the decoder immediately when the audio track is
-            //    muted (or unsolo'd), so the ring drains to silence.
-            if top_audio_clip.is_none() && self.audio_path.is_some() {
-                self.audio_shutdown
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                self.audio_path = None;
-                self.audio_ring.clear();
-                self.audio_shutdown =
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                self.audio_clock.seek(playhead_pts);
             }
         }
 
-        // Stop audio decoder when user pauses / stops playback
-        if !self.timeline.playing && self.audio_path.is_some() {
-            self.audio_shutdown
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            self.audio_path = None;
-            self.audio_ring.clear();
-            // Reset clock so next play starts fresh
-            self.audio_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // When paused — also kill decoders
+        if !self.timeline.playing && !self.active_audio_decoders.is_empty() {
+            self.stop_all_audio_decoders();
         }
 
         // ── Export progress polling ──────────────────────────────────────────
@@ -793,6 +788,24 @@ impl NexirApp {
         viewport_size
     }
 
+    fn stop_audio_decoder(&mut self, clip_id: nexir::timeline::ids::ClipId) {
+        if let Some(dec) = self.active_audio_decoders.remove(&clip_id) {
+            dec.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Remove its ring buffer from the CPAL mixer list
+            let ring_ptr = Arc::as_ptr(&dec.ring);
+            let mut bufs = self.audio_mixer_bufs.lock().unwrap();
+            bufs.retain(|b| Arc::as_ptr(b) != ring_ptr);
+        }
+    }
+
+    fn stop_all_audio_decoders(&mut self) {
+        let ids: Vec<_> = self.active_audio_decoders.keys().cloned().collect();
+        for id in ids {
+            self.stop_audio_decoder(id);
+        }
+        self.audio_clock.seek(self.project.frame_to_pts(self.timeline.playhead_frame));
+    }
+
     fn advance_playhead(&mut self, just_started_playing: bool) {
         if !self.timeline.playing {
             return;
@@ -807,7 +820,7 @@ impl NexirApp {
 
         let now = std::time::Instant::now();
 
-        if self.audio_path.is_some() && !just_started_playing {
+        if !self.active_audio_decoders.is_empty() && !just_started_playing {
             let clock_pts = self.audio_clock.pts();
             self.timeline.playhead_frame = self.project.pts_to_frame(clock_pts);
         } else if let Some(last) = self.timeline.last_tick {
@@ -837,11 +850,7 @@ impl NexirApp {
 
     /// Stop any running audio decoder and reset audio state.
     fn stop_playback(&mut self) {
-        self.audio_shutdown
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.audio_path = None;
-        self.audio_ring.clear();
-        self.audio_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.stop_all_audio_decoders();
         self.audio_was_playing = false;
         self.timeline.playing = false;
     }
@@ -987,6 +996,15 @@ impl NexirApp {
                     log::warn!("compile_export_graph: clip source_id={:?} has no registered path", clip.source_id);
                 }
                 // Fallthrough to YUV path if still image failed to load.
+            }
+
+            if let nexir::timeline::store::ClipKind::Text { text, font_size, color } = &clip.kind {
+                log::info!("compile_export_graph: clip source_id={:?} detected as Text", clip.source_id);
+                let cached = self.text_cache.lock().unwrap().get_or_create(device, text, *font_size, *color);
+                let rgba_id = ResourceId::next(&mut id_counter);
+                compiler.add_node(Box::new(nexir::render::text_cache::TextUploadNode::new(cached, rgba_id)));
+                comp_node.input_textures.push(rgba_id);
+                continue;
             }
 
             let tier = (clip.texture_slot >> 16) as u8;

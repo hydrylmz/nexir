@@ -148,11 +148,16 @@ impl From<ProjectFile> for Project {
         // Verify data consistency.
         debug_assert_eq!(registry.len(), pf.sources.ids.len());
 
+        let mut clips = pf.clips;
+        if clips.kind.is_empty() && !clips.is_empty() {
+            clips.kind.resize(clips.len(), crate::timeline::store::ClipKind::Video);
+        }
+
         Project {
             name: pf.name,
             settings: pf.settings,
             tracks: pf.tracks,
-            clips: pf.clips,
+            clips,
             sources: Arc::new(std::sync::RwLock::new(registry)),
         }
     }

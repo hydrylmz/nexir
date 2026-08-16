@@ -17,8 +17,9 @@ use crate::render::nodes::yuv_to_rgb::YuvToRgbNode;
 use crate::render::nodes::yuv_upload::YuvUploadNode;
 use crate::render::resource::ResourceId;
 use crate::render::shader::registry::ShaderRegistry;
+use crate::render::still_image::StillImageCache;
 use crate::scheduler::frame_scheduler::FrameScheduler;
-use crate::timeline::source::{ColorSpace, SourceRegistry};
+use crate::timeline::source::{ColorSpace, SourceRegistry, is_still_image_path};
 use crate::timeline::store::TimelineStore;
 use crate::timeline::track::TrackList;
 use std::sync::Arc;
@@ -45,6 +46,10 @@ struct ClipSignature {
     clip_width: u32,
     clip_height: u32,
     is_nv12: bool,
+    /// True when this clip is a still image (PNG/JPEG/etc).  Still images use
+    /// `StillImageUploadNode` instead of `YuvUploadNode → YuvToRgbNode`, so a
+    /// change in this flag must trigger graph recompilation.
+    is_still_image: bool,
 }
 
 pub struct ExportRenderer {
@@ -58,12 +63,17 @@ pub struct ExportRenderer {
     shaders: Arc<ShaderRegistry>,
     compute_cache: Arc<ComputePipelineCache>,
 
+    /// Cache for still-image CPU decoding + GPU staging buffers.
+    still_image_cache: StillImageCache,
+
     /// Current compiled render graph (None before first frame).
     cached_graph: Option<CompiledGraph>,
     /// Clip signatures that the current cached graph was built for.
     cached_sig: Vec<ClipSignature>,
-    /// Indices of the YuvUploadNodes inside the cached graph (one per clip).
-    upload_indices: Vec<usize>,
+    /// Indices of the YuvUploadNodes inside the cached graph (one per YUV clip).
+    /// Still-image clips do not have an entry here — their upload node writes its
+    /// staging buffer at load time and is a no-op during `upload_frame_data`.
+    upload_indices: Vec<Option<usize>>,
 
     pub frames_done: usize,
 }
@@ -97,6 +107,7 @@ impl ExportRenderer {
             sources,
             shaders,
             compute_cache,
+            still_image_cache: StillImageCache::default(),
             cached_graph: None,
             cached_sig: Vec::new(),
             upload_indices: Vec::new(),
@@ -104,26 +115,43 @@ impl ExportRenderer {
         }
     }
 
-    /// Compute the clip signature for `frame`.
-    fn signature(frame: &FrameState) -> Vec<ClipSignature> {
+    /// Compute the clip signature for `frame`, consulting the source registry
+    /// to detect still images.
+    fn signature(frame: &FrameState, sources: &SourceRegistry) -> Vec<ClipSignature> {
         frame
             .clips
             .iter()
-            .map(|c| ClipSignature {
-                clip_width: c.clip_width,
-                clip_height: c.clip_height,
-                is_nv12: c.is_nv12,
+            .map(|c| {
+                let is_still = sources
+                    .path(c.source_id)
+                    .map(|p| is_still_image_path(p.as_ref()))
+                    .unwrap_or(false);
+                ClipSignature {
+                    clip_width: c.clip_width,
+                    clip_height: c.clip_height,
+                    is_nv12: c.is_nv12,
+                    is_still_image: is_still,
+                }
             })
             .collect()
     }
 
     /// Compile (or reuse the cached) render graph for the active clips in `frame`.
     ///
-    /// Recompilation happens only when the number of active clips or their
-    /// dimensions change — typically at segment boundaries or on the very first
-    /// frame. Within a single clip's span the graph is reused every frame.
+    /// Recompilation happens only when the number of active clips, their
+    /// dimensions, or their still-image flag changes — typically at segment
+    /// boundaries or on the very first frame.  Within a single clip's span the
+    /// graph is reused every frame.
+    ///
+    /// Still-image clips (PNG, JPEG, etc.) bypass the YUV pipeline entirely:
+    /// a `StillImageUploadNode` copies the pre-decoded Rgba16Float staging
+    /// buffer directly into the composite input texture, avoiding the green-box
+    /// artefact that the YUV path produces for non-YUV pixel data.
     fn ensure_graph(&mut self, frame: &FrameState) -> Result<(), RenderError> {
-        let sig = Self::signature(frame);
+        let sig = {
+            let sources = self.sources.read().unwrap();
+            Self::signature(frame, &sources)
+        };
 
         if self.cached_graph.is_some() && self.cached_sig == sig {
             return Ok(()); // cache hit — nothing to do
@@ -146,12 +174,47 @@ impl ExportRenderer {
             wgpu::TextureFormat::Rgba16Float,
         );
 
-        let mut upload_indices = Vec::with_capacity(sig.len());
+        // `upload_indices` maps clip slot → YuvUploadNode index in the graph.
+        // Still-image clips are stored as `None` — they have no YuvUploadNode.
+        let mut upload_indices: Vec<Option<usize>> = Vec::with_capacity(sig.len());
 
-        for (slot, clip) in frame.clips.iter().enumerate() {
-            let y_id = ResourceId::next(&mut id_counter);
-            let uv_id = ResourceId::next(&mut id_counter);
+        for (slot, (clip, clip_sig)) in frame.clips.iter().zip(sig.iter()).enumerate() {
             let rgba_id = ResourceId::next(&mut id_counter);
+
+            if clip_sig.is_still_image {
+                // ── Still-image path ──────────────────────────────────────────
+                // Load the PNG/JPEG once; subsequent frames reuse the cache.
+                let path = {
+                    let sources = self.sources.read().unwrap();
+                    sources.path(clip.source_id).map(|p| p.to_path_buf())
+                };
+
+                if let Some(path) = path {
+                    if let Some(cached) = self.still_image_cache.get_or_load(&self.device, &path) {
+                        compiler.add_node(Box::new(
+                            crate::render::still_image::StillImageUploadNode::new(cached, rgba_id),
+                        ));
+                        comp_node.input_textures.push(rgba_id);
+                        upload_indices.push(None);
+                        continue;
+                    } else {
+                        log::warn!(
+                            "[export] slot {slot}: failed to load still image {:?}, skipping clip",
+                            path
+                        );
+                    }
+                } else {
+                    log::warn!("[export] slot {slot}: still image has no registered path, skipping");
+                }
+
+                // If load failed, push a sentinel so the slot count stays in sync.
+                upload_indices.push(None);
+                continue;
+            }
+
+            // ── YUV video path ────────────────────────────────────────────────
+            let y_id  = ResourceId::next(&mut id_counter);
+            let uv_id = ResourceId::next(&mut id_counter);
 
             // Create YuvUpload with the clip's ACTUAL dimensions so the GPU
             // textures are exactly the right size — no wasted rows, no green fill.
@@ -165,7 +228,7 @@ impl ExportRenderer {
             );
 
             let node_idx = compiler.add_node(Box::new(upload_node));
-            upload_indices.push(node_idx);
+            upload_indices.push(Some(node_idx));
 
             // YuvToRgb operates on clip dimensions and outputs an RGBA texture
             // at clip resolution.  The Composite node handles letterboxing via
@@ -204,8 +267,11 @@ impl ExportRenderer {
         Ok(())
     }
 
-    /// Upload YUV data for every active clip into the staging buffers of the
-    /// corresponding `YuvUploadNode`s in the compiled graph.
+    /// Upload YUV data for every active *video* clip into the staging buffers
+    /// of the corresponding `YuvUploadNode`s in the compiled graph.
+    ///
+    /// Still-image clips are skipped — their staging buffer is written once at
+    /// load time by `StillImageCache::get_or_load` and never needs refreshing.
     ///
     /// The graph must have been compiled by `ensure_graph` before calling this.
     fn upload_frame_data(&mut self, frame: &FrameState) {
@@ -219,7 +285,12 @@ impl ExportRenderer {
                 break;
             }
 
-            let node_idx = self.upload_indices[slot_idx];
+            // None means this slot is a still image — no YUV upload needed.
+            let node_idx = match self.upload_indices[slot_idx] {
+                Some(idx) => idx,
+                None => continue,
+            };
+
             let node = &mut nodes[node_idx];
 
             if let Some(upload) = node

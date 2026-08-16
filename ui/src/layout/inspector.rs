@@ -14,6 +14,11 @@ pub struct InspectorState {
     pub audio_muted: bool,
     pub speed: f32,
 
+    // Text clip editing
+    pub text_content: String,
+    pub font_size: f32,
+    pub text_color: [f32; 4],
+
     /// The clip store-index we last loaded values from.
     /// Used to detect when the selection changes so we can reload.
     last_loaded_clip: Option<usize>,
@@ -31,6 +36,9 @@ impl Default for InspectorState {
             pan: 0.0,
             audio_muted: false,
             speed: 1.0,
+            text_content: String::new(),
+            font_size: 48.0,
+            text_color: [1.0, 1.0, 1.0, 1.0],
             last_loaded_clip: None,
         }
     }
@@ -75,6 +83,19 @@ fn draw_inner(
             state.pan = project.clips.pan_at(idx) * 100.0;
             state.audio_muted = project.clips.audio_muted_at(idx);
             state.speed = project.clips.speed_at(idx);
+            // Load text clip properties
+            match project.clips.kind_at(idx) {
+                nexir::timeline::store::ClipKind::Text { text, font_size, color } => {
+                    state.text_content = text.clone();
+                    state.font_size = *font_size;
+                    state.text_color = *color;
+                }
+                _ => {
+                    state.text_content = String::new();
+                    state.font_size = 48.0;
+                    state.text_color = [1.0, 1.0, 1.0, 1.0];
+                }
+            }
         } else {
             *state = InspectorState::default();
         }
@@ -151,6 +172,48 @@ fn draw_inner(
                 );
             });
             ui.add_space(6.0);
+
+            // ── Text (only shown for Text clips) ─────────────────────────
+            let is_text_clip = matches!(
+                project.clips.kind_at(idx),
+                nexir::timeline::store::ClipKind::Text { .. }
+            );
+            if is_text_clip {
+                let mut text_changed = false;
+                ui.collapsing("T  Text", |ui| {
+                    egui::Grid::new("text_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Content");
+                            text_changed |= ui.text_edit_singleline(&mut state.text_content).changed();
+                            ui.end_row();
+
+                            ui.label("Font Size");
+                            text_changed |= ui
+                                .add(egui::Slider::new(&mut state.font_size, 10.0..=200.0).suffix("pt"))
+                                .changed();
+                            ui.end_row();
+
+                            ui.label("Color");
+                            let mut rgb = [state.text_color[0], state.text_color[1], state.text_color[2]];
+                            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                state.text_color = [rgb[0], rgb[1], rgb[2], state.text_color[3]];
+                                text_changed = true;
+                            }
+                            ui.end_row();
+                        });
+                });
+                if text_changed {
+                    history.record(project);
+                    project.clips.set_kind_at(idx, nexir::timeline::store::ClipKind::Text {
+                        text: state.text_content.clone(),
+                        font_size: state.font_size,
+                        color: state.text_color,
+                    });
+                }
+                ui.add_space(6.0);
+            }
 
             // ── Transform ────────────────────────────────────────────────
             let mut transform_changed = false;

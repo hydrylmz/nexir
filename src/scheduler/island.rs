@@ -20,6 +20,7 @@ pub struct IslandClip {
     pub clip_height:  u32,
     pub effect_start: u32,
     pub effect_count: u16,
+    pub kind:         crate::timeline::store::ClipKind,
 }
 
 /// A group of clips that can be decoded in parallel (one island per track).
@@ -53,6 +54,8 @@ pub fn build_islands(
         let (clip_width, clip_height) = source_reg.video_info(source_id)
             .map(|i| (i.width, i.height))
             .unwrap_or((1920, 1080));
+        
+        let kind = store.kind_at(idx).clone();
 
         let clip = IslandClip {
             store_index: idx,
@@ -65,6 +68,7 @@ pub fn build_islands(
             clip_height,
             effect_start,
             effect_count,
+            kind,
         };
 
         island_map.entry(track_id)

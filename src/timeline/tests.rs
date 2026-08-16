@@ -53,6 +53,7 @@ mod tests {
         let p1 = ClipInsertParams {
             track_id: TrackId(0),
             source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 0,
             pts_out: 100,
             source_in: 0,
@@ -68,6 +69,7 @@ mod tests {
         let p2 = ClipInsertParams {
             track_id: TrackId(0),
             source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 50,
             pts_out: 200,
             source_in: 0,
@@ -83,6 +85,7 @@ mod tests {
         let p3 = ClipInsertParams {
             track_id: TrackId(0),
             source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 150,
             pts_out: 300,
             source_in: 0,
@@ -141,6 +144,7 @@ mod tests {
             .insert_clip(ClipInsertParams {
                 track_id: track,
                 source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
                 pts_in: 0,
                 pts_out: 100,
                 source_in: 0,
@@ -158,6 +162,7 @@ mod tests {
             .insert_clip(ClipInsertParams {
                 track_id: track,
                 source_id: SourceId(1),
+            kind: crate::timeline::store::ClipKind::Video,
                 pts_in: 0,
                 pts_out: 100,
                 source_in: 0,
@@ -188,6 +193,7 @@ mod tests {
             .insert_clip(ClipInsertParams {
                 track_id: track1,
                 source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
                 pts_in: 0,
                 pts_out: 100,
                 source_in: 0,
@@ -206,6 +212,7 @@ mod tests {
             .insert_clip(ClipInsertParams {
                 track_id: track1,
                 source_id: SourceId(1),
+            kind: crate::timeline::store::ClipKind::Video,
                 pts_in: 100,
                 pts_out: 200,
                 source_in: 0,
@@ -225,6 +232,7 @@ mod tests {
             .insert_clip(ClipInsertParams {
                 track_id: track1,
                 source_id: SourceId(2),
+            kind: crate::timeline::store::ClipKind::Video,
                 pts_in: 200,
                 pts_out: 300,
                 source_in: 0,
@@ -253,16 +261,19 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 300, pts_out: 400, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
             volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let p2 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
             volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let p3 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 200, pts_out: 300, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
             volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
@@ -278,11 +289,13 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 50, pts_out: 200, source_in: 1000, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
             volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let p2 = ClipInsertParams {
             track_id: TrackId(1), source_id: SourceId(1),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 50, pts_out: 200, source_in: 1000, layer_order: 1, opacity: 1.0, transform: ClipTransform::identity(),
             volume: 1.0, pan: 0.0, audio_muted: false, speed: 2.0, pitch: 0.0,
         };
@@ -305,6 +318,7 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 0, pts_out: 100, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
             volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
@@ -321,6 +335,7 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
             volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
@@ -337,11 +352,13 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 100, pts_out: 200, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
             volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
         let p2 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 200, pts_out: 300, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
             volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
@@ -367,6 +384,7 @@ mod tests {
         let mut store = TimelineStore::new();
         let p1 = ClipInsertParams {
             track_id: TrackId(0), source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 100, pts_out: 100, source_in: 0, layer_order: 0, opacity: 1.0, transform: ClipTransform::identity(),
             volume: 1.0, pan: 0.0, audio_muted: false, speed: 1.0, pitch: 0.0,
         };
@@ -392,6 +410,7 @@ mod tests {
         let p1 = ClipInsertParams {
             track_id: TrackId(0),
             source_id: SourceId(1),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 0,
             pts_out: 10,
             source_in: 0,
@@ -412,6 +431,7 @@ mod tests {
         let p2 = ClipInsertParams {
             track_id: TrackId(0),
             source_id: SourceId(2),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 3,
             pts_out: 8,
             source_in: 0,
@@ -457,6 +477,7 @@ mod tests {
         let p1 = ClipInsertParams {
             track_id: TrackId(0),
             source_id: SourceId(1),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 0,
             pts_out: 10,
             source_in: 0,
@@ -474,6 +495,7 @@ mod tests {
         let p2 = ClipInsertParams {
             track_id: TrackId(0),
             source_id: SourceId(2),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 10,
             pts_out: 15,
             source_in: 0,
@@ -516,6 +538,7 @@ mod tests {
         let p1 = ClipInsertParams {
             track_id: TrackId(0),
             source_id: SourceId(1),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 0,
             pts_out: 10,
             source_in: 0,
@@ -534,6 +557,7 @@ mod tests {
         let p2 = ClipInsertParams {
             track_id: TrackId(1),
             source_id: SourceId(1),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 0,
             pts_out: 10,
             source_in: 0,
@@ -553,6 +577,7 @@ mod tests {
         let p3 = ClipInsertParams {
             track_id: TrackId(0),
             source_id: SourceId(2),
+            kind: crate::timeline::store::ClipKind::Video,
             pts_in: 3,
             pts_out: 8,
             source_in: 0,

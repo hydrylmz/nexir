@@ -4,6 +4,14 @@
 use crate::timeline::ids::{ClipId, TrackId, SourceId};
 use crate::timeline::transform::ClipTransform;
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ClipKind {
+    Video,
+    Audio,
+    Image,
+    Text { text: String, font_size: f32, color: [f32; 4] },
+}
+
 /// The central SoA clip metadata store.
 /// INVARIANT: all Vec fields have identical length at all times.
 /// INVARIANT: pts_in[i] <= pts_in[i+1] for all i  (sorted ascending).
@@ -19,6 +27,10 @@ pub struct TimelineStore {
     pub(crate) pts_in:       Vec<i64>,
     pub(crate) pts_out:      Vec<i64>,
     pub(crate) source_in:    Vec<i64>,
+
+    // --- identity / kind ---
+    #[serde(default)] // for backward compatibility
+    pub(crate) kind:         Vec<ClipKind>,
 
     // --- compositing (read every frame for active clips, but less hot than time) ---
     pub(crate) layer_order:  Vec<u16>,
@@ -56,6 +68,7 @@ impl TimelineStore {
             pts_in: Vec::new(),
             pts_out: Vec::new(),
             source_in: Vec::new(),
+            kind: Vec::new(),
             layer_order: Vec::new(),
             opacity: Vec::new(),
             transform: Vec::new(),
@@ -91,6 +104,7 @@ impl TimelineStore {
         assert_eq!(self.pts_in.len(), n);
         assert_eq!(self.pts_out.len(), n);
         assert_eq!(self.source_in.len(), n);
+        assert_eq!(self.kind.len(), n);
         assert_eq!(self.layer_order.len(), n);
         assert_eq!(self.opacity.len(), n);
         assert_eq!(self.transform.len(), n);
@@ -133,6 +147,14 @@ impl TimelineStore {
 
     pub fn source_in_at(&self, idx: usize) -> i64 {
         self.source_in[idx]
+    }
+
+    pub fn kind_at(&self, idx: usize) -> &ClipKind {
+        &self.kind[idx]
+    }
+
+    pub fn set_kind_at(&mut self, idx: usize, kind: ClipKind) {
+        self.kind[idx] = kind;
     }
 
     pub fn layer_order_at(&self, idx: usize) -> u16 {

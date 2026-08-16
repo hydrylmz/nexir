@@ -14,6 +14,7 @@ pub enum MediaKind {
     Video,
     Audio,
     Image,
+    Text,
 }
 
 impl MediaEntry {
@@ -46,7 +47,20 @@ impl MediaEntry {
             MediaKind::Video => "🎬",
             MediaKind::Audio => "🔊",
             MediaKind::Image => "🖼",
+            MediaKind::Text => "T",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LibraryPanel {
+    MediaPool,
+    Text,
+}
+
+impl Default for LibraryPanel {
+    fn default() -> Self {
+        Self::MediaPool
     }
 }
 
@@ -56,6 +70,7 @@ pub struct MediaPoolState {
     pub selected: Option<usize>,
     pub pending_import: Option<Vec<PathBuf>>,
     pub dragging_item: Option<MediaEntry>,
+    pub active_panel: LibraryPanel,
 }
 
 impl Default for MediaPoolState {
@@ -65,11 +80,99 @@ impl Default for MediaPoolState {
             selected: None,
             pending_import: None,
             dragging_item: None,
+            active_panel: LibraryPanel::default(),
         }
     }
 }
 
 pub fn draw(ui: &mut Ui, state: &mut MediaPoolState) {
+    ui.horizontal(|ui| {
+        // --- Left Vertical Bar ---
+        ui.vertical(|ui| {
+            ui.set_width(40.0);
+            ui.add_space(8.0);
+            
+            let button_size = egui::vec2(36.0, 36.0);
+            
+            ui.vertical_centered(|ui| {
+                let media_selected = state.active_panel == LibraryPanel::MediaPool;
+                let media_color = if media_selected { Color32::WHITE } else { Color32::GRAY };
+                let media_bg = if media_selected { Color32::from_rgb(60, 60, 60) } else { Color32::TRANSPARENT };
+                let media_btn = egui::Button::new(RichText::new("🎬").color(media_color).size(20.0))
+                    .fill(media_bg)
+                    .min_size(button_size);
+                
+                if ui.add(media_btn).on_hover_text("Media Pool").clicked() {
+                    state.active_panel = LibraryPanel::MediaPool;
+                }
+                
+                ui.add_space(8.0);
+                
+                let text_selected = state.active_panel == LibraryPanel::Text;
+                let text_color = if text_selected { Color32::WHITE } else { Color32::GRAY };
+                let text_bg = if text_selected { Color32::from_rgb(60, 60, 60) } else { Color32::TRANSPARENT };
+                let text_btn = egui::Button::new(RichText::new("T").color(text_color).size(20.0))
+                    .fill(text_bg)
+                    .min_size(button_size);
+                
+                if ui.add(text_btn).on_hover_text("Text Overlays").clicked() {
+                    state.active_panel = LibraryPanel::Text;
+                }
+            });
+        });
+        
+        ui.separator();
+        
+        // --- Main Content Area ---
+        ui.vertical(|ui| {
+            match state.active_panel {
+                LibraryPanel::MediaPool => draw_media_pool(ui, state),
+                LibraryPanel::Text => draw_text_panel(ui, state),
+            }
+        });
+    });
+}
+
+fn draw_text_panel(ui: &mut Ui, state: &mut MediaPoolState) {
+    ui.horizontal(|ui| {
+        ui.strong(RichText::new("Text").color(Color32::WHITE));
+    });
+    ui.separator();
+    ui.add_space(20.0);
+    
+    let text_entry = MediaEntry {
+        path: PathBuf::from("nexir://internal/text"),
+        name: "Basic Text".to_string(),
+        kind: MediaKind::Text,
+    };
+    
+    let response = egui::Frame::none()
+        .fill(Color32::from_rgb(32, 32, 32))
+        .inner_margin(egui::Margin::symmetric(16.0, 16.0))
+        .rounding(8.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width() - 20.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("T").size(24.0));
+                ui.add_space(8.0);
+                ui.label(RichText::new("Basic Text").size(16.0));
+            });
+        })
+        .response
+        .interact(egui::Sense::click_and_drag());
+        
+    if response.drag_started() {
+        state.dragging_item = Some(text_entry.clone());
+    }
+    
+    if response.dragged() {
+        egui::show_tooltip_at_pointer(ui.ctx(), egui::Id::new("drag_text_tooltip"), |ui| {
+            ui.label("T Basic Text");
+        });
+    }
+}
+
+fn draw_media_pool(ui: &mut Ui, state: &mut MediaPoolState) {
     // ── Header ────────────────────────────────────────────────────────
     ui.horizontal(|ui| {
         ui.strong(RichText::new("Media Pool").color(Color32::WHITE));

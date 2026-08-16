@@ -17,6 +17,7 @@ pub struct ClipRenderEntry {
     pub transform:     ClipTransform,
     pub opacity:       f32,
     pub is_nv12:       bool,
+    pub kind:          crate::timeline::store::ClipKind,
 }
 
 /// Everything the graph needs for one frame.

@@ -3,7 +3,10 @@
 use crate::audio::ring_buffer::AudioRingBuffer;
 use crate::sync::master_clock::MasterClock;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Shared list of per-clip ring buffers that the CPAL callback mixes from.
+pub type MixerBusList = Arc<Mutex<Vec<Arc<AudioRingBuffer>>>>;
 
 pub struct AudioOutputStream {
     /// cpal stream handle. Kept alive as long as audio should play.
@@ -15,7 +18,7 @@ pub struct AudioOutputStream {
 impl AudioOutputStream {
     /// Open the default audio output device and start streaming.
     pub fn open(
-        ring: Arc<AudioRingBuffer>,
+        mixer_bufs: MixerBusList,
         clock: Arc<MasterClock>,
     ) -> Result<Self, AudioStreamError> {
         let host = cpal::default_host();
@@ -29,14 +32,14 @@ impl AudioOutputStream {
             buffer_size: cpal::BufferSize::Fixed(1024),
         };
 
-        let ring_cb = Arc::clone(&ring);
+        let mixer_cb = Arc::clone(&mixer_bufs);
         let clock_cb = Arc::clone(&clock);
 
         let stream = device
             .build_output_stream(
                 &config,
                 move |output: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                    audio_callback(output, &ring_cb, &clock_cb);
+                    audio_callback(output, &mixer_cb, &clock_cb);
                 },
                 move |err| {
                     eprintln!("cpal stream error: {err}");
@@ -62,10 +65,42 @@ impl AudioOutputStream {
     }
 }
 
-/// The real-time audio callback.
-fn audio_callback(output: &mut [f32], ring: &AudioRingBuffer, clock: &MasterClock) {
-    let read_elements = ring.read(output);
-    clock.advance_samples(read_elements / 2);
+/// Real-time audio callback: mixes all active per-clip ring buffers into `output`.
+/// Runs on the CPAL audio thread — must never block or allocate.
+fn audio_callback(output: &mut [f32], mixer_bufs: &MixerBusList, clock: &MasterClock) {
+    let bufs = match mixer_bufs.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            output.fill(0.0);
+            return;
+        }
+    };
+
+    output.fill(0.0);
+    clock.advance_samples(output.len() / 2);
+
+    if bufs.is_empty() {
+        return;
+    }
+
+    // Allocate a temporary scratch buffer on the stack (max 4096 samples = 1024 stereo frames).
+    // Heap allocation is avoided — the CPAL buffer size is fixed at 1024 frames = 2048 samples.
+    let mut scratch = [0.0f32; 2048];
+    let n = output.len().min(scratch.len());
+
+    for buf in bufs.iter() {
+        let scratch_slice = &mut scratch[..n];
+        scratch_slice.fill(0.0);
+        buf.read(scratch_slice);
+        for (out, &s) in output.iter_mut().zip(scratch_slice.iter()) {
+            *out += s;
+        }
+    }
+
+    // Hard clip.
+    for s in output.iter_mut() {
+        *s = s.clamp(-1.0, 1.0);
+    }
 }
 
 #[derive(Debug)]

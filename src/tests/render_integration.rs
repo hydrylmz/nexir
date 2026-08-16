@@ -123,8 +123,8 @@ mod render_integration {
         );
 
         let mut frame = FrameState::test_empty(W, H);
-        frame.clips.push(ClipRenderEntry { source_id: SourceId(0), texture_slot: 0, layer_order: 0, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 1.0, is_nv12: false });
-        frame.clips.push(ClipRenderEntry { source_id: SourceId(1), texture_slot: 1, layer_order: 1, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 0.5, is_nv12: false });
+        frame.clips.push(ClipRenderEntry { source_id: SourceId(0), texture_slot: 0, layer_order: 0, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 1.0, is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
+        frame.clips.push(ClipRenderEntry { source_id: SourceId(1), texture_slot: 1, layer_order: 1, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 0.5, is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
         frame.sort_clips();
 
         let mut compiler = RenderGraphCompiler::new();

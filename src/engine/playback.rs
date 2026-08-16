@@ -58,7 +58,8 @@ impl PlaybackEngine {
     ) -> Result<Self, crate::audio::output_stream::AudioStreamError> {
         let clock = MasterClock::new(project_tb, crate::audio::audio_decoder::OUT_SAMPLE_RATE);
 
-        let audio_stream = AudioOutputStream::open(Arc::clone(&ring), Arc::clone(&clock))?;
+        let mixer_bufs = std::sync::Arc::new(std::sync::Mutex::new(vec![Arc::clone(&ring)]));
+        let audio_stream = AudioOutputStream::open(mixer_bufs, Arc::clone(&clock))?;
 
         let corrector = DriftCorrector::new(Arc::clone(&clock));
         let decider =
