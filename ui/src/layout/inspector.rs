@@ -18,9 +18,15 @@ pub struct InspectorState {
     pub text_content: String,
     pub font_size: f32,
     pub text_color: [f32; 4],
+    // Stroke
+    pub stroke_enabled: bool,
+    pub stroke_color: [f32; 3],
+    pub stroke_width: f32,
+    // Background
+    pub bg_enabled: bool,
+    pub bg_color: [f32; 4],
 
     /// The clip store-index we last loaded values from.
-    /// Used to detect when the selection changes so we can reload.
     last_loaded_clip: Option<usize>,
 }
 
@@ -39,6 +45,11 @@ impl Default for InspectorState {
             text_content: String::new(),
             font_size: 48.0,
             text_color: [1.0, 1.0, 1.0, 1.0],
+            stroke_enabled: false,
+            stroke_color: [0.0, 0.0, 0.0],
+            stroke_width: 2.0,
+            bg_enabled: false,
+            bg_color: [0.0, 0.0, 0.0, 0.85],
             last_loaded_clip: None,
         }
     }
@@ -85,10 +96,25 @@ fn draw_inner(
             state.speed = project.clips.speed_at(idx);
             // Load text clip properties
             match project.clips.kind_at(idx) {
-                nexir::timeline::store::ClipKind::Text { text, font_size, color } => {
+                nexir::timeline::store::ClipKind::Text {
+                    text, font_size, color, stroke_color, stroke_width, background_color
+                } => {
                     state.text_content = text.clone();
                     state.font_size = *font_size;
                     state.text_color = *color;
+                    if let Some(sc) = stroke_color {
+                        state.stroke_enabled = true;
+                        state.stroke_color = [sc[0], sc[1], sc[2]];
+                    } else {
+                        state.stroke_enabled = false;
+                    }
+                    state.stroke_width = *stroke_width;
+                    if let Some(bg) = background_color {
+                        state.bg_enabled = true;
+                        state.bg_color = *bg;
+                    } else {
+                        state.bg_enabled = false;
+                    }
                 }
                 _ => {
                     state.text_content = String::new();
@@ -202,6 +228,38 @@ fn draw_inner(
                                 text_changed = true;
                             }
                             ui.end_row();
+
+                            // ── Stroke ────────────────────────────────────
+                            ui.label("Stroke");
+                            text_changed |= ui.checkbox(&mut state.stroke_enabled, "").changed();
+                            ui.end_row();
+
+                            if state.stroke_enabled {
+                                ui.label("  Color");
+                                if ui.color_edit_button_rgb(&mut state.stroke_color).changed() {
+                                    text_changed = true;
+                                }
+                                ui.end_row();
+
+                                ui.label("  Width");
+                                text_changed |= ui
+                                    .add(egui::Slider::new(&mut state.stroke_width, 0.5..=20.0).suffix("px"))
+                                    .changed();
+                                ui.end_row();
+                            }
+
+                            // ── Background ────────────────────────────────
+                            ui.label("Background");
+                            text_changed |= ui.checkbox(&mut state.bg_enabled, "").changed();
+                            ui.end_row();
+
+                            if state.bg_enabled {
+                                ui.label("  Color");
+                                if ui.color_edit_button_rgba_unmultiplied(&mut state.bg_color).changed() {
+                                    text_changed = true;
+                                }
+                                ui.end_row();
+                            }
                         });
                 });
                 if text_changed {
@@ -210,6 +268,17 @@ fn draw_inner(
                         text: state.text_content.clone(),
                         font_size: state.font_size,
                         color: state.text_color,
+                        stroke_color: if state.stroke_enabled {
+                            Some([state.stroke_color[0], state.stroke_color[1], state.stroke_color[2], 1.0])
+                        } else {
+                            None
+                        },
+                        stroke_width: state.stroke_width,
+                        background_color: if state.bg_enabled {
+                            Some(state.bg_color)
+                        } else {
+                            None
+                        },
                     });
                 }
                 ui.add_space(6.0);

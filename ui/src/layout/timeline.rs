@@ -1621,7 +1621,11 @@ pub fn draw(
                                 text: "Basic Text".to_string(),
                                 font_size: 48.0,
                                 color: [1.0, 1.0, 1.0, 1.0],
+                                stroke_color: None,
+                                stroke_width: 2.0,
+                                background_color: None,
                             }
+
                         } else {
                             nexir::timeline::store::ClipKind::Video
                         },

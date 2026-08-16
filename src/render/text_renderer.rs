@@ -4,8 +4,15 @@ use imageproc::drawing::draw_text_mut;
 
 const DEFAULT_FONT: &[u8] = include_bytes!("../../assets/Roboto-Regular.ttf");
 
-/// Measure the pixel dimensions of `text` rendered at `font_size` without
-/// allocating a pixel buffer. Used by the scheduler hot path.
+/// Background padding relative to font_size (adds breathing room around text).
+const BG_PADDING_RATIO: f32 = 0.15;
+
+/// Number of directions used for stroke simulation.
+const STROKE_ANGLES: usize = 16;
+
+/// Measure the pixel dimensions of `text` at `font_size` **including** padding
+/// that will be added when stroke or background is present. This ensures the
+/// scheduler gives us the correct clip_width/clip_height.
 pub fn measure_text(text: &str, font_size: f32) -> (u32, u32) {
     if text.is_empty() {
         return (1, 1);
@@ -16,10 +23,16 @@ pub fn measure_text(text: &str, font_size: f32) -> (u32, u32) {
     (w.max(1) as u32, h.max(1) as u32)
 }
 
-/// Rasterize `text` into a tight-cropped RGBA8 buffer.
-/// Returns (width, height, rgba_bytes).
-/// Background pixels are fully transparent (alpha = 0).
-pub fn rasterize_text(text: &str, font_size: f32, color: [f32; 4]) -> (u32, u32, Vec<u8>) {
+/// Full-featured rasterisation: optional background fill, optional stroke outline, text.
+/// Returns (width, height, rgba8_bytes).
+pub fn rasterize_text(
+    text: &str,
+    font_size: f32,
+    color: [f32; 4],
+    stroke_color: Option<[f32; 4]>,
+    stroke_width: f32,
+    background_color: Option<[f32; 4]>,
+) -> (u32, u32, Vec<u8>) {
     if text.is_empty() {
         return (1, 1, vec![0; 4]);
     }
@@ -27,27 +40,71 @@ pub fn rasterize_text(text: &str, font_size: f32, color: [f32; 4]) -> (u32, u32,
     let font = Font::try_from_bytes(DEFAULT_FONT).unwrap();
     let scale = Scale::uniform(font_size);
 
-    let (width, height) = imageproc::drawing::text_size(scale, &font, text);
-    if width <= 0 || height <= 0 {
+    let (text_w, text_h) = imageproc::drawing::text_size(scale, &font, text);
+    if text_w <= 0 || text_h <= 0 {
         return (1, 1, vec![0; 4]);
     }
 
-    let width_u32 = width as u32;
-    let height_u32 = height as u32;
+    // Compute total padding: stroke bleed + optional background breathing room.
+    let stroke_pad = if stroke_color.is_some() { stroke_width.ceil() as i32 } else { 0 };
+    let bg_pad = if background_color.is_some() {
+        (font_size * BG_PADDING_RATIO).ceil() as i32
+    } else {
+        0
+    };
+    let pad = (stroke_pad + bg_pad).max(0);
 
-    // RgbaImage is zero-initialised → background pixels are (0,0,0,0) transparent.
-    let mut image = RgbaImage::new(width_u32, height_u32);
+    let width  = (text_w + pad * 2).max(1) as u32;
+    let height = (text_h + pad * 2).max(1) as u32;
 
-    let rgba_color = Rgba([
+    // Start fully transparent.
+    let mut image = RgbaImage::new(width, height);
+
+    // 1. Background fill.
+    if let Some(bg) = background_color {
+        let bg_pixel = to_rgba8(bg);
+        for pixel in image.pixels_mut() {
+            *pixel = bg_pixel;
+        }
+    }
+
+    // 2. Stroke — draw text offset in STROKE_ANGLES directions.
+    if let Some(sc) = stroke_color {
+        let stroke_pixel = to_rgba8(sc);
+        let sw = stroke_width.max(1.0);
+        for i in 0..STROKE_ANGLES {
+            let angle = (i as f32) * std::f32::consts::TAU / STROKE_ANGLES as f32;
+            let ox = (angle.cos() * sw).round() as i32;
+            let oy = (angle.sin() * sw).round() as i32;
+            draw_text_mut(
+                &mut image,
+                stroke_pixel,
+                pad + ox,
+                pad + oy,
+                scale,
+                &font,
+                text,
+            );
+        }
+    }
+
+    // 3. Main text on top.
+    let text_pixel = Rgba([
         (color[0] * 255.0).clamp(0.0, 255.0) as u8,
         (color[1] * 255.0).clamp(0.0, 255.0) as u8,
         (color[2] * 255.0).clamp(0.0, 255.0) as u8,
-        // Use full opacity for the text pixels themselves; rusttype's
-        // sub-pixel rendering writes partial-alpha values for antialiasing.
         255u8,
     ]);
+    draw_text_mut(&mut image, text_pixel, pad, pad, scale, &font, text);
 
-    draw_text_mut(&mut image, rgba_color, 0, 0, scale, &font, text);
+    (width, height, image.into_raw())
+}
 
-    (width_u32, height_u32, image.into_raw())
+fn to_rgba8(c: [f32; 4]) -> Rgba<u8> {
+    Rgba([
+        (c[0] * 255.0).clamp(0.0, 255.0) as u8,
+        (c[1] * 255.0).clamp(0.0, 255.0) as u8,
+        (c[2] * 255.0).clamp(0.0, 255.0) as u8,
+        (c[3] * 255.0).clamp(0.0, 255.0) as u8,
+    ])
 }

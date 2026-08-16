@@ -21,25 +21,42 @@ pub struct CachedText {
     pub staging: std::sync::Arc<wgpu::Buffer>,
 }
 
+/// Cache key covers every parameter that affects the rasterized output.
 #[derive(Hash, Eq, PartialEq, Clone)]
 pub struct TextKey {
     pub text: String,
-    // Note: f32 does not implement Eq/Hash, so we use bits representation for hashing.
     pub font_size_bits: u32,
     pub color_bits: [u32; 4],
+    // Stroke
+    pub has_stroke: bool,
+    pub stroke_color_bits: [u32; 4],
+    pub stroke_width_bits: u32,
+    // Background
+    pub has_bg: bool,
+    pub bg_color_bits: [u32; 4],
 }
 
 impl TextKey {
-    pub fn new(text: &str, font_size: f32, color: [f32; 4]) -> Self {
+    pub fn new(
+        text: &str,
+        font_size: f32,
+        color: [f32; 4],
+        stroke_color: Option<[f32; 4]>,
+        stroke_width: f32,
+        background_color: Option<[f32; 4]>,
+    ) -> Self {
         Self {
             text: text.to_string(),
             font_size_bits: font_size.to_bits(),
             color_bits: [
-                color[0].to_bits(),
-                color[1].to_bits(),
-                color[2].to_bits(),
-                color[3].to_bits(),
+                color[0].to_bits(), color[1].to_bits(),
+                color[2].to_bits(), color[3].to_bits(),
             ],
+            has_stroke: stroke_color.is_some(),
+            stroke_color_bits: stroke_color.unwrap_or([0.0; 4]).map(f32::to_bits),
+            stroke_width_bits: stroke_width.to_bits(),
+            has_bg: background_color.is_some(),
+            bg_color_bits: background_color.unwrap_or([0.0; 4]).map(f32::to_bits),
         }
     }
 }
@@ -57,13 +74,17 @@ impl TextCache {
         text: &str,
         font_size: f32,
         color: [f32; 4],
+        stroke_color: Option<[f32; 4]>,
+        stroke_width: f32,
+        background_color: Option<[f32; 4]>,
     ) -> CachedText {
-        let key = TextKey::new(text, font_size, color);
+        let key = TextKey::new(text, font_size, color, stroke_color, stroke_width, background_color);
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
         }
 
-        let (width, height, rgba_data) = rasterize_text(text, font_size, color);
+        let (width, height, rgba_data) =
+            rasterize_text(text, font_size, color, stroke_color, stroke_width, background_color);
 
         // Pack pixels as Rgba16Float with 256-byte row alignment.
         let bytes_per_pixel = 8u32; // 4 channels × 2 bytes (f16)
@@ -78,7 +99,7 @@ impl TextCache {
                 let src = src_row + (x * 4) as usize;
                 let dst = dst_row + (x * bytes_per_pixel) as usize;
 
-                let sr = rgba_data[src] as f32 / 255.0;
+                let sr = rgba_data[src]     as f32 / 255.0;
                 let sg = rgba_data[src + 1] as f32 / 255.0;
                 let sb = rgba_data[src + 2] as f32 / 255.0;
                 let sa = rgba_data[src + 3] as f32 / 255.0;

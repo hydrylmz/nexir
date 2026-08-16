@@ -9,7 +9,20 @@ pub enum ClipKind {
     Video,
     Audio,
     Image,
-    Text { text: String, font_size: f32, color: [f32; 4] },
+    Text {
+        text: String,
+        font_size: f32,
+        color: [f32; 4],
+        /// Stroke (outline) around each glyph. None = disabled.
+        #[serde(default)]
+        stroke_color: Option<[f32; 4]>,
+        /// Stroke thickness in pixels.
+        #[serde(default)]
+        stroke_width: f32,
+        /// Solid background fill behind the text. None = transparent.
+        #[serde(default)]
+        background_color: Option<[f32; 4]>,
+    },
 }
 
 /// The central SoA clip metadata store.

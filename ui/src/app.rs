@@ -998,14 +998,20 @@ impl NexirApp {
                 // Fallthrough to YUV path if still image failed to load.
             }
 
-            if let nexir::timeline::store::ClipKind::Text { text, font_size, color } = &clip.kind {
+            if let nexir::timeline::store::ClipKind::Text {
+                text, font_size, color, stroke_color, stroke_width, background_color
+            } = &clip.kind {
                 log::info!("compile_export_graph: clip source_id={:?} detected as Text", clip.source_id);
-                let cached = self.text_cache.lock().unwrap().get_or_create(device, text, *font_size, *color);
+                let cached = self.text_cache.lock().unwrap().get_or_create(
+                    device, text, *font_size, *color,
+                    *stroke_color, *stroke_width, *background_color,
+                );
                 let rgba_id = ResourceId::next(&mut id_counter);
                 compiler.add_node(Box::new(nexir::render::text_cache::TextUploadNode::new(cached, rgba_id)));
                 comp_node.input_textures.push(rgba_id);
                 continue;
             }
+
 
             let tier = (clip.texture_slot >> 16) as u8;
             let index = (clip.texture_slot & 0xFFFF) as u16;
