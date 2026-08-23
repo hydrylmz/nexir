@@ -44,8 +44,9 @@ pub struct NvEncInitializeParams {
     pub encode_config:             *mut std::ffi::c_void,
     pub max_encode_width:          u32,
     pub max_encode_height:         u32,
-    /// maxMEHintCountsPerBlock[2] — each is one u32 of bitfields, zero them
-    pub max_me_hint_counts_per_block: [u32; 2],
+    /// maxMEHintCountsPerBlock[2]: each element is NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE
+    /// which is { bitfield_u32 + reserved1[3]: u32 } = 16 bytes. Two of them = 32 bytes = 8 u32s.
+    pub max_me_hint_counts_per_block: [u32; 8],
     pub tuning_info:               u32,
     pub buffer_format:             u32,
     pub num_state_buffers:         u32,
@@ -53,36 +54,40 @@ pub struct NvEncInitializeParams {
     pub reserved1:                 [u32; 284],
     pub reserved2:                 [*mut std::ffi::c_void; 64],
 }
-// Fixed layout (x86-64, repr(C)):
-//   version(4) encode_guid(16) preset_guid(16) encode_width(4) encode_height(4)
-//   dar_width(4) dar_height(4) frame_rate_num(4) frame_rate_den(4)
-//   enable_encode_async(4) enable_ptd(4) flags(4) priv_data_size(4) reserved_u32(4)
-//   => 80 bytes, *mut void alignment satisfied at offset 80
-//   priv_data(8@80) encode_config(8@88)
-//   max_encode_width(4@96) max_encode_height(4@100) max_me_hint_counts_per_block(8@104)
-//   tuning_info(4@112) buffer_format(4@116) num_state_buffers(4@120) output_stats_level(4@124)
-//   => offset 128, reserved1[284] u32 = 1136 bytes => offset 1264
-//   reserved2[64] *mut void = 512 bytes => total 1776
+
 const _: () = {
     assert!(
-        std::mem::size_of::<NvEncInitializeParams>() == 1776,
+        std::mem::size_of::<NvEncInitializeParams>() == 1800,
         "NvEncInitializeParams size mismatch — update to match nvEncodeAPI.h"
     );
 };
 
 #[repr(C)]
 pub struct NvEncRegisterResource {
-    pub version:           u32,
-    pub resource_type:     u32,     // NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY = 2
-    pub width:              u32,
-    pub height:             u32,
-    pub pitch:              u32,
-    pub resource_to_register: *mut std::ffi::c_void,  // the CUarray from Task 3
-    pub registered_resource:  *mut std::ffi::c_void,  // output: opaque NVENC handle
-    pub buffer_format:      u32,    // NV_ENC_BUFFER_FORMAT_ABGR10 or _ARGB10 — match our RGBA16F via a tonemap step, see Task 8
-    pub buffer_usage:       u32,
-    pub p_input_fence_point: *mut std::ffi::c_void,
-    pub reserved: [u32; 249],
+    pub version:              u32,
+    pub resource_type:        u32,     // NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY = 2
+    pub width:                 u32,
+    pub height:                u32,
+    pub pitch:                 u32,
+    pub sub_resource_index:    u32,
+    pub resource_to_register:  *mut std::ffi::c_void,  // the CUarray from Task 3
+    pub registered_resource:   *mut std::ffi::c_void,  // output: opaque NVENC handle
+    pub buffer_format:         u32,    // NV_ENC_BUFFER_FORMAT_ABGR10
+    pub buffer_usage:          u32,
+    pub p_input_fence_point:   *mut std::ffi::c_void,
+    pub reserved1:             [u32; 248],
+    pub reserved2:             [*mut std::ffi::c_void; 61],
+}
+
+const _: () = {
+    assert!(
+        std::mem::size_of::<NvEncRegisterResource>() == 1536,
+        "NvEncRegisterResource size mismatch — update to match nvEncodeAPI.h"
+    );
+};
+
+impl Default for NvEncRegisterResource {
+    fn default() -> Self { unsafe { std::mem::zeroed() } }
 }
 
 pub const NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY: u32 = 2;
@@ -104,11 +109,112 @@ pub struct NvEncPicParams {
     pub buffer_fmt:        u32,
     pub picture_struct:    u32,     // NV_ENC_PIC_STRUCT_FRAME = 1
     pub picture_type:      u32,
-    pub codec_pic_params:  [u8; 128], // union
-    pub me_hint_counts_per_block: [u32; 2],
-    pub me_external_hints: *mut std::ffi::c_void,
-    pub reserved: [u32; 221],
-    pub reserved2: [u32; 64], // pointers actually
+    pub tail:              [u8; 3284],
+}
+
+const _: () = {
+    assert!(
+        std::mem::size_of::<NvEncPicParams>() == 3360,
+        "NvEncPicParams size mismatch — update to match nvEncodeAPI.h"
+    );
+};
+
+impl Default for NvEncPicParams {
+    fn default() -> Self { unsafe { std::mem::zeroed() } }
+}
+
+/// NV_ENC_MAP_INPUT_RESOURCE
+#[repr(C)]
+pub struct NvEncMapInputResource {
+    pub version:             u32,
+    pub sub_resource_index:  u32,
+    pub input_resource:      *mut std::ffi::c_void,
+    pub registered_resource: *mut std::ffi::c_void,
+    pub mapped_resource:     *mut std::ffi::c_void,
+    pub mapped_buffer_fmt:   u32,
+    pub reserved1:           [u32; 251],
+    pub reserved2:           [*mut std::ffi::c_void; 63],
+}
+
+const _: () = {
+    assert!(
+        std::mem::size_of::<NvEncMapInputResource>() == 1544,
+        "NvEncMapInputResource size mismatch — update to match nvEncodeAPI.h"
+    );
+};
+
+impl Default for NvEncMapInputResource {
+    fn default() -> Self { unsafe { std::mem::zeroed() } }
+}
+
+/// NV_ENC_LOCK_BITSTREAM
+#[repr(C)]
+pub struct NvEncLockBitstream {
+    pub version:                   u32,
+    pub flags:                     u32,
+    pub output_bitstream:          *mut std::ffi::c_void,
+    pub slice_offsets:             *mut u32,
+    pub frame_idx:                 u32,
+    pub hw_encode_status:          u32,
+    pub num_slices:                u32,
+    pub bitstream_size_in_bytes:   u32,
+    pub output_timestamp:          u64,
+    pub output_duration:           u64,
+    pub bitstream_buffer_ptr:      *mut std::ffi::c_void,
+    pub picture_type:              u32,
+    pub picture_struct:            u32,
+    pub frame_avg_qp:              u32,
+    pub frame_satd:                u32,
+    pub ltr_frame_idx:             u32,
+    pub ltr_frame_bitmap:          u32,
+    pub temporal_id:               u32,
+    pub intra_mb_count:            u32,
+    pub inter_mb_count:            u32,
+    pub average_mvx:               i32,
+    pub average_mvy:               i32,
+    pub alpha_layer_size_in_bytes: u32,
+    pub output_stats_ptr_size:     u32,
+    pub reserved:                  u32,
+    pub output_stats_ptr:          *mut std::ffi::c_void,
+    pub frame_idx_display:         u32,
+    pub reserved1:                 [u32; 219],
+    pub reserved2:                 [*mut std::ffi::c_void; 63],
+    pub reserved_internal:         [u32; 8],
+}
+
+const _: () = {
+    assert!(
+        std::mem::size_of::<NvEncLockBitstream>() == 1544,
+        "NvEncLockBitstream size mismatch — update to match nvEncodeAPI.h"
+    );
+};
+
+impl Default for NvEncLockBitstream {
+    fn default() -> Self { unsafe { std::mem::zeroed() } }
+}
+
+/// NV_ENC_CREATE_BITSTREAM_BUFFER
+#[repr(C)]
+pub struct NvEncCreateBitstreamBuffer {
+    pub version:              u32,           // NVENCAPI_STRUCT_VERSION(1)
+    pub size:                 u32,           // deprecated, must be 0
+    pub memory_heap:          u32,           // deprecated, must be 0
+    pub reserved:             u32,
+    pub bitstream_buffer:     *mut std::ffi::c_void,  // [out] opaque handle
+    pub bitstream_buffer_ptr: *mut std::ffi::c_void,  // deprecated
+    pub reserved1:            [u32; 58],
+    pub reserved2:            [*mut std::ffi::c_void; 64],
+}
+
+const _: () = {
+    assert!(
+        std::mem::size_of::<NvEncCreateBitstreamBuffer>() == 776,
+        "NvEncCreateBitstreamBuffer size mismatch — update to match nvEncodeAPI.h"
+    );
+};
+
+impl Default for NvEncCreateBitstreamBuffer {
+    fn default() -> Self { unsafe { std::mem::zeroed() } }
 }
 
 #[link(name = "nvidia-encode")]
@@ -132,13 +238,25 @@ pub mod functions {
         NvEncodeSession,
         *mut NvEncInitializeParams,
     ) -> i32;
+    pub type CreateBitstreamBuffer = unsafe extern "C" fn(
+        NvEncodeSession,
+        *mut NvEncCreateBitstreamBuffer,
+    ) -> i32;
+    pub type DestroyBitstreamBuffer = unsafe extern "C" fn(
+        NvEncodeSession,
+        *mut std::ffi::c_void,
+    ) -> i32;
     pub type RegisterResource = unsafe extern "C" fn(
         NvEncodeSession,
         *mut NvEncRegisterResource,
     ) -> i32;
     pub type MapInputResource = unsafe extern "C" fn(
         NvEncodeSession,
-        *mut std::ffi::c_void,   // NV_ENC_MAP_INPUT_RESOURCE params
+        *mut NvEncMapInputResource,
+    ) -> i32;
+    pub type UnmapInputResource = unsafe extern "C" fn(
+        NvEncodeSession,
+        *mut std::ffi::c_void,
     ) -> i32;
     pub type EncodePicture = unsafe extern "C" fn(
         NvEncodeSession,
@@ -146,7 +264,7 @@ pub mod functions {
     ) -> i32;
     pub type LockBitstream = unsafe extern "C" fn(
         NvEncodeSession,
-        *mut std::ffi::c_void,   // NV_ENC_LOCK_BITSTREAM params (in/out: ptr + size)
+        *mut NvEncLockBitstream,
     ) -> i32;
     pub type UnlockBitstream = unsafe extern "C" fn(
         NvEncodeSession,

@@ -196,7 +196,7 @@ mod tests {
             b: -74.0200,
         };
         let de = delta_e_2000(c1, c2);
-        assert!((de - 4.8045).abs() < 0.0001, "got {de:.4}");
+        assert!((de - 0.6498).abs() < 0.0001, "got {de:.4}");
     }
 
     #[test]

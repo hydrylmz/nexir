@@ -138,8 +138,11 @@ struct NvencFunctions {
     open_session:       functions::OpenEncodeSessionEx,
     get_preset_config:  functions::GetPresetConfig,
     initialize:         functions::InitializeEncoder,
+    create_bitstream:   functions::CreateBitstreamBuffer,
+    destroy_bitstream:  functions::DestroyBitstreamBuffer,
     register_resource:  functions::RegisterResource,
     map_input:          functions::MapInputResource,
+    unmap_input:        functions::UnmapInputResource,
     encode_picture:     functions::EncodePicture,
     lock_bitstream:     functions::LockBitstream,
     unlock_bitstream:   functions::UnlockBitstream,
@@ -167,7 +170,10 @@ pub struct EncodeInterop {
     registered_resource_0: *mut std::ffi::c_void,
     /// NVENC registered resource handle for slot 1.
     registered_resource_1: *mut std::ffi::c_void,
-    bitstream_buffer:      *mut std::ffi::c_void,
+    /// Pre-allocated bitstream output buffer for slot 0.
+    bitstream_buffer_0:    *mut std::ffi::c_void,
+    /// Pre-allocated bitstream output buffer for slot 1.
+    bitstream_buffer_1:    *mut std::ffi::c_void,
     funcs:                 NvencFunctions,
     width:                 u32,
     height:                u32,
@@ -226,16 +232,6 @@ impl EncodeInterop {
         transport: crate::interop::capability::InteropTransport,
         codec:     VideoCodec,
     ) -> Result<Self, EncodeInteropError> {
-        // NVENC uses a vtable-style C API: NvEncodeAPICreateInstance fills a
-        // function-pointer struct, and all subsequent calls go through it.
-        // We allocate the struct as a raw block and read out the function pointers.
-        // The NV_ENCODE_API_FUNCTION_LIST struct is ~2264 bytes on 64-bit:
-        //   8 bytes  — version + reserved (u32 × 2)
-        //   312 bytes — 39 function pointer slots
-        //   1944 bytes — reserved3[243] void* (the driver writes null here too!)
-        // We must allocate enough space or the driver will corrupt the heap when
-        // filling the reserved tail, causing a STATUS_FATAL_USER_CALLBACK_EXCEPTION crash.
-        // 4096 bytes (512 pointer slots) gives a comfortable margin.
         let fn_table_size = std::mem::size_of::<usize>() * 512;
         let mut fn_table_raw = vec![0u8; fn_table_size];
         let mut success = false;
@@ -264,65 +260,46 @@ impl EncodeInterop {
             return Err(EncodeInteropError::ApiLoad);
         }
 
-        // In a real implementation, we'd read function pointers from the versioned struct
-        // using offsets specified by the NVENC SDK header. For this scaffold we demonstrate
-        // the pattern; the actual field layout must match nvEncodeAPI.h exactly.
-        // We cast to function pointers at the known offsets (pointer-sized slots after version field).
-        // NVENC API Function Table Layout
-        //
-        // NvEncodeAPICreateInstance fills an NV_ENCODE_API_FUNCTION_LIST struct — a
-        // versioned C struct where the first field is a u32 version and all subsequent
-        // fields are function pointers in the order declared in nvEncodeAPI.h (NVENC SDK 12.x).
-        //
-        // The offsets below are SLOT INDICES into the function-pointer array (i.e.,
-        // `*base.add(N)` where `base` is a pointer to the first function-pointer slot
-        // immediately after the u32 version field). They MUST match the field order in
-        // nvEncodeAPI.h exactly:
-        //
-        //   Slot 1  — nvEncOpenEncodeSessionEx
-        //   Slot 2  — nvEncInitializeEncoder
-        //   Slot 8  — nvEncRegisterResource
-        //   Slot 9  — nvEncMapInputResource
-        //   Slot 11 — nvEncEncodePicture
-        //   Slot 14 — nvEncLockBitstream
-        //   Slot 15 — nvEncUnlockBitstream
-        //   Slot 22 — nvEncDestroyEncoder
-        //
-        // ⚠️  SDK VERSION WARNING: These offsets are correct for NVENC SDK API v14,
-        // which ships with CUDA 12.x drivers. If the NV_ENCODE_API_FUNCTION_LIST struct
-        // layout changes in a future major SDK version, these offsets MUST be updated to
-        // match the new nvEncodeAPI.h. Verify against the official NVENC SDK headers.
-        //
         // Pointer offsets (base.add(N)) into NV_ENCODE_API_FUNCTION_LIST:
         //   base.add(0)  = version (u32) + reserved (u32)
         //   base.add(1)  = nvEncOpenEncodeSession
-        //   base.add(12) = nvEncInitializeEncoder     (Slot 13)
-        //   base.add(17) = nvEncEncodePicture         (Slot 18)
-        //   base.add(18) = nvEncLockBitstream         (Slot 19)
-        //   base.add(19) = nvEncUnlockBitstream       (Slot 20)
-        //   base.add(26) = nvEncMapInputResource      (Slot 27)
-        //   base.add(28) = nvEncDestroyEncoder        (Slot 29)
-        //   base.add(30) = nvEncOpenEncodeSessionEx   (Slot 31)
-        //   base.add(31) = nvEncRegisterResource      (Slot 32)
+        //   base.add(10) = nvEncGetEncodePresetConfig
+        //   base.add(12) = nvEncInitializeEncoder
+        //   base.add(15) = nvEncCreateBitstreamBuffer
+        //   base.add(16) = nvEncDestroyBitstreamBuffer
+        //   base.add(17) = nvEncEncodePicture
+        //   base.add(18) = nvEncLockBitstream
+        //   base.add(19) = nvEncUnlockBitstream
+        //   base.add(26) = nvEncMapInputResource
+        //   base.add(27) = nvEncUnmapInputResource
+        //   base.add(28) = nvEncDestroyEncoder
+        //   base.add(30) = nvEncOpenEncodeSessionEx
+        //   base.add(31) = nvEncRegisterResource
         let function_list = fn_table_raw.as_ptr() as NV_ENCODE_API_FUNCTION_LIST;
         let base = function_list as *const usize;
         let funcs = unsafe {
             let open_off         = 30usize; // nvEncOpenEncodeSessionEx
-            let preset_cfg_off   = 10usize; // nvEncGetEncodePresetConfig  (SDK slot 11)
+            let preset_cfg_off   = 10usize; // nvEncGetEncodePresetConfig
             let init_off         = 12usize; // nvEncInitializeEncoder
-            let reg_off          = 31usize; // nvEncRegisterResource
-            let map_off          = 26usize; // nvEncMapInputResource
+            let create_bs_off    = 15usize; // nvEncCreateBitstreamBuffer
+            let destroy_bs_off   = 16usize; // nvEncDestroyBitstreamBuffer
             let enc_off          = 17usize; // nvEncEncodePicture
             let lock_off         = 18usize; // nvEncLockBitstream
             let unlock_off       = 19usize; // nvEncUnlockBitstream
+            let map_off          = 26usize; // nvEncMapInputResource
+            let unmap_off        = 27usize; // nvEncUnmapInputResource
             let destroy_off      = 28usize; // nvEncDestroyEncoder
+            let reg_off          = 31usize; // nvEncRegisterResource
 
             NvencFunctions {
                 open_session:      std::mem::transmute(*base.add(open_off)),
                 get_preset_config: std::mem::transmute(*base.add(preset_cfg_off)),
                 initialize:        std::mem::transmute(*base.add(init_off)),
+                create_bitstream:  std::mem::transmute(*base.add(create_bs_off)),
+                destroy_bitstream: std::mem::transmute(*base.add(destroy_bs_off)),
                 register_resource: std::mem::transmute(*base.add(reg_off)),
                 map_input:         std::mem::transmute(*base.add(map_off)),
+                unmap_input:       std::mem::transmute(*base.add(unmap_off)),
                 encode_picture:    std::mem::transmute(*base.add(enc_off)),
                 lock_bitstream:    std::mem::transmute(*base.add(lock_off)),
                 unlock_bitstream:  std::mem::transmute(*base.add(unlock_off)),
@@ -342,12 +319,6 @@ impl EncodeInterop {
         }
 
         // Step 2 — Open the encode session against our shared CUDA context.
-        // NVENC requires the CUDA context to be *current on the calling thread* (pushed
-        // onto the CUDA context stack) before nvEncOpenEncodeSessionEx is called, so it
-        // can make cuCtx* calls internally. We push it here and pop after the call.
-        //
-        // Version constants: NVENCAPI_STRUCT_VERSION(n) = api_ver | (n<<16) | (0x7<<28)
-        // The 0x7 magic marker is mandatory — NVENC crashes if it is missing.
         let open_params_ver = nvenc_struct_ver(probed_api_version, 1);
         let mut session: NvEncodeSession = std::ptr::null_mut();
         let params = NvEncOpenEncodeSessionExParams {
@@ -373,12 +344,9 @@ impl EncodeInterop {
         log::info!("[export] NVENC session opened successfully");
 
         // Step 3 — Initialise the encoder (codec, preset, dimensions, frame rate).
-        // Select the NVENC codec GUID based on the requested output codec.
         let encode_guid = match codec {
             VideoCodec::H265 => NV_ENC_CODEC_HEVC_GUID,
-            _ => NV_ENC_CODEC_H264_GUID, // H264, ProRes, VP9 fall through to H264 GUID
-                                          // (ProRes/VP9 should never reach NVENC path, but
-                                          //  this is a safe default rather than unreachable!())
+            _ => NV_ENC_CODEC_H264_GUID,
         };
         let init_params_ver = nvenc_struct_ver(probed_api_version, 5);
         let mut init_params = NvEncInitializeParams {
@@ -400,7 +368,7 @@ impl EncodeInterop {
             encode_config:                std::ptr::null_mut(),
             max_encode_width:             job.width,
             max_encode_height:            job.height,
-            max_me_hint_counts_per_block: [0u32; 2],
+            max_me_hint_counts_per_block: [0u32; 8],
             tuning_info:                  0,
             buffer_format:                0,
             num_state_buffers:            0,
@@ -421,9 +389,6 @@ impl EncodeInterop {
         }
 
         // Step 4 — Allocate two ping-pong ABGR10 interop textures (R32Uint packed).
-        //
-        // Having two textures allows the GPU to render frame N into slot N%2 while
-        // NVENC concurrently encodes the previously completed frame from slot (N-1)%2.
         let make_abgr10_texture = |label: &'static str| wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d { width: job.width, height: job.height, depth_or_array_layers: 1 },
@@ -459,7 +424,7 @@ impl EncodeInterop {
             buffer_format:        NV_ENC_BUFFER_FORMAT_ABGR10,
             buffer_usage:         0,
             p_input_fence_point:  std::ptr::null_mut(),
-            reserved: [0u32; 249],
+            ..Default::default()
         };
         let ret = unsafe { (funcs.register_resource)(session, &mut register_0) };
         if ret != NV_ENC_SUCCESS {
@@ -478,20 +443,42 @@ impl EncodeInterop {
             buffer_format:        NV_ENC_BUFFER_FORMAT_ABGR10,
             buffer_usage:         0,
             p_input_fence_point:  std::ptr::null_mut(),
-            reserved: [0u32; 249],
+            ..Default::default()
         };
         let ret = unsafe { (funcs.register_resource)(session, &mut register_1) };
         if ret != NV_ENC_SUCCESS {
-            // Unregister slot 0 before returning so we don't leak a registered resource.
-            // Slot 0 was registered successfully; NVENC requires explicit unregister on cleanup.
-            // We have no unregister fn in the table yet — destroy_encoder will handle it.
             unsafe { (funcs.destroy_encoder)(session) };
             return Err(EncodeInteropError::Register(ret));
         }
 
-        // Allocate a bitstream output buffer (opaque NVENC handle).
-        // TODO: replace with nvEncCreateBitstreamBuffer when wiring full bitstream path.
-        let bitstream_buffer: *mut std::ffi::c_void = std::ptr::null_mut();
+        // Step 6 — Allocate ping-pong bitstream output buffers.
+        let create_bs_ver = nvenc_struct_ver(probed_api_version, 1);
+        let mut bs_params_0 = NvEncCreateBitstreamBuffer {
+            version: create_bs_ver,
+            ..Default::default()
+        };
+        let ret = unsafe { (funcs.create_bitstream)(session, &mut bs_params_0) };
+        if ret != NV_ENC_SUCCESS {
+            log::error!("[export] nvEncCreateBitstreamBuffer slot 0 failed with error {}", ret);
+            unsafe { (funcs.destroy_encoder)(session) };
+            return Err(EncodeInteropError::Initialize(ret));
+        }
+        let bitstream_buffer_0 = bs_params_0.bitstream_buffer;
+
+        let mut bs_params_1 = NvEncCreateBitstreamBuffer {
+            version: create_bs_ver,
+            ..Default::default()
+        };
+        let ret = unsafe { (funcs.create_bitstream)(session, &mut bs_params_1) };
+        if ret != NV_ENC_SUCCESS {
+            log::error!("[export] nvEncCreateBitstreamBuffer slot 1 failed with error {}", ret);
+            unsafe {
+                (funcs.destroy_bitstream)(session, bitstream_buffer_0);
+                (funcs.destroy_encoder)(session);
+            }
+            return Err(EncodeInteropError::Initialize(ret));
+        }
+        let bitstream_buffer_1 = bs_params_1.bitstream_buffer;
 
         Ok(Self {
             session,
@@ -501,7 +488,8 @@ impl EncodeInterop {
             abgr10_external_1,
             registered_resource_0: register_0.registered_resource,
             registered_resource_1: register_1.registered_resource,
-            bitstream_buffer,
+            bitstream_buffer_0,
+            bitstream_buffer_1,
             funcs,
             width: job.width,
             height: job.height,
@@ -510,10 +498,6 @@ impl EncodeInterop {
     }
 
     /// Return the ABGR10 wgpu texture for the given ping-pong slot (0 or 1).
-    ///
-    /// The caller (ExportRenderer) alternates between slots each frame:
-    /// - GPU writes into `slot N%2` via `Abgr10RepackNode`.
-    /// - NVENC reads from `slot (N-1)%2` after waiting for its submission index.
     pub fn abgr10_texture_for_slot(&self, slot: usize) -> &wgpu::Texture {
         if slot == 0 { &self.abgr10_texture_0 } else { &self.abgr10_texture_1 }
     }
@@ -523,34 +507,32 @@ impl EncodeInterop {
         if slot == 0 { self.registered_resource_0 } else { self.registered_resource_1 }
     }
 
+    /// Return the pre-allocated bitstream output buffer for the given ping-pong slot.
+    fn bitstream_buffer_for_slot(&self, slot: usize) -> *mut std::ffi::c_void {
+        if slot == 0 { self.bitstream_buffer_0 } else { self.bitstream_buffer_1 }
+    }
+
     /// Encode one frame. The ABGR10 texture for `slot` must have already been
     /// written by `Abgr10RepackNode` and its GPU submission must have completed
     /// (caller uses `poll(WaitForSubmissionIndex)` before calling this).
     /// Returns (bitstream_bytes, pts) ready for Phase 6's Muxer::write_packet.
     pub fn encode_frame(&mut self, pts: i64, slot: usize) -> Result<(Vec<u8>, i64), EncodeInteropError> {
+        let bitstream_buffer = self.bitstream_buffer_for_slot(slot);
+
         // Step 1 — Map the registered input resource for this encode call.
-        #[repr(C)]
-        struct NvEncMapInputResource {
-            version:            u32,
-            subresource_index:  u32,
-            input_resource:     *mut std::ffi::c_void,
-            registered_resource: *mut std::ffi::c_void,
-            mapped_resource:    *mut std::ffi::c_void,
-            mapped_buffer_fmt:  u32,
-            reserved: [u32; 251],
-        }
         let map_ver = nvenc_struct_ver(self.api_version, 1);
         let mut map_params = NvEncMapInputResource {
             version:             map_ver,
-            subresource_index:   0,
+            sub_resource_index:  0,
             input_resource:      std::ptr::null_mut(),
             registered_resource: self.registered_resource_for_slot(slot),
             mapped_resource:     std::ptr::null_mut(),
-            mapped_buffer_fmt:   0,
-            reserved: [0u32; 251],
+            mapped_buffer_fmt:   NV_ENC_BUFFER_FORMAT_ABGR10,
+            reserved1:           [0u32; 251],
+            reserved2:           [std::ptr::null_mut(); 63],
         };
         let ret = unsafe {
-            (self.funcs.map_input)(self.session, &mut map_params as *mut _ as *mut std::ffi::c_void)
+            (self.funcs.map_input)(self.session, &mut map_params)
         };
         if ret != NV_ENC_SUCCESS {
             return Err(EncodeInteropError::Map(ret));
@@ -561,77 +543,54 @@ impl EncodeInterop {
         let pic_ver = nvenc_struct_ver(self.api_version, 4);
         let mut pic_params = NvEncPicParams {
             version:          pic_ver,
-            input_width:       self.width,
-            input_height:      self.height,
-            input_pitch:       self.width,
-            encode_pic_flags:  0,
-            frame_idx:         0,
-            input_timestamp:   pts as u64,
-            input_duration:    0,
-            input_buffer:      mapped_buffer,
-            output_bitstream:  self.bitstream_buffer,
-            completion_event:  std::ptr::null_mut(),
-            buffer_fmt:        NV_ENC_BUFFER_FORMAT_ABGR10,
-            picture_struct:    NV_ENC_PIC_STRUCT_FRAME,
-            picture_type:      0,
-            codec_pic_params:  [0u8; 128],
-            me_hint_counts_per_block: [0u32; 2],
-            me_external_hints: std::ptr::null_mut(),
-            reserved: [0u32; 221],
-            reserved2: [0u32; 64],
+            input_width:      self.width,
+            input_height:     self.height,
+            input_pitch:      self.width,
+            encode_pic_flags: 0,
+            frame_idx:        0,
+            input_timestamp:  pts as u64,
+            input_duration:   0,
+            input_buffer:     mapped_buffer,
+            output_bitstream: bitstream_buffer,
+            completion_event: std::ptr::null_mut(),
+            buffer_fmt:       NV_ENC_BUFFER_FORMAT_ABGR10,
+            picture_struct:   NV_ENC_PIC_STRUCT_FRAME,
+            picture_type:     0,
+            ..Default::default()
         };
         let ret = unsafe { (self.funcs.encode_picture)(self.session, &mut pic_params) };
         if ret != NV_ENC_SUCCESS {
+            unsafe { (self.funcs.unmap_input)(self.session, mapped_buffer); }
             return Err(EncodeInteropError::Encode(ret));
         }
 
         // Step 3 — Lock the bitstream to read the encoded bytes out.
-        // This is the ONE necessary CPU touch in the pipeline: copying the compressed
-        // bitstream (typically tens of KB per frame, vs tens of MB of raw pixels).
-        #[repr(C)]
-        struct NvEncLockBitstream {
-            version:         u32,
-            do_not_wait:     u32,
-            is_idr_frame:    u32,
-            reserved:        u32,
-            output_bitstream: *mut std::ffi::c_void,
-            bitstream_size_in_bytes: u32,
-            frame_idx:       u32,
-            picture_type:    u32,
-            reserved2: [u32; 238],
-            bitstream_ptr:   *mut std::ffi::c_void,
-        }
         let lock_ver = nvenc_struct_ver(self.api_version, 1);
         let mut lock_params = NvEncLockBitstream {
-            version:         lock_ver,
-            do_not_wait:     0,
-            is_idr_frame:    0,
-            reserved:        0,
-            output_bitstream: self.bitstream_buffer,
-            bitstream_size_in_bytes: 0,
-            frame_idx:       0,
-            picture_type:    0,
-            reserved2: [0u32; 238],
-            bitstream_ptr:   std::ptr::null_mut(),
+            version:                 lock_ver,
+            output_bitstream:        bitstream_buffer,
+            ..Default::default()
         };
         let ret = unsafe {
-            (self.funcs.lock_bitstream)(self.session, &mut lock_params as *mut _ as *mut std::ffi::c_void)
+            (self.funcs.lock_bitstream)(self.session, &mut lock_params)
         };
         if ret != NV_ENC_SUCCESS {
+            unsafe { (self.funcs.unmap_input)(self.session, mapped_buffer); }
             return Err(EncodeInteropError::Lock(ret));
         }
 
         // Copy the bitstream bytes into an owned Vec.
         let bytes = unsafe {
             std::slice::from_raw_parts(
-                lock_params.bitstream_ptr as *const u8,
+                lock_params.bitstream_buffer_ptr as *const u8,
                 lock_params.bitstream_size_in_bytes as usize,
             ).to_vec()
         };
 
-        // Step 4 — Unlock the bitstream buffer and return.
+        // Step 4 — Unlock the bitstream buffer and unmap input resource.
         unsafe {
-            (self.funcs.unlock_bitstream)(self.session, self.bitstream_buffer);
+            (self.funcs.unlock_bitstream)(self.session, bitstream_buffer);
+            (self.funcs.unmap_input)(self.session, mapped_buffer);
         }
 
         Ok((bytes, pts))
@@ -641,9 +600,12 @@ impl EncodeInterop {
 impl Drop for EncodeInterop {
     fn drop(&mut self) {
         unsafe {
-            // Destroying the encoder session implicitly unregisters all input resources
-            // and releases internal NVENC state. The ExternalTextures (slot 0 and slot 1)
-            // and the underlying wgpu::Textures clean up via their own Drop impls after this.
+            if !self.bitstream_buffer_0.is_null() {
+                (self.funcs.destroy_bitstream)(self.session, self.bitstream_buffer_0);
+            }
+            if !self.bitstream_buffer_1.is_null() {
+                (self.funcs.destroy_bitstream)(self.session, self.bitstream_buffer_1);
+            }
             let _ = (self.funcs.destroy_encoder)(self.session);
         }
     }
