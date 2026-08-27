@@ -12,7 +12,7 @@ struct KeyParams {
     height:         u32,
 }
 
-@group(0) @binding(0) var in_tex:  texture_storage_2d<rgba16float, read>;
+@group(0) @binding(0) var in_tex:  texture_2d<f32>;
 @group(0) @binding(1) var out_tex: texture_storage_2d<rgba16float, write>;
 
 var<push_constant> params: KeyParams;
@@ -52,7 +52,7 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let coord = vec2<i32>(id.xy);
 
     // Step 2 — Load pixel
-    var c = textureLoad(in_tex, coord);
+    var c = textureLoad(in_tex, coord, 0);
 
     // Step 3 — Convert to HSV
     let hsv = rgb_to_hsv(c.rgb);

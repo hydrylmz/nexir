@@ -10,6 +10,7 @@ pub mod audio;
 pub mod sync;
 pub mod export;
 pub mod interop;
+pub mod profiling;
 
 #[cfg(test)]
 mod tests;

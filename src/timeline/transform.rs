@@ -100,6 +100,381 @@ impl ClipTransform {
     
 }
 
+/// Compositing blend modes – GPU fragment shader interprets the `blend_mode` u32 field.
+/// Values must match `BLEND_*` constants in the composite WGSL shader.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[repr(u32)]
+pub enum BlendMode {
+    /// Standard alpha compositing (Porter-Duff Over). Default.
+    #[default]
+    Normal = 0,
+    /// dst + src
+    Add = 1,
+    /// src * dst
+    Multiply = 2,
+    /// 1 - (1-src)*(1-dst)
+    Screen = 3,
+    /// Multiply if dst < 0.5, Screen otherwise
+    Overlay = 4,
+    /// min(src, dst)
+    Darken = 5,
+    /// max(src, dst)
+    Lighten = 6,
+    /// Dodge: dst / (1 - src)
+    ColorDodge = 7,
+    /// Burn: 1 - (1 - dst) / src
+    ColorBurn = 8,
+    /// Hard Light: Multiply/Screen swap of Overlay
+    HardLight = 9,
+    /// Soft Light: Pegtop formula
+    SoftLight = 10,
+    /// |src - dst|
+    Difference = 11,
+    /// src + dst - 2*src*dst
+    Exclusion = 12,
+}
+
+impl BlendMode {
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            0 => BlendMode::Normal,
+            1 => BlendMode::Add,
+            2 => BlendMode::Multiply,
+            3 => BlendMode::Screen,
+            4 => BlendMode::Overlay,
+            5 => BlendMode::Darken,
+            6 => BlendMode::Lighten,
+            7 => BlendMode::ColorDodge,
+            8 => BlendMode::ColorBurn,
+            9 => BlendMode::HardLight,
+            10 => BlendMode::SoftLight,
+            11 => BlendMode::Difference,
+            12 => BlendMode::Exclusion,
+            _ => BlendMode::Normal,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Add => "Add",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+            BlendMode::Overlay => "Overlay",
+            BlendMode::Darken => "Darken",
+            BlendMode::Lighten => "Lighten",
+            BlendMode::ColorDodge => "Color Dodge",
+            BlendMode::ColorBurn => "Color Burn",
+            BlendMode::HardLight => "Hard Light",
+            BlendMode::SoftLight => "Soft Light",
+            BlendMode::Difference => "Difference",
+            BlendMode::Exclusion => "Exclusion",
+        }
+    }
+
+    /// All blend modes in display order.
+    pub fn all() -> &'static [BlendMode] {
+        &[
+            BlendMode::Normal, BlendMode::Add, BlendMode::Multiply,
+            BlendMode::Screen, BlendMode::Overlay, BlendMode::Darken,
+            BlendMode::Lighten, BlendMode::ColorDodge, BlendMode::ColorBurn,
+            BlendMode::HardLight, BlendMode::SoftLight, BlendMode::Difference,
+            BlendMode::Exclusion,
+        ]
+    }
+}
+
+/// Axis-aligned crop rectangle in normalised clip space [0..1].
+/// (0,0)=top-left, (1,1)=bottom-right.
+/// `feather` controls a soft gradient at the crop edge (0 = hard, 1 = full clip width feather).
+#[derive(Copy, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CropRect {
+    pub left:    f32,
+    pub top:     f32,
+    pub right:   f32,
+    pub bottom:  f32,
+    pub feather: f32,
+}
+
+impl Default for CropRect {
+    fn default() -> Self {
+        Self { left: 0.0, top: 0.0, right: 1.0, bottom: 1.0, feather: 0.0 }
+    }
+}
+
+impl CropRect {
+    /// No-op crop (full clip visible).
+    pub fn full() -> Self {
+        Self::default()
+    }
+
+    /// True if this is a full-clip no-op crop.
+    pub fn is_identity(&self) -> bool {
+        self.left < f32::EPSILON
+            && self.top < f32::EPSILON
+            && (self.right - 1.0).abs() < f32::EPSILON
+            && (self.bottom - 1.0).abs() < f32::EPSILON
+            && self.feather < f32::EPSILON
+    }
+
+    /// Clamps all values to [0..1] and ensures left < right, top < bottom.
+    pub fn normalise(&mut self) {
+        self.left = self.left.clamp(0.0, 1.0);
+        self.right = self.right.clamp(0.0, 1.0);
+        self.top = self.top.clamp(0.0, 1.0);
+        self.bottom = self.bottom.clamp(0.0, 1.0);
+        self.feather = self.feather.clamp(0.0, 1.0);
+        if self.left > self.right { std::mem::swap(&mut self.left, &mut self.right); }
+        if self.top > self.bottom { std::mem::swap(&mut self.top, &mut self.bottom); }
+    }
+
+    /// Returns the alpha multiplier at a given normalised clip UV, applying feather.
+    pub fn alpha_at(&self, u: f32, v: f32) -> f32 {
+        if self.feather < f32::EPSILON {
+            // Hard crop
+            if u >= self.left && u <= self.right && v >= self.top && v <= self.bottom {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            let half = self.feather * 0.5;
+            let al = ((u - self.left) / half).clamp(0.0, 1.0);
+            let ar = ((self.right - u) / half).clamp(0.0, 1.0);
+            let at = ((v - self.top) / half).clamp(0.0, 1.0);
+            let ab = ((self.bottom - v) / half).clamp(0.0, 1.0);
+            al.min(ar).min(at).min(ab)
+        }
+    }
+
+    /// Pack into 4 GPU floats: [left, top, right, bottom] (feather handled separately).
+    pub fn to_gpu(&self) -> [f32; 4] {
+        [self.left, self.top, self.right, self.bottom]
+    }
+}
+
+/// 4-point perspective warp (Corner Pin) in normalised clip space.
+/// Each corner is (u, v) in [0..1] clip UV space.
+/// Identity = corners at (0,0), (1,0), (0,1), (1,1).
+#[derive(Copy, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CornerPin {
+    pub top_left:     [f32; 2],
+    pub top_right:    [f32; 2],
+    pub bottom_left:  [f32; 2],
+    pub bottom_right: [f32; 2],
+}
+
+impl Default for CornerPin {
+    fn default() -> Self {
+        Self {
+            top_left:     [0.0, 0.0],
+            top_right:    [1.0, 0.0],
+            bottom_left:  [0.0, 1.0],
+            bottom_right: [1.0, 1.0],
+        }
+    }
+}
+
+impl CornerPin {
+    pub fn identity() -> Self { Self::default() }
+
+    pub fn is_identity(&self) -> bool {
+        let id = Self::identity();
+        self == &id
+    }
+
+    /// Pack corners into 8 floats for GPU upload (TL, TR, BL, BR each as [u,v]).
+    pub fn to_gpu(&self) -> [f32; 8] {
+        [
+            self.top_left[0], self.top_left[1],
+            self.top_right[0], self.top_right[1],
+            self.bottom_left[0], self.bottom_left[1],
+            self.bottom_right[0], self.bottom_right[1],
+        ]
+    }
+}
+
+/// Track-matte type for a clip.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum MatteMode {
+    #[default]
+    /// No matte applied.
+    None,
+    /// Use the alpha channel of the track above as the matte.
+    AlphaMatte,
+    /// Invert the alpha channel of the track above as the matte.
+    AlphaMatteInverted,
+    /// Use the luminance of the track above as the matte.
+    LumaMatte,
+    /// Invert the luminance of the track above as the matte.
+    LumaMatteInverted,
+}
+
+impl MatteMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            MatteMode::None => "None",
+            MatteMode::AlphaMatte => "Alpha Matte",
+            MatteMode::AlphaMatteInverted => "Alpha Matte Inverted",
+            MatteMode::LumaMatte => "Luma Matte",
+            MatteMode::LumaMatteInverted => "Luma Matte Inverted",
+        }
+    }
+
+    /// Evaluates the matte multiplier (in [0.0, 1.0]) given the RGBA color of the matte frame.
+    pub fn evaluate_matte(&self, matte_rgba: [f32; 4]) -> f32 {
+        match self {
+            MatteMode::None => 1.0,
+            MatteMode::AlphaMatte => matte_rgba[3].clamp(0.0, 1.0),
+            MatteMode::AlphaMatteInverted => (1.0 - matte_rgba[3]).clamp(0.0, 1.0),
+            MatteMode::LumaMatte => {
+                let luma = 0.2126 * matte_rgba[0] + 0.7152 * matte_rgba[1] + 0.0722 * matte_rgba[2];
+                luma.clamp(0.0, 1.0)
+            }
+            MatteMode::LumaMatteInverted => {
+                let luma = 0.2126 * matte_rgba[0] + 0.7152 * matte_rgba[1] + 0.0722 * matte_rgba[2];
+                (1.0 - luma).clamp(0.0, 1.0)
+            }
+        }
+    }
+}
+
+/// Blends a single colour channel using the specified blend mode.
+/// Both `src` and `dst` are expected in [0.0, 1.0].
+pub fn blend_channel(mode: BlendMode, src: f32, dst: f32) -> f32 {
+    match mode {
+        BlendMode::Normal => src,
+        BlendMode::Add => (src + dst).min(1.0),
+        BlendMode::Multiply => src * dst,
+        BlendMode::Screen => 1.0 - (1.0 - src) * (1.0 - dst),
+        BlendMode::Overlay => {
+            if dst < 0.5 {
+                2.0 * src * dst
+            } else {
+                1.0 - 2.0 * (1.0 - src) * (1.0 - dst)
+            }
+        }
+        BlendMode::Darken => src.min(dst),
+        BlendMode::Lighten => src.max(dst),
+        BlendMode::ColorDodge => {
+            if src >= 1.0 {
+                1.0
+            } else {
+                (dst / (1.0 - src)).min(1.0)
+            }
+        }
+        BlendMode::ColorBurn => {
+            if src <= 0.0 {
+                0.0
+            } else {
+                (1.0 - (1.0 - dst) / src).max(0.0)
+            }
+        }
+        BlendMode::HardLight => {
+            if src < 0.5 {
+                2.0 * src * dst
+            } else {
+                1.0 - 2.0 * (1.0 - src) * (1.0 - dst)
+            }
+        }
+        BlendMode::SoftLight => {
+            (1.0 - 2.0 * src) * dst * dst + 2.0 * src * dst
+        }
+        BlendMode::Difference => (src - dst).abs(),
+        BlendMode::Exclusion => src + dst - 2.0 * src * dst,
+    }
+}
+
+/// Blends an RGBA source pixel over an RGBA destination pixel.
+pub fn blend_pixel(mode: BlendMode, src: [f32; 4], dst: [f32; 4]) -> [f32; 4] {
+    let src_a = src[3];
+    let dst_a = dst[3];
+    let out_a = src_a + dst_a * (1.0 - src_a);
+
+    if out_a <= f32::EPSILON {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+
+    let mut out_rgb = [0.0; 3];
+    for i in 0..3 {
+        let blended = blend_channel(mode, src[i], dst[i]);
+        // Standard Porter-Duff compositing with non-separable blend modes
+        out_rgb[i] = (src_a * (1.0 - dst_a) * src[i]
+            + dst_a * (1.0 - src_a) * dst[i]
+            + src_a * dst_a * blended)
+            / out_a;
+    }
+
+    [out_rgb[0], out_rgb[1], out_rgb[2], out_a]
+}
+
+/// Geometric mask shapes for clip masking.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum GeometricMask {
+    Rectangle(CropRect),
+    Ellipse {
+        /// Center in normalized [0..1] UV coordinates.
+        center: [f32; 2],
+        /// Radius X and Y in normalized coordinates.
+        radius: [f32; 2],
+        /// Feather radius in normalized coordinates.
+        feather: f32,
+    },
+    Polygon {
+        /// Polygon vertices in normalized UV space.
+        points: Vec<[f32; 2]>,
+        /// Feather factor.
+        feather: f32,
+    },
+}
+
+impl GeometricMask {
+    /// Computes the alpha mask value in [0.0, 1.0] at a normalized coordinate (u, v).
+    pub fn alpha_at(&self, u: f32, v: f32) -> f32 {
+        match self {
+            GeometricMask::Rectangle(rect) => rect.alpha_at(u, v),
+            GeometricMask::Ellipse { center, radius, feather } => {
+                if radius[0] <= 0.0 || radius[1] <= 0.0 {
+                    return 0.0;
+                }
+                let dx = (u - center[0]) / radius[0];
+                let dy = (v - center[1]) / radius[1];
+                let dist_sq = dx * dx + dy * dy;
+                let dist = dist_sq.sqrt();
+                if *feather < f32::EPSILON {
+                    if dist <= 1.0 { 1.0 } else { 0.0 }
+                } else {
+                    let half_f = *feather * 0.5;
+                    ((1.0 + half_f - dist) / *feather).clamp(0.0, 1.0)
+                }
+            }
+            GeometricMask::Polygon { points, feather: _ } => {
+                if points.len() < 3 {
+                    return 1.0;
+                }
+                // Ray casting algorithm for point in polygon
+                let mut inside = false;
+                let mut j = points.len() - 1;
+                for i in 0..points.len() {
+                    let pi = points[i];
+                    let pj = points[j];
+                    if ((pi[1] > v) != (pj[1] > v))
+                        && (u < (pj[0] - pi[0]) * (v - pi[1]) / (pj[1] - pi[1]) + pi[0])
+                    {
+                        inside = !inside;
+                    }
+                    j = i;
+                }
+                if inside { 1.0 } else { 0.0 }
+            }
+        }
+    }
+}
+
 /// Fixed-size GPU-uploadable effect parameter block.
 /// 64 bytes = 16 × f32 = one cache line.
 /// The interpretation of `data` depends on the `EffectKind` of the owning effect.

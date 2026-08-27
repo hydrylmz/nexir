@@ -128,6 +128,9 @@ impl GpuDevice {
             required_features |= wgpu::Features::TEXTURE_BINDING_ARRAY
                                | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
         }
+        if adapter_features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
+            required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        }
 
         // Step 3: Request device and queue
         let (device, queue) = adapter.request_device(
@@ -202,6 +205,9 @@ impl GpuDevice {
         if has_binding_arrays {
             required_features |= wgpu::Features::TEXTURE_BINDING_ARRAY
                                | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
+        }
+        if adapter_features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
+            required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         }
 
         let (device, queue) = adapter.request_device(

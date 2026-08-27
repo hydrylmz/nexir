@@ -135,18 +135,20 @@ pub enum EncodeInteropError {
 
 /// NVENC function table loaded from the driver.
 struct NvencFunctions {
-    open_session:       functions::OpenEncodeSessionEx,
-    get_preset_config:  functions::GetPresetConfig,
-    initialize:         functions::InitializeEncoder,
-    create_bitstream:   functions::CreateBitstreamBuffer,
-    destroy_bitstream:  functions::DestroyBitstreamBuffer,
-    register_resource:  functions::RegisterResource,
-    map_input:          functions::MapInputResource,
-    unmap_input:        functions::UnmapInputResource,
-    encode_picture:     functions::EncodePicture,
-    lock_bitstream:     functions::LockBitstream,
-    unlock_bitstream:   functions::UnlockBitstream,
-    destroy_encoder:    functions::DestroyEncoder,
+    open_session:          functions::OpenEncodeSessionEx,
+    get_preset_config:     functions::GetPresetConfig,
+    initialize:            functions::InitializeEncoder,
+    create_bitstream:      functions::CreateBitstreamBuffer,
+    destroy_bitstream:     functions::DestroyBitstreamBuffer,
+    register_resource:     functions::RegisterResource,
+    map_input:             functions::MapInputResource,
+    unmap_input:           functions::UnmapInputResource,
+    encode_picture:        functions::EncodePicture,
+    lock_bitstream:        functions::LockBitstream,
+    unlock_bitstream:      functions::UnlockBitstream,
+    destroy_encoder:       functions::DestroyEncoder,
+    register_async_event:  functions::RegisterAsyncEvent,
+    unregister_async_event: functions::UnregisterAsyncEvent,
 }
 
 /// Holds the NVENC session and two ping-pong interop-imported ABGR10 textures.
@@ -180,9 +182,40 @@ pub struct EncodeInterop {
     /// The NVENC API major version we probed successfully; used to construct
     /// per-struct version fields for encode-time calls.
     api_version:           u32,
+    /// Win32 event handle for slot 0 completion (null when async mode is off).
+    /// Only populated on Windows when NVENC async init succeeded.
+    completion_event_0:    *mut std::ffi::c_void,
+    /// Win32 event handle for slot 1 completion (null when async mode is off).
+    completion_event_1:    *mut std::ffi::c_void,
+    /// Whether asynchronous NVENC encoding is active.  False means sync mode
+    /// (completion_event_* are null and no WaitForSingleObject calls are made).
+    is_async:              bool,
 }
 
 unsafe impl Send for EncodeInterop {}
+/// WAIT_OBJECT_0: WaitForSingleObject returned because the object was signalled.
+#[cfg(target_os = "windows")]
+const WAIT_OBJECT_0: u32 = 0x00000000;
+
+/// Win32 kernel32 functions needed for asynchronous NVENC completion events.
+/// These are the standard Windows synchronization APIs; we declare them here
+/// rather than pulling in the `windows-sys` crate to avoid a new dependency.
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn CreateEventA(
+        lp_event_attributes: *mut std::ffi::c_void,
+        b_manual_reset:      i32,
+        b_initial_state:     i32,
+        lp_name:             *const std::ffi::c_char,
+    ) -> *mut std::ffi::c_void;
+
+    fn WaitForSingleObject(
+        h_handle:         *mut std::ffi::c_void,
+        dw_milliseconds:  u32,
+    ) -> u32;
+
+    fn CloseHandle(h_object: *mut std::ffi::c_void) -> i32;
+}
 
 // NV_ENC_PIC_STRUCT_FRAME — all exported frames are progressive frames.
 const NV_ENC_PIC_STRUCT_FRAME: u32 = 1;
@@ -270,6 +303,8 @@ impl EncodeInterop {
         //   base.add(17) = nvEncEncodePicture
         //   base.add(18) = nvEncLockBitstream
         //   base.add(19) = nvEncUnlockBitstream
+        //   base.add(24) = nvEncRegisterAsyncEvent
+        //   base.add(25) = nvEncUnregisterAsyncEvent
         //   base.add(26) = nvEncMapInputResource
         //   base.add(27) = nvEncUnmapInputResource
         //   base.add(28) = nvEncDestroyEncoder
@@ -278,32 +313,36 @@ impl EncodeInterop {
         let function_list = fn_table_raw.as_ptr() as NV_ENCODE_API_FUNCTION_LIST;
         let base = function_list as *const usize;
         let funcs = unsafe {
-            let open_off         = 30usize; // nvEncOpenEncodeSessionEx
-            let preset_cfg_off   = 10usize; // nvEncGetEncodePresetConfig
-            let init_off         = 12usize; // nvEncInitializeEncoder
-            let create_bs_off    = 15usize; // nvEncCreateBitstreamBuffer
-            let destroy_bs_off   = 16usize; // nvEncDestroyBitstreamBuffer
-            let enc_off          = 17usize; // nvEncEncodePicture
-            let lock_off         = 18usize; // nvEncLockBitstream
-            let unlock_off       = 19usize; // nvEncUnlockBitstream
-            let map_off          = 26usize; // nvEncMapInputResource
-            let unmap_off        = 27usize; // nvEncUnmapInputResource
-            let destroy_off      = 28usize; // nvEncDestroyEncoder
-            let reg_off          = 31usize; // nvEncRegisterResource
+            let open_off              = 30usize; // nvEncOpenEncodeSessionEx
+            let preset_cfg_off        = 10usize; // nvEncGetEncodePresetConfig
+            let init_off              = 12usize; // nvEncInitializeEncoder
+            let create_bs_off         = 15usize; // nvEncCreateBitstreamBuffer
+            let destroy_bs_off        = 16usize; // nvEncDestroyBitstreamBuffer
+            let enc_off               = 17usize; // nvEncEncodePicture
+            let lock_off              = 18usize; // nvEncLockBitstream
+            let unlock_off            = 19usize; // nvEncUnlockBitstream
+            let reg_async_off         = 24usize; // nvEncRegisterAsyncEvent
+            let unreg_async_off       = 25usize; // nvEncUnregisterAsyncEvent
+            let map_off               = 26usize; // nvEncMapInputResource
+            let unmap_off             = 27usize; // nvEncUnmapInputResource
+            let destroy_off           = 28usize; // nvEncDestroyEncoder
+            let reg_off               = 31usize; // nvEncRegisterResource
 
             NvencFunctions {
-                open_session:      std::mem::transmute(*base.add(open_off)),
-                get_preset_config: std::mem::transmute(*base.add(preset_cfg_off)),
-                initialize:        std::mem::transmute(*base.add(init_off)),
-                create_bitstream:  std::mem::transmute(*base.add(create_bs_off)),
-                destroy_bitstream: std::mem::transmute(*base.add(destroy_bs_off)),
-                register_resource: std::mem::transmute(*base.add(reg_off)),
-                map_input:         std::mem::transmute(*base.add(map_off)),
-                unmap_input:       std::mem::transmute(*base.add(unmap_off)),
-                encode_picture:    std::mem::transmute(*base.add(enc_off)),
-                lock_bitstream:    std::mem::transmute(*base.add(lock_off)),
-                unlock_bitstream:  std::mem::transmute(*base.add(unlock_off)),
-                destroy_encoder:   std::mem::transmute(*base.add(destroy_off)),
+                open_session:           std::mem::transmute(*base.add(open_off)),
+                get_preset_config:      std::mem::transmute(*base.add(preset_cfg_off)),
+                initialize:             std::mem::transmute(*base.add(init_off)),
+                create_bitstream:       std::mem::transmute(*base.add(create_bs_off)),
+                destroy_bitstream:      std::mem::transmute(*base.add(destroy_bs_off)),
+                register_resource:      std::mem::transmute(*base.add(reg_off)),
+                map_input:              std::mem::transmute(*base.add(map_off)),
+                unmap_input:            std::mem::transmute(*base.add(unmap_off)),
+                encode_picture:         std::mem::transmute(*base.add(enc_off)),
+                lock_bitstream:         std::mem::transmute(*base.add(lock_off)),
+                unlock_bitstream:       std::mem::transmute(*base.add(unlock_off)),
+                destroy_encoder:        std::mem::transmute(*base.add(destroy_off)),
+                register_async_event:   std::mem::transmute(*base.add(reg_async_off)),
+                unregister_async_event: std::mem::transmute(*base.add(unreg_async_off)),
             }
         };
 
@@ -359,7 +398,7 @@ impl EncodeInterop {
             dar_height:                   job.height,
             frame_rate_num:               job.frame_rate.num as u32,
             frame_rate_den:               job.frame_rate.den as u32,
-            enable_encode_async:          0, // sync mode
+            enable_encode_async:          0, // set to 1 below on Windows if driver allows it
             enable_ptd:                   1, // let NVENC pick frame types
             flags:                        0,
             priv_data_size:               0,
@@ -376,17 +415,127 @@ impl EncodeInterop {
             reserved1:                    [0u32; 284],
             reserved2:                    [std::ptr::null_mut(); 64],
         };
-        let mut ret = unsafe { (funcs.initialize)(session, &mut init_params) };
-        if ret != NV_ENC_SUCCESS {
-            log::warn!("[export] nvEncInitializeEncoder with P4 preset failed ({}), retrying with DEFAULT preset", ret);
-            init_params.preset_guid = NV_ENC_PRESET_DEFAULT_GUID;
-            ret = unsafe { (funcs.initialize)(session, &mut init_params) };
-        }
-        if ret != NV_ENC_SUCCESS {
-            log::error!("[export] nvEncInitializeEncoder failed with error {}", ret);
-            unsafe { (funcs.destroy_encoder)(session) };
-            return Err(EncodeInteropError::Initialize(ret));
-        }
+
+        // --- Async-first initialization ---
+        // On Windows: attempt async NVENC mode (enable_encode_async = 1).
+        // If the driver accepts it AND Win32 event creation succeeds, use async.
+        // Any failure at any step falls back silently to synchronous mode.
+        // On non-Windows: always synchronous (no Win32 event primitives available).
+        #[cfg(target_os = "windows")]
+        let (is_async, completion_event_0, completion_event_1) = unsafe {
+            init_params.enable_encode_async = 1;
+            let mut async_ret = (funcs.initialize)(session, &mut init_params);
+            if async_ret != NV_ENC_SUCCESS {
+                log::warn!(
+                    "[export] nvEncInitializeEncoder async failed ({}), retrying with DEFAULT preset async",
+                    async_ret
+                );
+                init_params.preset_guid = NV_ENC_PRESET_DEFAULT_GUID;
+                async_ret = (funcs.initialize)(session, &mut init_params);
+            }
+
+            if async_ret == NV_ENC_SUCCESS {
+                // Try to create Win32 auto-reset events (bManualReset=0, bInitialState=0).
+                let ev0 = CreateEventA(std::ptr::null_mut(), 0, 0, std::ptr::null());
+                let ev1 = CreateEventA(std::ptr::null_mut(), 0, 0, std::ptr::null());
+                if ev0.is_null() || ev1.is_null() {
+                    // Clean up any handle that was successfully created.
+                    if !ev0.is_null() { CloseHandle(ev0); }
+                    if !ev1.is_null() { CloseHandle(ev1); }
+                    log::warn!("[export] CreateEventA failed — falling back to sync NVENC mode");
+                    // Destroy and re-init in sync mode below.
+                    (funcs.destroy_encoder)(session);
+                    init_params.enable_encode_async = 0;
+                    init_params.preset_guid = NV_ENC_PRESET_P4_GUID;
+                    let mut sync_ret = (funcs.initialize)(session, &mut init_params);
+                    if sync_ret != NV_ENC_SUCCESS {
+                        init_params.preset_guid = NV_ENC_PRESET_DEFAULT_GUID;
+                        sync_ret = (funcs.initialize)(session, &mut init_params);
+                    }
+                    if sync_ret != NV_ENC_SUCCESS {
+                        log::error!("[export] nvEncInitializeEncoder sync fallback failed ({})", sync_ret);
+                        (funcs.destroy_encoder)(session);
+                        return Err(EncodeInteropError::Initialize(sync_ret));
+                    }
+                    (false, std::ptr::null_mut(), std::ptr::null_mut())
+                } else {
+                    // Register both events with NVENC.
+                    let event_params_ver = nvenc_struct_ver(probed_api_version, 1);
+                    let mut ep0 = NvEncEventParams {
+                        version: event_params_ver,
+                        completion_event: ev0,
+                        ..Default::default()
+                    };
+                    let mut ep1 = NvEncEventParams {
+                        version: event_params_ver,
+                        completion_event: ev1,
+                        ..Default::default()
+                    };
+                    let r0 = (funcs.register_async_event)(session, &mut ep0);
+                    let r1 = (funcs.register_async_event)(session, &mut ep1);
+                    if r0 != NV_ENC_SUCCESS || r1 != NV_ENC_SUCCESS {
+                        log::warn!(
+                            "[export] nvEncRegisterAsyncEvent failed (r0={}, r1={}) — \
+                             falling back to sync NVENC mode",
+                            r0, r1
+                        );
+                        CloseHandle(ev0);
+                        CloseHandle(ev1);
+                        // Destroy and re-init in sync mode.
+                        (funcs.destroy_encoder)(session);
+                        init_params.enable_encode_async = 0;
+                        init_params.preset_guid = NV_ENC_PRESET_P4_GUID;
+                        let mut sync_ret = (funcs.initialize)(session, &mut init_params);
+                        if sync_ret != NV_ENC_SUCCESS {
+                            init_params.preset_guid = NV_ENC_PRESET_DEFAULT_GUID;
+                            sync_ret = (funcs.initialize)(session, &mut init_params);
+                        }
+                        if sync_ret != NV_ENC_SUCCESS {
+                            log::error!("[export] nvEncInitializeEncoder sync fallback failed ({})", sync_ret);
+                            (funcs.destroy_encoder)(session);
+                            return Err(EncodeInteropError::Initialize(sync_ret));
+                        }
+                        (false, std::ptr::null_mut(), std::ptr::null_mut())
+                    } else {
+                        log::info!("[export] NVENC asynchronous encoding active (Win32 events registered)");
+                        (true, ev0, ev1)
+                    }
+                }
+            } else {
+                // Async init failed; try sync fallback.
+                log::warn!("[export] nvEncInitializeEncoder async mode rejected by driver — falling back to sync");
+                init_params.enable_encode_async = 0;
+                init_params.preset_guid = NV_ENC_PRESET_P4_GUID;
+                let mut sync_ret = (funcs.initialize)(session, &mut init_params);
+                if sync_ret != NV_ENC_SUCCESS {
+                    init_params.preset_guid = NV_ENC_PRESET_DEFAULT_GUID;
+                    sync_ret = (funcs.initialize)(session, &mut init_params);
+                }
+                if sync_ret != NV_ENC_SUCCESS {
+                    log::error!("[export] nvEncInitializeEncoder failed with error {}", sync_ret);
+                    (funcs.destroy_encoder)(session);
+                    return Err(EncodeInteropError::Initialize(sync_ret));
+                }
+                (false, std::ptr::null_mut(), std::ptr::null_mut())
+            }
+        };
+
+        // Non-Windows: always synchronous.
+        #[cfg(not(target_os = "windows"))]
+        let (is_async, completion_event_0, completion_event_1) = {
+            let mut ret = unsafe { (funcs.initialize)(session, &mut init_params) };
+            if ret != NV_ENC_SUCCESS {
+                log::warn!("[export] nvEncInitializeEncoder with P4 preset failed ({}), retrying with DEFAULT preset", ret);
+                init_params.preset_guid = NV_ENC_PRESET_DEFAULT_GUID;
+                ret = unsafe { (funcs.initialize)(session, &mut init_params) };
+            }
+            if ret != NV_ENC_SUCCESS {
+                log::error!("[export] nvEncInitializeEncoder failed with error {}", ret);
+                unsafe { (funcs.destroy_encoder)(session) };
+                return Err(EncodeInteropError::Initialize(ret));
+            }
+            (false, std::ptr::null_mut::<std::ffi::c_void>(), std::ptr::null_mut::<std::ffi::c_void>())
+        };
 
         // Step 4 — Allocate two ping-pong ABGR10 interop textures (R32Uint packed).
         let make_abgr10_texture = |label: &'static str| wgpu::TextureDescriptor {
@@ -494,6 +643,9 @@ impl EncodeInterop {
             width: job.width,
             height: job.height,
             api_version: probed_api_version,
+            completion_event_0,
+            completion_event_1,
+            is_async,
         })
     }
 
@@ -510,6 +662,12 @@ impl EncodeInterop {
     /// Return the pre-allocated bitstream output buffer for the given ping-pong slot.
     fn bitstream_buffer_for_slot(&self, slot: usize) -> *mut std::ffi::c_void {
         if slot == 0 { self.bitstream_buffer_0 } else { self.bitstream_buffer_1 }
+    }
+
+    /// Return the Win32 completion event handle for the given ping-pong slot.
+    /// Returns null when async mode is inactive.
+    fn completion_event_for_slot(&self, slot: usize) -> *mut std::ffi::c_void {
+        if slot == 0 { self.completion_event_0 } else { self.completion_event_1 }
     }
 
     /// Encode one frame. The ABGR10 texture for `slot` must have already been
@@ -539,8 +697,17 @@ impl EncodeInterop {
         }
         let mapped_buffer = map_params.mapped_resource;
 
-        // Step 2 — Encode the picture via NVENC.
+        // Step 2 — Submit the picture to the NVENC hardware encoder.
+        // In async mode (Windows only): attach the slot's Win32 completion event so
+        // NVENC signals it when encoding of this frame finishes.  nvEncEncodePicture
+        // returns immediately (NV_ENC_SUCCESS) and the CPU thread is free to submit
+        // the next GPU render while NVENC works in parallel.
         let pic_ver = nvenc_struct_ver(self.api_version, 4);
+        let completion_event = if self.is_async {
+            self.completion_event_for_slot(slot)
+        } else {
+            std::ptr::null_mut()
+        };
         let mut pic_params = NvEncPicParams {
             version:          pic_ver,
             input_width:      self.width,
@@ -552,7 +719,7 @@ impl EncodeInterop {
             input_duration:   0,
             input_buffer:     mapped_buffer,
             output_bitstream: bitstream_buffer,
-            completion_event: std::ptr::null_mut(),
+            completion_event,
             buffer_fmt:       NV_ENC_BUFFER_FORMAT_ABGR10,
             picture_struct:   NV_ENC_PIC_STRUCT_FRAME,
             picture_type:     0,
@@ -562,6 +729,24 @@ impl EncodeInterop {
         if ret != NV_ENC_SUCCESS {
             unsafe { (self.funcs.unmap_input)(self.session, mapped_buffer); }
             return Err(EncodeInteropError::Encode(ret));
+        }
+
+        // Step 2b — Wait for NVENC to signal the completion event (async mode only).
+        // On Windows with async enabled, nvEncEncodePicture returned immediately; we
+        // now block on the event with a 5-second safety timeout before accessing the
+        // bitstream.  On non-Windows or in sync mode this block compiles away.
+        #[cfg(target_os = "windows")]
+        if self.is_async {
+            let wait_result = unsafe { WaitForSingleObject(completion_event, 5000) };
+            if wait_result != WAIT_OBJECT_0 {
+                log::error!(
+                    "[export] WaitForSingleObject timed out or failed (result=0x{:x}) \
+                     for slot {} — encoder may be wedged",
+                    wait_result, slot
+                );
+                unsafe { (self.funcs.unmap_input)(self.session, mapped_buffer); }
+                return Err(EncodeInteropError::Encode(-1));
+            }
         }
 
         // Step 3 — Lock the bitstream to read the encoded bytes out.
@@ -600,6 +785,34 @@ impl EncodeInterop {
 impl Drop for EncodeInterop {
     fn drop(&mut self) {
         unsafe {
+            // Unregister async completion events before destroying the encoder.
+            // Must happen before destroy_encoder; guards for null handles ensure
+            // this is a no-op when async mode was never activated or init failed.
+            #[cfg(target_os = "windows")]
+            if self.is_async {
+                let event_params_ver = nvenc_struct_ver(self.api_version, 1);
+                if !self.completion_event_0.is_null() {
+                    let mut ep = NvEncEventParams {
+                        version:          event_params_ver,
+                        completion_event: self.completion_event_0,
+                        ..Default::default()
+                    };
+                    let _ = (self.funcs.unregister_async_event)(self.session, &mut ep);
+                    CloseHandle(self.completion_event_0);
+                    self.completion_event_0 = std::ptr::null_mut();
+                }
+                if !self.completion_event_1.is_null() {
+                    let mut ep = NvEncEventParams {
+                        version:          event_params_ver,
+                        completion_event: self.completion_event_1,
+                        ..Default::default()
+                    };
+                    let _ = (self.funcs.unregister_async_event)(self.session, &mut ep);
+                    CloseHandle(self.completion_event_1);
+                    self.completion_event_1 = std::ptr::null_mut();
+                }
+            }
+
             if !self.bitstream_buffer_0.is_null() {
                 (self.funcs.destroy_bitstream)(self.session, self.bitstream_buffer_0);
             }

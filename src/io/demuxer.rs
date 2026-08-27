@@ -318,44 +318,20 @@ impl Demuxer {
             let pri_raw = avcodecpar_get_color_primaries(codecpar);
             let bit_depth = avcodecpar_get_bit_depth(codecpar) as u8;
 
-            use crate::timeline::source::{ColorInfo, ColorRange, ColorPrimaries, MatrixCoefficients, TransferFunction};
+            use crate::timeline::source::ColorInfo;
 
-            let range = match cr_raw {
-                1 => ColorRange::Limited,
-                2 => ColorRange::Full,
-                _ => ColorRange::Limited, // Fallback to limited (MPEG)
-            };
+            let w = if width > 0 { width as u32 } else { 0 };
+            let h = if height > 0 { height as u32 } else { 0 };
 
-            let matrix = match cs_raw {
-                1 => MatrixCoefficients::Bt709,
-                5 | 6 => MatrixCoefficients::Bt601,
-                9 | 10 => MatrixCoefficients::Bt2020,
-                _ => MatrixCoefficients::Bt709, // Fallback
-            };
-
-            let primaries = match pri_raw {
-                1 => ColorPrimaries::Bt709,
-                9 => ColorPrimaries::Bt2020,
-                _ => ColorPrimaries::Bt709, // Fallback
-            };
-
-            let transfer_fn = match trc_raw {
-                1 => TransferFunction::Bt709,
-                8 => TransferFunction::Linear,
-                13 => TransferFunction::Srgb,
-                14 | 15 => TransferFunction::Bt2020,
-                16 => TransferFunction::Pq,
-                18 => TransferFunction::Hlg,
-                _ => TransferFunction::Bt709, // Fallback
-            };
-
-            let color_info = ColorInfo {
-                range,
-                matrix,
-                primaries,
-                transfer_fn,
+            let color_info = ColorInfo::from_ffmpeg(
+                cs_raw,
+                cr_raw,
+                trc_raw,
+                pri_raw,
                 bit_depth,
-            };
+                w,
+                h,
+            );
 
             StreamInfo {
                 index,

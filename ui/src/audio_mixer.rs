@@ -27,6 +27,8 @@ pub struct AudioClipInfo {
     pub volume: f32,
     pub pan: f32,
     pub muted: bool,
+    pub fade_in_pts: i64,
+    pub fade_out_pts: i64,
     pub speed: f32,
     pub pitch: f32,
     pub source_pts: i64,   // source file pts to start decoding from
@@ -125,6 +127,8 @@ impl AudioMixer {
                     let volume = clip.volume;
                     let pan = clip.pan;
                     let muted = clip.muted;
+                    let fade_in = clip.fade_in_pts;
+                    let fade_out = clip.fade_out_pts;
                     let speed = clip.speed;
                     let pitch = clip.pitch;
                     let src_in = clip.source_in_pts;
@@ -141,6 +145,8 @@ impl AudioMixer {
                             volume,
                             pan,
                             muted,
+                            fade_in,
+                            fade_out,
                             speed,
                             pitch,
                             src_in,

@@ -13,6 +13,7 @@ pub enum BuiltinShader {
     ColorCorrection,
     ChromaKey,
     Lut3D,
+    ToneMap,
 }
 
 pub struct ShaderRegistry {
@@ -31,20 +32,23 @@ impl ShaderRegistry {
             (BuiltinShader::ColorCorrection,  include_str!("color_correction.wgsl")),
             (BuiltinShader::ChromaKey,        include_str!("chroma_key.wgsl")),
             (BuiltinShader::Lut3D,            include_str!("lut.wgsl")),
+            (BuiltinShader::ToneMap,          include_str!("tonemap.wgsl")),
         ];
 
         for &(shader_id, src) in sources {
             device.device.push_error_scope(wgpu::ErrorFilter::Validation);
 
             let label = match shader_id {
-                BuiltinShader::YuvToRgb       => "yuv_to_rgb_shader",
-                BuiltinShader::Composite      => "composite_shader",
-                BuiltinShader::CompositeSingle=> "composite_single_shader",
-                BuiltinShader::Blit           => "blit_shader",
+                BuiltinShader::YuvToRgb        => "yuv_to_rgb_shader",
+                BuiltinShader::Composite       => "composite_shader",
+                BuiltinShader::CompositeSingle => "composite_single_shader",
+                BuiltinShader::Blit            => "blit_shader",
                 BuiltinShader::ColorCorrection => "color_correction_shader",
-                BuiltinShader::ChromaKey      => "chroma_key_shader",
-                BuiltinShader::Lut3D          => "lut_3d_shader",
+                BuiltinShader::ChromaKey       => "chroma_key_shader",
+                BuiltinShader::Lut3D           => "lut_3d_shader",
+                BuiltinShader::ToneMap         => "tonemap_shader",
             };
+
 
             let module = device.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),

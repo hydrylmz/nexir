@@ -190,7 +190,12 @@ impl FrameScheduler {
                     clip_height: clip.clip_height,
                     transform: clip.transform,
                     opacity: clip.opacity,
-                    is_nv12: false, kind: clip.kind.clone(),
+                    blend_mode: clip.blend_mode,
+                    crop: clip.crop,
+                    corner_pin: clip.corner_pin,
+                    matte_mode: clip.matte_mode,
+                    is_nv12: false,
+                    kind: clip.kind.clone(),
                 });
                 continue;
             }
@@ -209,7 +214,12 @@ impl FrameScheduler {
                 clip_height: clip.clip_height,
                 transform: clip.transform,
                 opacity: clip.opacity,
-                is_nv12, kind: clip.kind.clone(),
+                blend_mode: clip.blend_mode,
+                crop: clip.crop,
+                corner_pin: clip.corner_pin,
+                matte_mode: clip.matte_mode,
+                is_nv12,
+                kind: clip.kind.clone(),
             });
         }
 
@@ -278,7 +288,12 @@ impl FrameScheduler {
                     clip_height: clip.clip_height,
                     transform: clip.transform,
                     opacity: clip.opacity,
-                    is_nv12: false, kind: clip.kind.clone(),
+                    blend_mode: clip.blend_mode,
+                    crop: clip.crop,
+                    corner_pin: clip.corner_pin,
+                    matte_mode: clip.matte_mode,
+                    is_nv12: false,
+                    kind: clip.kind.clone(),
                 });
                 continue;
             }
@@ -304,7 +319,12 @@ impl FrameScheduler {
                 clip_height: clip.clip_height,
                 transform: clip.transform,
                 opacity: clip.opacity,
-                is_nv12, kind: clip.kind.clone(),
+                blend_mode: clip.blend_mode,
+                crop: clip.crop,
+                corner_pin: clip.corner_pin,
+                matte_mode: clip.matte_mode,
+                is_nv12,
+                kind: clip.kind.clone(),
             });
         }
 

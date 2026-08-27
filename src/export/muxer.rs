@@ -11,11 +11,14 @@ pub struct Muxer {
 }
 
 struct MuxerInner {
-    ctx:             *mut AVFormatContext,
-    video_stream_idx: i32,
-    audio_stream_idx: i32,
-    video_tb:        AVRational,
-    audio_tb:        AVRational,
+    ctx:                   *mut AVFormatContext,
+    video_stream_idx:      i32,
+    audio_stream_idx:      i32,
+    video_tb:              AVRational,
+    audio_tb:              AVRational,
+    finalised:             bool,
+    video_packets_written: usize,
+    audio_packets_written: usize,
 }
 
 unsafe impl Send for Muxer {}
@@ -84,7 +87,10 @@ impl Muxer {
                     audio_stream_idx,
                     video_tb,
                     audio_tb,
-                })
+                    finalised: false,
+                    video_packets_written: 0,
+                    audio_packets_written: 0,
+                }),
             })
         }
     }
@@ -94,7 +100,10 @@ impl Muxer {
         pkt:      *mut AVPacket,
         is_video: bool,
     ) -> Result<(), MuxError> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.finalised {
+            return Err(MuxError::Write("Cannot write to finalized muxer".into()));
+        }
         unsafe {
             let stream_idx = if is_video {
                 inner.video_stream_idx
@@ -112,20 +121,54 @@ impl Muxer {
             if ret < 0 {
                 return Err(MuxError::Write(format!("Write frame failed: {}", ret)));
             }
+
+            if is_video {
+                inner.video_packets_written += 1;
+            } else {
+                inner.audio_packets_written += 1;
+            }
         }
         Ok(())
     }
 
-    pub fn finalise(self) -> Result<(), MuxError> {
-        let inner = self.inner.into_inner().unwrap();
+    /// Thread-safe synchronous finalisation through shared Arc reference.
+    pub fn finalise_sync(&self) -> Result<(), MuxError> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.finalised {
+            return Ok(());
+        }
+        inner.finalised = true;
         unsafe {
             let ret = av_write_trailer(inner.ctx);
             avformat_free_context(inner.ctx);
+            inner.ctx = std::ptr::null_mut();
             if ret < 0 {
                 return Err(MuxError::Trailer(format!("Write trailer failed: {}", ret)));
             }
         }
         Ok(())
+    }
+
+    pub fn finalise(self) -> Result<(), MuxError> {
+        self.finalise_sync()
+    }
+
+    /// Returns the count of (video_packets, audio_packets) written to the container.
+    pub fn packet_stats(&self) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        (inner.video_packets_written, inner.audio_packets_written)
+    }
+}
+
+impl Drop for MuxerInner {
+    fn drop(&mut self) {
+        if !self.finalised && !self.ctx.is_null() {
+            unsafe {
+                let _ = av_write_trailer(self.ctx);
+                avformat_free_context(self.ctx);
+                self.ctx = std::ptr::null_mut();
+            }
+        }
     }
 }
 

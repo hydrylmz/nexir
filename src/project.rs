@@ -227,8 +227,14 @@ impl Project {
         let volume = self.clips.volume_at(idx);
         let pan = self.clips.pan_at(idx);
         let audio_muted = self.clips.audio_muted_at(idx);
+        let fade_in_pts = self.clips.fade_in_pts_at(idx);
+        let fade_out_pts = self.clips.fade_out_pts_at(idx);
         let speed = self.clips.speed_at(idx);
         let pitch = self.clips.pitch_at(idx);
+        let blend_mode = self.clips.blend_mode_at(idx);
+        let crop = *self.clips.crop_at(idx);
+        let corner_pin = *self.clips.corner_pin_at(idx);
+        let matte_mode = self.clips.matte_mode_at(idx);
         let kind = self.clips.kind_at(idx).clone();
 
         // Ripple remove from old track (closes gap)
@@ -248,9 +254,15 @@ impl Project {
                 layer_order: layer,
                 opacity,
                 transform,
+                blend_mode,
+                crop,
+                corner_pin,
+                matte_mode,
                 volume,
                 pan,
                 audio_muted,
+                fade_in_pts,
+                fade_out_pts,
                 speed,
                 pitch,
             },

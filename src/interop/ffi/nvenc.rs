@@ -217,6 +217,29 @@ impl Default for NvEncCreateBitstreamBuffer {
     fn default() -> Self { unsafe { std::mem::zeroed() } }
 }
 
+/// NV_ENC_EVENT_PARAMS — passed to nvEncRegisterAsyncEvent / nvEncUnregisterAsyncEvent.
+/// Layout mirrors nvEncodeAPI.h: version(u32) + reserved(u32) + completion_event(*void)
+/// + reserved1([u32; 254]) + reserved2([*void; 64]) = 4+4+8+1016+512 = 1544 bytes.
+#[repr(C)]
+pub struct NvEncEventParams {
+    pub version:          u32,
+    pub reserved:         u32,
+    pub completion_event: *mut std::ffi::c_void,
+    pub reserved1:        [u32; 254],
+    pub reserved2:        [*mut std::ffi::c_void; 64],
+}
+
+const _: () = {
+    assert!(
+        std::mem::size_of::<NvEncEventParams>() == 1544,
+        "NvEncEventParams size mismatch — update to match nvEncodeAPI.h"
+    );
+};
+
+impl Default for NvEncEventParams {
+    fn default() -> Self { unsafe { std::mem::zeroed() } }
+}
+
 #[link(name = "nvidia-encode")]
 unsafe extern "C" {
     pub fn NvEncodeAPICreateInstance(function_list: NV_ENCODE_API_FUNCTION_LIST) -> i32;
@@ -271,4 +294,12 @@ pub mod functions {
         *mut std::ffi::c_void,
     ) -> i32;
     pub type DestroyEncoder = unsafe extern "C" fn(NvEncodeSession) -> i32;
+    pub type RegisterAsyncEvent = unsafe extern "C" fn(
+        NvEncodeSession,
+        *mut super::NvEncEventParams,
+    ) -> i32;
+    pub type UnregisterAsyncEvent = unsafe extern "C" fn(
+        NvEncodeSession,
+        *mut super::NvEncEventParams,
+    ) -> i32;
 }

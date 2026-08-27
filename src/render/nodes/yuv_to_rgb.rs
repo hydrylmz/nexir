@@ -177,16 +177,16 @@ impl RenderNode for YuvToRgbNode {
         let bind_group = &cache.as_ref().unwrap().1;
 
         // Step 4 — Build push constants from ColorInfo
-        let color_space_u32 = match self.color_info.matrix {
+        let color_space_u32 = match self.color_info.effective_matrix(self.width, self.height) {
             MatrixCoefficients::Bt601  => 0u32,
             MatrixCoefficients::Bt709  => 1u32,
             MatrixCoefficients::Bt2020 => 2u32,
-            MatrixCoefficients::Unknown => 1u32, // fallback to BT.709
+            MatrixCoefficients::Unknown => 1u32,
         };
-        let limited_range = match self.color_info.range {
+        let limited_range = match self.color_info.effective_range() {
             ColorRange::Full    => 0u32,
             ColorRange::Limited => 1u32,
-            ColorRange::Unknown => 1u32, // fallback to limited (broadcast)
+            ColorRange::Unknown => 1u32,
         };
         let params = YuvParams {
             color_space:   color_space_u32,

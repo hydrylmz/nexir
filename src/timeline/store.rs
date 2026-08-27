@@ -2,7 +2,7 @@
 // src/timeline/store.rs
 
 use crate::timeline::ids::{ClipId, TrackId, SourceId};
-use crate::timeline::transform::ClipTransform;
+use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ClipKind {
@@ -53,9 +53,23 @@ pub struct TimelineStore {
     pub(crate) layer_order:  Vec<u16>,
     pub(crate) opacity:      Vec<f32>,
     pub(crate) transform:    Vec<ClipTransform>,
+    #[serde(default)]
+    pub(crate) blend_mode:   Vec<BlendMode>,
+    #[serde(default)]
+    pub(crate) crop:         Vec<CropRect>,
+    #[serde(default)]
+    pub(crate) corner_pin:   Vec<CornerPin>,
+    #[serde(default)]
+    pub(crate) matte_mode:   Vec<MatteMode>,
     pub(crate) volume:       Vec<f32>,
     pub(crate) pan:          Vec<f32>,
     pub(crate) audio_muted:  Vec<bool>,
+    /// Audio fade-in duration in timeline PTS ticks (0 = no fade).
+    #[serde(default)]
+    pub(crate) fade_in_pts:  Vec<i64>,
+    /// Audio fade-out duration in timeline PTS ticks (0 = no fade).
+    #[serde(default)]
+    pub(crate) fade_out_pts: Vec<i64>,
 
     // --- speed / pitch (cold path — set by inspector) ---
     /// Playback speed multiplier (1.0 = normal, 2.0 = double speed, 0.5 = half speed).
@@ -89,9 +103,15 @@ impl TimelineStore {
             layer_order: Vec::new(),
             opacity: Vec::new(),
             transform: Vec::new(),
+            blend_mode: Vec::new(),
+            crop: Vec::new(),
+            corner_pin: Vec::new(),
+            matte_mode: Vec::new(),
             volume: Vec::new(),
             pan: Vec::new(),
             audio_muted: Vec::new(),
+            fade_in_pts: Vec::new(),
+            fade_out_pts: Vec::new(),
             speed: Vec::new(),
             pitch: Vec::new(),
             effect_start: Vec::new(),
@@ -106,6 +126,42 @@ impl TimelineStore {
 
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
+    }
+
+    pub fn sort_by_pts_in(&mut self) {
+        let mut permutation: Vec<usize> = (0..self.ids.len()).collect();
+        permutation.sort_by_key(|&i| self.pts_in[i]);
+
+        fn apply_perm<T: Clone>(v: &mut Vec<T>, perm: &[usize]) {
+            let old = v.clone();
+            for (new_idx, &old_idx) in perm.iter().enumerate() {
+                v[new_idx] = old[old_idx].clone();
+            }
+        }
+
+        apply_perm(&mut self.ids, &permutation);
+        apply_perm(&mut self.track_ids, &permutation);
+        apply_perm(&mut self.source_ids, &permutation);
+        apply_perm(&mut self.pts_in, &permutation);
+        apply_perm(&mut self.pts_out, &permutation);
+        apply_perm(&mut self.source_in, &permutation);
+        apply_perm(&mut self.kind, &permutation);
+        apply_perm(&mut self.layer_order, &permutation);
+        apply_perm(&mut self.opacity, &permutation);
+        apply_perm(&mut self.transform, &permutation);
+        apply_perm(&mut self.blend_mode, &permutation);
+        apply_perm(&mut self.crop, &permutation);
+        apply_perm(&mut self.corner_pin, &permutation);
+        apply_perm(&mut self.matte_mode, &permutation);
+        apply_perm(&mut self.volume, &permutation);
+        apply_perm(&mut self.pan, &permutation);
+        apply_perm(&mut self.audio_muted, &permutation);
+        apply_perm(&mut self.fade_in_pts, &permutation);
+        apply_perm(&mut self.fade_out_pts, &permutation);
+        apply_perm(&mut self.speed, &permutation);
+        apply_perm(&mut self.pitch, &permutation);
+        apply_perm(&mut self.effect_start, &permutation);
+        apply_perm(&mut self.effect_count, &permutation);
     }
 
     pub fn assert_sorted(&self) {
@@ -125,9 +181,15 @@ impl TimelineStore {
         assert_eq!(self.layer_order.len(), n);
         assert_eq!(self.opacity.len(), n);
         assert_eq!(self.transform.len(), n);
+        assert_eq!(self.blend_mode.len(), n);
+        assert_eq!(self.crop.len(), n);
+        assert_eq!(self.corner_pin.len(), n);
+        assert_eq!(self.matte_mode.len(), n);
         assert_eq!(self.volume.len(), n);
         assert_eq!(self.pan.len(), n);
         assert_eq!(self.audio_muted.len(), n);
+        assert_eq!(self.fade_in_pts.len(), n);
+        assert_eq!(self.fade_out_pts.len(), n);
         assert_eq!(self.speed.len(), n);
         assert_eq!(self.pitch.len(), n);
         assert_eq!(self.effect_start.len(), n);
@@ -226,6 +288,22 @@ impl TimelineStore {
         self.audio_muted[idx] = muted;
     }
 
+    pub fn fade_in_pts_at(&self, idx: usize) -> i64 {
+        self.fade_in_pts[idx]
+    }
+
+    pub fn set_fade_in_pts_at(&mut self, idx: usize, pts: i64) {
+        self.fade_in_pts[idx] = pts.max(0);
+    }
+
+    pub fn fade_out_pts_at(&self, idx: usize) -> i64 {
+        self.fade_out_pts[idx]
+    }
+
+    pub fn set_fade_out_pts_at(&mut self, idx: usize, pts: i64) {
+        self.fade_out_pts[idx] = pts.max(0);
+    }
+
     pub fn speed_at(&self, idx: usize) -> f32 {
         self.speed[idx]
     }
@@ -256,5 +334,52 @@ impl TimelineStore {
 
     pub fn set_pitch_at(&mut self, idx: usize, pitch: f32) {
         self.pitch[idx] = pitch;
+    }
+
+    pub fn blend_mode_at(&self, idx: usize) -> BlendMode {
+        self.blend_mode.get(idx).copied().unwrap_or_default()
+    }
+
+    pub fn set_blend_mode_at(&mut self, idx: usize, mode: BlendMode) {
+        if idx < self.blend_mode.len() {
+            self.blend_mode[idx] = mode;
+        }
+    }
+
+    pub fn crop_at(&self, idx: usize) -> &CropRect {
+        static DEFAULT_CROP: CropRect = CropRect { left: 0.0, top: 0.0, right: 1.0, bottom: 1.0, feather: 0.0 };
+        self.crop.get(idx).unwrap_or(&DEFAULT_CROP)
+    }
+
+    pub fn set_crop_at(&mut self, idx: usize, crop: CropRect) {
+        if idx < self.crop.len() {
+            self.crop[idx] = crop;
+        }
+    }
+
+    pub fn corner_pin_at(&self, idx: usize) -> &CornerPin {
+        static DEFAULT_PIN: CornerPin = CornerPin {
+            top_left: [0.0, 0.0],
+            top_right: [1.0, 0.0],
+            bottom_left: [0.0, 1.0],
+            bottom_right: [1.0, 1.0],
+        };
+        self.corner_pin.get(idx).unwrap_or(&DEFAULT_PIN)
+    }
+
+    pub fn set_corner_pin_at(&mut self, idx: usize, pin: CornerPin) {
+        if idx < self.corner_pin.len() {
+            self.corner_pin[idx] = pin;
+        }
+    }
+
+    pub fn matte_mode_at(&self, idx: usize) -> MatteMode {
+        self.matte_mode.get(idx).copied().unwrap_or_default()
+    }
+
+    pub fn set_matte_mode_at(&mut self, idx: usize, mode: MatteMode) {
+        if idx < self.matte_mode.len() {
+            self.matte_mode[idx] = mode;
+        }
     }
 }

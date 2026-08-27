@@ -56,6 +56,8 @@ pub struct ActiveAudioDecoder {
     volume: f32,
     pan: f32,
     muted: bool,
+    fade_in_pts: i64,
+    fade_out_pts: i64,
     speed: f32,
     source_in_pts: i64,
     source_out_pts: i64,
@@ -68,6 +70,8 @@ pub struct ActiveClipAudioInfo {
     pub volume: f32,
     pub pan: f32,
     pub muted: bool,
+    pub fade_in_pts: i64,
+    pub fade_out_pts: i64,
     pub speed: f32,
     pub pitch: f32,
     pub source_pts: i64,
@@ -127,6 +131,7 @@ pub struct NexirApp {
     cuda_ctx: Option<Arc<CudaContext>>,
     still_cache: Mutex<StillImageCache>,
     text_cache: Mutex<nexir::render::text_cache::TextCache>,
+    composite_pipelines: Arc<nexir::render::nodes::composite::CompositePipelines>,
 }
 
 pub struct AppResponse {
@@ -297,6 +302,13 @@ impl NexirApp {
             interop_capability
         );
 
+        let composite_pipelines = Arc::new(nexir::render::nodes::composite::CompositePipelines::new(
+            &device,
+            &shaders,
+            8,
+            wgpu::TextureFormat::Rgba16Float,
+        ));
+
         log::info!("NexirApp::new: completed successfully!");
         Self {
             egui_ctx,
@@ -341,6 +353,7 @@ impl NexirApp {
             cuda_ctx: None,
             still_cache: Mutex::new(StillImageCache::default()),
             text_cache: Mutex::new(nexir::render::text_cache::TextCache::default()),
+            composite_pipelines,
         }
     }
 
@@ -483,7 +496,11 @@ impl NexirApp {
                             } else {
                                 s.frame_rate.unwrap_or(Rational { num: 30, den: 1 })
                             },
-                            pixel_fmt: PixelFormat::Yuv420p,
+                            pixel_fmt: if s.color_info.bit_depth >= 10 {
+                                PixelFormat::P010
+                            } else {
+                                PixelFormat::Yuv420p
+                            },
                             color_info: s.color_info,
                             // convert from stream timebase to project timebase
                             duration_pts: if is_still_image {
@@ -493,6 +510,7 @@ impl NexirApp {
                             },
                             is_vfr: !is_still_image && s.is_vfr,
                             time_base: s.time_base,
+                            rotation: nexir::timeline::source::VideoRotation::None,
                         });
 
                         let ai = demuxer.audio_stream.as_ref().map(|s| AudioStreamInfo {
@@ -535,9 +553,12 @@ impl NexirApp {
         let mut active_clips = Vec::new();
         query_active(&self.project.clips, playhead_pts, &mut active_clips);
 
-        let mut viewport_size = egui::Vec2::ZERO;
+        let mut vp_result = crate::layout::viewport::ViewportDrawResult {
+            size: egui::Vec2::ZERO,
+            eyedropper_pick: None,
+        };
         egui::CentralPanel::default().show(&self.egui_ctx, |ui| {
-            viewport_size = crate::layout::viewport::draw(
+            vp_result = crate::layout::viewport::draw(
                 ui,
                 self.preview.texture_id,
                 self.preview.video_width,
@@ -546,8 +567,69 @@ impl NexirApp {
                 &mut self.project,
                 &active_clips,
                 &mut self.history,
+                self.inspector.eyedropper_active,
             );
         });
+        let viewport_size = vp_result.size;
+
+        // Eyedropper: if a pick was requested and we have a preview texture, do a GPU readback.
+        if let Some(uv) = vp_result.eyedropper_pick {
+            if let Some(ref tex) = self.preview.texture {
+                let w = tex.width();
+                let h = tex.height();
+                let px = (uv.x * w as f32) as u32;
+                let py = (uv.y * h as f32) as u32;
+                let px = px.min(w.saturating_sub(1));
+                let py = py.min(h.saturating_sub(1));
+
+                // Each texel is 4 bytes (RGBA8). We read a 4-byte block.
+                let bytes_per_row = (w * 4 + 255) & !255u32; // align to 256
+                let buf_size = (bytes_per_row * h) as u64;
+
+                let staging = self.device.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("eyedropper_staging"),
+                    size: buf_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+
+                let mut enc = self.device.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: Some("eyedropper_enc") }
+                );
+                enc.copy_texture_to_buffer(
+                    tex.as_image_copy(),
+                    wgpu::ImageCopyBuffer {
+                        buffer: &staging,
+                        layout: wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(bytes_per_row),
+                            rows_per_image: Some(h),
+                        },
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+                self.device.queue.submit([enc.finish()]);
+                self.device.device.poll(wgpu::Maintain::Wait);
+
+                {
+                    let buf_slice = staging.slice(..);
+                    buf_slice.map_async(wgpu::MapMode::Read, |_| {});
+                    self.device.device.poll(wgpu::Maintain::Wait);
+                    let data = buf_slice.get_mapped_range();
+                    let byte_offset = (py * bytes_per_row + px * 4) as usize;
+                    if byte_offset + 3 < data.len() {
+                        let r = data[byte_offset]     as f32 / 255.0;
+                        let g = data[byte_offset + 1] as f32 / 255.0;
+                        let b = data[byte_offset + 2] as f32 / 255.0;
+                        self.inspector.chroma_key_color = [r, g, b];
+                        log::info!("Eyedropper picked color [{:.3}, {:.3}, {:.3}] at ({}, {})", r, g, b, px, py);
+                    }
+                }
+                staging.unmap();
+                self.inspector.eyedropper_active = false;
+                self.egui_ctx.request_repaint();
+            }
+        }
 
         let mouse_released = self.egui_ctx.input(|i| i.pointer.any_released());
         if mouse_released {
@@ -598,9 +680,11 @@ impl NexirApp {
                                     sources.path(source_id).map(|p| p.as_ref().clone())
                                 };
                                 if let Some(path) = path {
-                                    let volume = self.project.clips.volume_at(clip.store_index);
-                                    let pan = self.project.clips.pan_at(clip.store_index);
+                                    let volume = self.project.clips.volume_at(clip.store_index) * track.gain;
+                                    let pan = (self.project.clips.pan_at(clip.store_index) + track.pan).clamp(-1.0, 1.0);
                                     let muted = self.project.clips.audio_muted_at(clip.store_index);
+                                    let fade_in_pts = self.project.clips.fade_in_pts_at(clip.store_index);
+                                    let fade_out_pts = self.project.clips.fade_out_pts_at(clip.store_index);
                                     let speed = self.project.clips.speed_at(clip.store_index);
                                     let pitch = self.project.clips.pitch_at(clip.store_index);
                                     let source_in_pts = self.project.clips.source_in_at(clip.store_index);
@@ -615,6 +699,8 @@ impl NexirApp {
                                         volume,
                                         pan,
                                         muted,
+                                        fade_in_pts,
+                                        fade_out_pts,
                                         speed,
                                         pitch,
                                         source_pts: clip.source_pts,
@@ -646,6 +732,8 @@ impl NexirApp {
                             || existing.volume != info.volume
                             || existing.pan != info.pan
                             || existing.muted != info.muted
+                            || existing.fade_in_pts != info.fade_in_pts
+                            || existing.fade_out_pts != info.fade_out_pts
                             || existing.speed != info.speed
                             || existing.source_in_pts != info.source_in_pts
                             || existing.source_out_pts != info.source_out_pts
@@ -688,6 +776,8 @@ impl NexirApp {
                                 info_clone.volume,
                                 info_clone.pan,
                                 info_clone.muted,
+                                info_clone.fade_in_pts,
+                                info_clone.fade_out_pts,
                                 info_clone.speed,
                                 info_clone.pitch,
                                 info_clone.source_in_pts,
@@ -705,6 +795,8 @@ impl NexirApp {
                             volume: info.volume,
                             pan: info.pan,
                             muted: info.muted,
+                            fade_in_pts: info.fade_in_pts,
+                            fade_out_pts: info.fade_out_pts,
                             speed: info.speed,
                             source_in_pts: info.source_in_pts,
                             source_out_pts: info.source_out_pts,
@@ -962,12 +1054,11 @@ impl NexirApp {
         let mut compiler = RenderGraphCompiler::new();
         let mut id_counter = 2; // 0=FINAL_COLOR, 1=SCREEN
 
-        let mut comp_node = CompositeNode::new(
+        let mut comp_node = CompositeNode::with_pipelines(
             device,
-            &self.shaders,
+            Arc::clone(&self.composite_pipelines),
             ResourceId::FINAL_COLOR,
             8, // max clips
-            wgpu::TextureFormat::Rgba16Float,
         );
 
         for clip in &frame.clips {
@@ -983,7 +1074,6 @@ impl NexirApp {
 
             if is_still {
                 if let Some(path) = self.project.sources.read().unwrap().path(clip.source_id) {
-                    log::info!("compile_export_graph: clip source_id={:?} path={:?} detected as still", clip.source_id, path);
                     if let Some(cached) = self.still_cache.lock().unwrap().get_or_load(device, path.as_ref()) {
                         let rgba_id = ResourceId::next(&mut id_counter);
                         compiler.add_node(Box::new(StillImageUploadNode::new(cached, rgba_id)));
@@ -1001,7 +1091,6 @@ impl NexirApp {
             if let nexir::timeline::store::ClipKind::Text {
                 text, font_size, color, stroke_color, stroke_width, background_color, bg_padding
             } = &clip.kind {
-                log::info!("compile_export_graph: clip source_id={:?} detected as Text", clip.source_id);
                 let cached = self.text_cache.lock().unwrap().get_or_create(
                     device, text, *font_size, *color,
                     *stroke_color, *stroke_width, *background_color, *bg_padding,
@@ -1021,8 +1110,17 @@ impl NexirApp {
             let y_id = ResourceId::next(&mut id_counter);
             let uv_id = ResourceId::next(&mut id_counter);
 
+            let color_info = self
+                .project
+                .sources
+                .read()
+                .unwrap()
+                .video_info(clip.source_id)
+                .map(|vi| vi.color_info)
+                .unwrap_or_default();
+
             let mut upload_node =
-                YuvUploadNode::new(device, 0, clip.clip_width, clip.clip_height, y_id, uv_id);
+                YuvUploadNode::new_with_depth(device, 0, clip.clip_width, clip.clip_height, y_id, uv_id, color_info.bit_depth);
 
             // Upload YUV data from the slot pool into staging buffers
             self.io_layer.pool.with_buffer_read(slot_id, |data| {
@@ -1033,6 +1131,8 @@ impl NexirApp {
 
             // Add YuvToRgb node
             let rgba_id = ResourceId::next(&mut id_counter);
+
+
             compiler.add_node(Box::new(
                 nexir::render::nodes::yuv_to_rgb::YuvToRgbNode::new(
                     device,
@@ -1043,18 +1143,96 @@ impl NexirApp {
                     rgba_id,
                     clip.clip_width,
                     clip.clip_height,
-                    nexir::timeline::source::ColorInfo {
-                        transfer_fn: nexir::timeline::source::TransferFunction::Bt709,
-                        range: nexir::timeline::source::ColorRange::Limited,
-                        matrix: nexir::timeline::source::MatrixCoefficients::Bt709,
-                        primaries: nexir::timeline::source::ColorPrimaries::Bt709,
-                        bit_depth: 8,
-                    },
+                    color_info,
                 ),
             ));
 
+            // Insert tone-mapping for HDR clips targeting SDR viewport
+            let final_rgba_id = if color_info.is_hdr() {
+                use nexir::render::nodes::tonemap::{
+                    ToneMapNode, InputTransferFn, GamutConversion, ToneMapPushConstants,
+                    ToneMapMode,
+                };
+                use nexir::timeline::source::TransferFunction;
+
+                let tonemapped_id = ResourceId::next(&mut id_counter);
+                let trc = match color_info.transfer_fn {
+                    TransferFunction::Pq  => InputTransferFn::Pq,
+                    TransferFunction::Hlg => InputTransferFn::Hlg,
+                    _                     => InputTransferFn::Linear,
+                };
+                let gamut = if color_info.effective_primaries(
+                    clip.clip_width, clip.clip_height
+                ) == nexir::timeline::source::ColorPrimaries::Bt2020 {
+                    GamutConversion::Bt2020ToBt709
+                } else {
+                    GamutConversion::None
+                };
+                let tm_params = ToneMapPushConstants::for_sdr_preview(
+                    trc,
+                    gamut,
+                    ToneMapMode::AcesFilmic,
+                    1000.0,
+                    clip.clip_width,
+                    clip.clip_height,
+                );
+                compiler.add_node(Box::new(ToneMapNode::new(
+                    device,
+                    &self.shaders,
+                    &self.compute_cache,
+                    rgba_id,
+                    tonemapped_id,
+                    tm_params,
+                )));
+                tonemapped_id
+            } else {
+                rgba_id
+            };
+
+            let post_process_id = if self.inspector.chroma_key_enabled {
+                let r = self.inspector.chroma_key_color[0];
+                let g = self.inspector.chroma_key_color[1];
+                let b = self.inspector.chroma_key_color[2];
+                let max = r.max(g).max(b);
+                let min = r.min(g).min(b);
+                let delta = max - min;
+                let hue = if delta < 1e-5 {
+                    0.0
+                } else if (max - r).abs() < 1e-5 {
+                    ((g - b) / delta).rem_euclid(6.0) * 60.0
+                } else if (max - g).abs() < 1e-5 {
+                    ((b - r) / delta + 2.0) * 60.0
+                } else {
+                    ((r - g) / delta + 4.0) * 60.0
+                };
+                let tol = (self.inspector.chroma_key_tolerance * 180.0).max(1.0);
+                let soft = (self.inspector.chroma_key_softness * 180.0).min(tol - 0.1).max(0.01);
+                let ck_params = nexir::render::nodes::chroma_key::ChromaKeyParams {
+                    key_hue: hue,
+                    tolerance: tol,
+                    softness: soft,
+                    min_saturation: 0.15,
+                    min_value: 0.08,
+                    spill_suppress: 0.3,
+                    width: clip.clip_width,
+                    height: clip.clip_height,
+                };
+                let ck_out_id = ResourceId::next(&mut id_counter);
+                compiler.add_node(Box::new(nexir::render::nodes::chroma_key::ChromaKeyNode::new(
+                    device,
+                    &self.shaders,
+                    &self.compute_cache,
+                    final_rgba_id,
+                    ck_out_id,
+                    ck_params,
+                )));
+                ck_out_id
+            } else {
+                final_rgba_id
+            };
+
             // Provide RGBA texture to compositor
-            comp_node.input_textures.push(rgba_id);
+            comp_node.input_textures.push(post_process_id);
         }
 
         compiler.add_node(Box::new(comp_node));
@@ -1209,7 +1387,8 @@ impl NexirApp {
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba8UnormSrgb,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 });
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

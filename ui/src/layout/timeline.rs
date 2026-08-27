@@ -1565,14 +1565,12 @@ pub fn draw(
                                             nexir::timeline::rational::Rational { num: 30, den: 1 },
                                         )
                                     },
-                                    pixel_fmt: nexir::timeline::source::PixelFormat::Yuv420p,
-                                    color_info: nexir::timeline::source::ColorInfo {
-                                        transfer_fn: nexir::timeline::source::TransferFunction::Bt709,
-                                        range: nexir::timeline::source::ColorRange::Limited,
-                                        matrix: nexir::timeline::source::MatrixCoefficients::Bt709,
-                                        primaries: nexir::timeline::source::ColorPrimaries::Bt709,
-                                        bit_depth: 8,
+                                    pixel_fmt: if s.color_info.bit_depth >= 10 {
+                                        nexir::timeline::source::PixelFormat::P010
+                                    } else {
+                                        nexir::timeline::source::PixelFormat::Yuv420p
                                     },
+                                    color_info: s.color_info,
                                     duration_pts: if is_still_image {
                                         0
                                     } else {
@@ -1580,6 +1578,7 @@ pub fn draw(
                                     },
                                     is_vfr: !is_still_image && s.is_vfr,
                                     time_base: s.time_base,
+                                    rotation: nexir::timeline::source::VideoRotation::None,
                                 }
                             });
                             let ai = demuxer.audio_stream.as_ref().map(|s| {
@@ -1657,8 +1656,11 @@ pub fn draw(
                         volume: 1.0,
                         pan: 0.0,
                         audio_muted: false,
+                        fade_in_pts: 0,
+                        fade_out_pts: 0,
                         speed: 1.0,
                         pitch: 0.0,
+                        ..Default::default()
                     });
 
                     // NOTE: Auto-inserting an audio clip on import is intentionally disabled.

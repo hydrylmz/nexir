@@ -1,6 +1,6 @@
 // src/render/frame_state.rs
 
-use crate::timeline::transform::ClipTransform;
+use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode};
 use crate::timeline::ids::SourceId;
 
 /// One clip's contribution to the current frame.
@@ -16,6 +16,10 @@ pub struct ClipRenderEntry {
     pub clip_height:   u32,
     pub transform:     ClipTransform,
     pub opacity:       f32,
+    pub blend_mode:    BlendMode,
+    pub crop:          CropRect,
+    pub corner_pin:    CornerPin,
+    pub matte_mode:    MatteMode,
     pub is_nv12:       bool,
     pub kind:          crate::timeline::store::ClipKind,
 }

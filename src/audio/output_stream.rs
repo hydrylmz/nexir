@@ -97,10 +97,8 @@ fn audio_callback(output: &mut [f32], mixer_bufs: &MixerBusList, clock: &MasterC
         }
     }
 
-    // Hard clip.
-    for s in output.iter_mut() {
-        *s = s.clamp(-1.0, 1.0);
-    }
+    // Soft limiter prevents digital clipping.
+    crate::audio::audio_mixer::soft_limit_buffer(output);
 }
 
 #[derive(Debug)]

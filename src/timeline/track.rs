@@ -2,6 +2,10 @@
 
 use crate::timeline::ids::TrackId;
 
+fn default_track_gain() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub id:        TrackId,
@@ -11,6 +15,12 @@ pub struct Track {
     pub solo:      bool,
     pub locked:    bool,      
     pub height_px: u16,       
+    /// Track-level audio gain multiplier (1.0 = unity).
+    #[serde(default = "default_track_gain")]
+    pub gain:      f32,
+    /// Track-level stereo pan (-1.0 = full left, 0.0 = center, 1.0 = full right).
+    #[serde(default)]
+    pub pan:       f32,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -27,12 +37,12 @@ pub enum TrackKind {
 impl Track {
     /// Construct a named video track.
     pub fn new_video(id: TrackId, name: impl Into<String>) -> Self {
-        Track { id, kind: TrackKind::Video, name: name.into(), mute: false, solo: false, locked: false, height_px: 80 }
+        Track { id, kind: TrackKind::Video, name: name.into(), mute: false, solo: false, locked: false, height_px: 80, gain: 1.0, pan: 0.0 }
     }
 
     /// Construct a stereo audio track at 48 kHz.
     pub fn new_audio(id: TrackId, name: impl Into<String>) -> Self {
-        Track { id, kind: TrackKind::Audio { sample_rate: 48_000, channels: 2 }, name: name.into(), mute: false, solo: false, locked: false, height_px: 60 }
+        Track { id, kind: TrackKind::Audio { sample_rate: 48_000, channels: 2 }, name: name.into(), mute: false, solo: false, locked: false, height_px: 60, gain: 1.0, pan: 0.0 }
     }
 
     /// Returns true if this track should contribute to rendering.

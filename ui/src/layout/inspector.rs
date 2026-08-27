@@ -1,6 +1,7 @@
 use crate::history::HistoryState;
 use egui::{Color32, RichText, Ui};
 use nexir::project::Project;
+use nexir::timeline::transform::{BlendMode, CropRect};
 
 pub struct InspectorState {
     // Local edit copies — written back to the project on change
@@ -9,9 +10,18 @@ pub struct InspectorState {
     pub pos_y: f32,
     pub rotation: f32,
     pub opacity: f32,
+    pub blend_mode: BlendMode,
+    pub crop_left: f32,
+    pub crop_top: f32,
+    pub crop_right: f32,
+    pub crop_bottom: f32,
+    pub crop_feather: f32,
+
     pub volume: f32,
     pub pan: f32,
     pub audio_muted: bool,
+    pub fade_in_ms: f32,
+    pub fade_out_ms: f32,
     pub speed: f32,
 
     // Text clip editing
@@ -27,6 +37,15 @@ pub struct InspectorState {
     pub bg_color: [f32; 4],
     pub bg_padding: f32,
 
+    // Effects
+    pub chroma_key_enabled: bool,
+    pub chroma_key_color: [f32; 3],
+    pub chroma_key_tolerance: f32,
+    pub chroma_key_softness: f32,
+
+    /// When true, the next viewport click picks a color for chroma key.
+    pub eyedropper_active: bool,
+
     /// The clip store-index we last loaded values from.
     last_loaded_clip: Option<usize>,
 }
@@ -39,9 +58,17 @@ impl Default for InspectorState {
             pos_y: 0.0,
             rotation: 0.0,
             opacity: 100.0,
+            blend_mode: BlendMode::Normal,
+            crop_left: 0.0,
+            crop_top: 0.0,
+            crop_right: 100.0,
+            crop_bottom: 100.0,
+            crop_feather: 0.0,
             volume: 100.0,
             pan: 0.0,
             audio_muted: false,
+            fade_in_ms: 0.0,
+            fade_out_ms: 0.0,
             speed: 1.0,
             text_content: String::new(),
             font_size: 48.0,
@@ -52,6 +79,11 @@ impl Default for InspectorState {
             bg_enabled: false,
             bg_color: [0.0, 0.0, 0.0, 0.85],
             bg_padding: 12.0,
+            chroma_key_enabled: false,
+            chroma_key_color: [0.0, 1.0, 0.0],
+            chroma_key_tolerance: 0.3,
+            chroma_key_softness: 0.1,
+            eyedropper_active: false,
             last_loaded_clip: None,
         }
     }
@@ -84,7 +116,7 @@ fn draw_inner(
     history: &mut HistoryState,
 ) {
     // ── Sync local state when selection changes ──────────────────────────
-    if selected_clip != state.last_loaded_clip || selected_clip.is_some() {
+    if selected_clip != state.last_loaded_clip {
         if let Some(idx) = selected_clip {
             let t = project.clips.transform_at(idx);
             state.pos_x = t.position[0];
@@ -95,7 +127,16 @@ fn draw_inner(
             state.volume = project.clips.volume_at(idx) * 100.0;
             state.pan = project.clips.pan_at(idx) * 100.0;
             state.audio_muted = project.clips.audio_muted_at(idx);
+            state.fade_in_ms = (project.clips.fade_in_pts_at(idx) as f64 * 1000.0 / 90_000.0) as f32;
+            state.fade_out_ms = (project.clips.fade_out_pts_at(idx) as f64 * 1000.0 / 90_000.0) as f32;
             state.speed = project.clips.speed_at(idx);
+            state.blend_mode = project.clips.blend_mode_at(idx);
+            let crop = project.clips.crop_at(idx);
+            state.crop_left = crop.left * 100.0;
+            state.crop_top = crop.top * 100.0;
+            state.crop_right = crop.right * 100.0;
+            state.crop_bottom = crop.bottom * 100.0;
+            state.crop_feather = crop.feather;
             // Load text clip properties
             match project.clips.kind_at(idx) {
                 nexir::timeline::store::ClipKind::Text {
@@ -294,10 +335,13 @@ fn draw_inner(
                 ui.add_space(6.0);
             }
 
-            // ── Transform ────────────────────────────────────────────────
+            // ── Transform & Compositing ──────────────────────────────────
             let mut transform_changed = false;
             let mut opacity_changed = false;
-            ui.collapsing("🎬  Transform", |ui| {
+            let mut blend_changed = false;
+            let mut crop_changed = false;
+
+            ui.collapsing("🎬  Transform & Compositing", |ui| {
                 egui::Grid::new("transform_grid")
                     .num_columns(2)
                     .spacing([8.0, 6.0])
@@ -331,21 +375,75 @@ fn draw_inner(
                             .add(egui::Slider::new(&mut state.opacity, 0.0..=100.0).suffix("%"))
                             .changed();
                         ui.end_row();
+
+                        // ── Blend Mode ────────────────────────────────────
+                        ui.label("Blend Mode");
+                        egui::ComboBox::from_id_source("blend_mode_dropdown")
+                            .selected_text(state.blend_mode.label())
+                            .show_ui(ui, |ui| {
+                                for &mode in BlendMode::all() {
+                                    if ui.selectable_value(&mut state.blend_mode, mode, mode.label()).clicked() {
+                                        blend_changed = true;
+                                    }
+                                }
+                            });
+                        ui.end_row();
                     });
 
                 ui.add_space(4.0);
-                if ui.button("↺  Reset").clicked() {
+
+                // ── Crop & Feathering ─────────────────────────────────────
+                ui.collapsing("✂  Crop & Feather", |ui| {
+                    egui::Grid::new("crop_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Left");
+                            crop_changed |= ui.add(egui::Slider::new(&mut state.crop_left, 0.0..=100.0).suffix("%")).changed();
+                            ui.end_row();
+
+                            ui.label("Top");
+                            crop_changed |= ui.add(egui::Slider::new(&mut state.crop_top, 0.0..=100.0).suffix("%")).changed();
+                            ui.end_row();
+
+                            ui.label("Right");
+                            crop_changed |= ui.add(egui::Slider::new(&mut state.crop_right, 0.0..=100.0).suffix("%")).changed();
+                            ui.end_row();
+
+                            ui.label("Bottom");
+                            crop_changed |= ui.add(egui::Slider::new(&mut state.crop_bottom, 0.0..=100.0).suffix("%")).changed();
+                            ui.end_row();
+
+                            ui.label("Feather");
+                            crop_changed |= ui.add(egui::Slider::new(&mut state.crop_feather, 0.0..=1.0)).changed();
+                            ui.end_row();
+                        });
+
+                    if ui.button("↺  Reset Crop").clicked() {
+                        state.crop_left = 0.0;
+                        state.crop_top = 0.0;
+                        state.crop_right = 100.0;
+                        state.crop_bottom = 100.0;
+                        state.crop_feather = 0.0;
+                        crop_changed = true;
+                    }
+                });
+
+                ui.add_space(4.0);
+                if ui.button("↺  Reset Transform").clicked() {
                     state.scale = 1.0;
                     state.pos_x = 0.0;
                     state.pos_y = 0.0;
                     state.rotation = 0.0;
                     state.opacity = 100.0;
+                    state.blend_mode = BlendMode::Normal;
                     transform_changed = true;
                     opacity_changed = true;
+                    blend_changed = true;
                 }
             });
             // Write edited values back into the clip store
-            if transform_changed || opacity_changed {
+            if transform_changed || opacity_changed || blend_changed || crop_changed {
                 history.record(project);
             }
             if transform_changed {
@@ -358,6 +456,21 @@ fn draw_inner(
             }
             if opacity_changed {
                 project.clips.set_opacity_at(idx, state.opacity / 100.0);
+            }
+            if blend_changed {
+                project.clips.set_blend_mode_at(idx, state.blend_mode);
+            }
+            if crop_changed {
+                project.clips.set_crop_at(
+                    idx,
+                    CropRect {
+                        left: state.crop_left / 100.0,
+                        top: state.crop_top / 100.0,
+                        right: state.crop_right / 100.0,
+                        bottom: state.crop_bottom / 100.0,
+                        feather: state.crop_feather,
+                    },
+                );
             }
 
             ui.add_space(6.0);
@@ -392,6 +505,26 @@ fn draw_inner(
                             )
                             .changed();
                         ui.end_row();
+
+                        ui.label("Fade In");
+                        audio_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut state.fade_in_ms, 0.0..=5000.0)
+                                    .suffix(" ms")
+                                    .fixed_decimals(0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Fade Out");
+                        audio_changed |= ui
+                            .add(
+                                egui::Slider::new(&mut state.fade_out_ms, 0.0..=5000.0)
+                                    .suffix(" ms")
+                                    .fixed_decimals(0),
+                            )
+                            .changed();
+                        ui.end_row();
                     });
 
                 ui.add_space(4.0);
@@ -412,6 +545,8 @@ fn draw_inner(
                         state.volume = 100.0;
                         state.pan = 0.0;
                         state.audio_muted = false;
+                        state.fade_in_ms = 0.0;
+                        state.fade_out_ms = 0.0;
                         audio_changed = true;
                     }
                 });
@@ -425,6 +560,11 @@ fn draw_inner(
                     .clips
                     .set_pan_at(idx, (state.pan / 100.0).clamp(-1.0, 1.0));
                 project.clips.set_audio_muted_at(idx, state.audio_muted);
+                // Convert ms → 90 kHz PTS ticks
+                let fade_in_pts = (state.fade_in_ms as f64 * 90_000.0 / 1000.0).round() as i64;
+                let fade_out_pts = (state.fade_out_ms as f64 * 90_000.0 / 1000.0).round() as i64;
+                project.clips.set_fade_in_pts_at(idx, fade_in_pts);
+                project.clips.set_fade_out_pts_at(idx, fade_out_pts);
             }
 
             ui.add_space(6.0);
@@ -495,7 +635,53 @@ fn draw_inner(
 
             // ── Effects ───────────────────────────────────────────────────
             ui.collapsing("✨  Effects", |ui| {
-                ui.label("No effects applied.");
+                ui.collapsing("🟢  Chroma Key (Green Screen)", |ui| {
+                    egui::Grid::new("chroma_key_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Enable");
+                            ui.checkbox(&mut state.chroma_key_enabled, "");
+                            ui.end_row();
+
+                            if state.chroma_key_enabled {
+                                ui.label("Key Color");
+                                ui.horizontal(|ui| {
+                                    ui.color_edit_button_rgb(&mut state.chroma_key_color);
+                                    let eye_label = if state.eyedropper_active { "💉 Picking…" } else { "🔍 Pick" };
+                                    let eye_btn = egui::Button::new(eye_label);
+                                    let eye_btn = if state.eyedropper_active {
+                                        eye_btn.fill(egui::Color32::from_rgb(200, 120, 0))
+                                    } else {
+                                        eye_btn
+                                    };
+                                    if ui.add(eye_btn).clicked() {
+                                        state.eyedropper_active = !state.eyedropper_active;
+                                    }
+                                });
+                                ui.end_row();
+
+                                ui.label("Presets");
+                                ui.horizontal(|ui| {
+                                    if ui.button("🟩 Green").clicked() {
+                                        state.chroma_key_color = [0.0, 1.0, 0.0];
+                                    }
+                                    if ui.button("🟦 Blue").clicked() {
+                                        state.chroma_key_color = [0.0, 0.0, 1.0];
+                                    }
+                                });
+                                ui.end_row();
+
+                                ui.label("Tolerance");
+                                ui.add(egui::Slider::new(&mut state.chroma_key_tolerance, 0.01..=1.0));
+                                ui.end_row();
+
+                                ui.label("Softness");
+                                ui.add(egui::Slider::new(&mut state.chroma_key_softness, 0.0..=state.chroma_key_tolerance));
+                                ui.end_row();
+                            }
+                        });
+                });
             });
         }
     }

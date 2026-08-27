@@ -44,6 +44,8 @@ pub struct AudioDecoder {
     speed: f32,
     source_in_pts: i64,
     source_out_pts: i64,
+    fade_in_pts: i64,
+    fade_out_pts: i64,
     current_seek_pts: i64,
     current_timeline_pts: i64,
     current_timeline_out_pts: i64,
@@ -62,6 +64,8 @@ impl AudioDecoder {
         volume: f32,
         pan: f32,
         muted: bool,
+        fade_in_pts: i64,
+        fade_out_pts: i64,
         speed: f32,
         pitch: f32,
         source_in_pts: i64,
@@ -147,6 +151,8 @@ impl AudioDecoder {
             volume,
             pan,
             muted,
+            fade_in_pts,
+            fade_out_pts,
             samples_written: 0,
             stream_tb,
             path: path.to_path_buf(),
@@ -295,28 +301,25 @@ impl AudioDecoder {
         if self.muted {
             interleaved.fill(0.0);
         } else {
-            let angle = (self.pan + 1.0) * std::f32::consts::PI / 4.0; // 0 (full left) → π/2 (full right)
-            let base_left_gain = self.volume * angle.cos();
-            let base_right_gain = self.volume * angle.sin();
+            let (c_pan_l, c_pan_r) = crate::audio::audio_mixer::constant_power_pan(self.pan);
+            let base_left_gain = self.volume * c_pan_l;
+            let base_right_gain = self.volume * c_pan_r;
             for (sample_idx, frame) in interleaved.chunks_exact_mut(2).enumerate() {
                 let current_sample_index = self.samples_written + sample_idx as u64;
                 let current_timeline_pts = self.current_timeline_pts
                     + (current_sample_index as f64 * 90000.0 / OUT_SAMPLE_RATE as f64) as i64;
 
-                let mut fade_factor = 1.0f32;
-                let dist_from_start = current_timeline_pts
-                    - (self.current_timeline_pts
-                        - self.timeline_pts_since_source_in(self.current_seek_pts));
-                if dist_from_start < 13500 {
-                    fade_factor = fade_factor.min((dist_from_start as f32 / 13500.0).max(0.0));
-                }
-                let dist_to_end = self.current_timeline_out_pts - current_timeline_pts;
-                if dist_to_end < 13500 {
-                    fade_factor = fade_factor.min((dist_to_end as f32 / 13500.0).max(0.0));
-                }
-                if current_timeline_pts > self.current_timeline_out_pts {
-                    fade_factor = 0.0;
-                }
+                let clip_pts_in = self.current_timeline_pts
+                    - self.timeline_pts_since_source_in(self.current_seek_pts);
+                let clip_pts_out = self.current_timeline_out_pts;
+
+                let fade_factor = crate::audio::audio_mixer::compute_fade_multiplier(
+                    current_timeline_pts,
+                    clip_pts_in,
+                    clip_pts_out,
+                    self.fade_in_pts,
+                    self.fade_out_pts,
+                );
 
                 frame[0] *= base_left_gain * fade_factor;
                 frame[1] *= base_right_gain * fade_factor;
@@ -366,9 +369,9 @@ impl AudioDecoder {
             if self.muted {
                 interleaved.fill(0.0);
             } else {
-                let angle = (self.pan + 1.0) * std::f32::consts::PI / 4.0;
-                let left_gain = self.volume * angle.cos();
-                let right_gain = self.volume * angle.sin();
+                let (c_pan_l, c_pan_r) = crate::audio::audio_mixer::constant_power_pan(self.pan);
+                let left_gain = self.volume * c_pan_l;
+                let right_gain = self.volume * c_pan_r;
                 for frame in interleaved.chunks_exact_mut(2) {
                     frame[0] *= left_gain;
                     frame[1] *= right_gain;

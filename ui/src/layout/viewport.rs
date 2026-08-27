@@ -51,6 +51,14 @@ fn is_point_in_quad(p: egui::Pos2, quad: &[egui::Pos2; 4]) -> bool {
     inside
 }
 
+/// Returned by `viewport::draw`.
+pub struct ViewportDrawResult {
+    pub size: Vec2,
+    /// If the eyedropper was active and the user clicked inside the video area,
+    /// this is the normalized UV coordinate (0..1 range) of the click.
+    pub eyedropper_pick: Option<egui::Vec2>,
+}
+
 /// Draw the preview viewport, preserving the video's aspect ratio via letter-boxing / pillar-boxing.
 pub fn draw(
     ui: &mut Ui,
@@ -61,7 +69,8 @@ pub fn draw(
     project: &mut Project,
     active_clips: &[ActiveClip],
     history: &mut HistoryState,
-) -> Vec2 {
+    eyedropper_active: bool,
+) -> ViewportDrawResult {
     let fps = project.settings.frame_rate.num.max(1);
     let f = state.playhead_frame;
     let ff = f % fps;
@@ -124,8 +133,28 @@ pub fn draw(
         );
     }
 
-    // Hit-testing
-    if response.clicked() && !state.is_interacting_with_clip() {
+    // Eyedropper mode cursor feedback
+    if eyedropper_active {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+
+    // Eyedropper pick — intercept click before normal hit-testing
+    let mut eyedropper_pick: Option<egui::Vec2> = None;
+    if eyedropper_active && response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos()
+            .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+            .or_else(|| ui.ctx().pointer_interact_pos())
+        {
+            if draw_rect.contains(pos) {
+                let u = (pos.x - draw_rect.min.x) / draw_rect.width();
+                let v = (pos.y - draw_rect.min.y) / draw_rect.height();
+                eyedropper_pick = Some(egui::vec2(u.clamp(0.0, 1.0), v.clamp(0.0, 1.0)));
+            }
+        }
+    }
+
+    // Hit-testing (only when eyedropper is not active)
+    if !eyedropper_active && response.clicked() && !state.is_interacting_with_clip() {
         if let Some(pos) = ui.ctx().pointer_interact_pos() {
             let mut clicked_idx = None;
             for clip in active_clips.iter().rev() {
@@ -539,5 +568,5 @@ pub fn draw(
         );
     });
 
-    viewport_size
+    ViewportDrawResult { size: viewport_size, eyedropper_pick }
 }

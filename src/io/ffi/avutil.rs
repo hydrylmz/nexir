@@ -1,7 +1,3 @@
-// src/io/ffi/avutil.rs
-// AVFrame, AVPacket, rational, error codes — minimal FFI surface.
-
-/// FFmpeg's rational number. Identical C ABI to our Rational type.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct AVRational {
@@ -133,6 +129,11 @@ extern "C" {
 
     /// Get sample rate of the audio frame.
     pub fn av_frame_get_sample_rate(frame: *const AVFrame) -> std::ffi::c_int;
+
+    pub fn av_frame_get_color_space(frame: *const AVFrame) -> std::ffi::c_int;
+    pub fn av_frame_get_color_range(frame: *const AVFrame) -> std::ffi::c_int;
+    pub fn av_frame_get_color_trc(frame: *const AVFrame) -> std::ffi::c_int;
+    pub fn av_frame_get_color_primaries(frame: *const AVFrame) -> std::ffi::c_int;
 
     pub fn av_frame_set_width(frame: *mut AVFrame, width: std::ffi::c_int);
     pub fn av_frame_set_height(frame: *mut AVFrame, height: std::ffi::c_int);

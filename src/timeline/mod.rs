@@ -7,4 +7,6 @@ pub mod rational;
 pub mod query;
 pub mod mutation;
 pub mod transform;
+pub mod timecode;
+pub mod marker;
 pub mod tests;

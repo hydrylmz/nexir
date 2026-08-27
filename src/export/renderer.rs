@@ -15,6 +15,7 @@ use crate::render::graph::{CompiledGraph, RenderGraphCompiler};
 use crate::render::nodes::composite::CompositeNode;
 use crate::render::nodes::yuv_to_rgb::YuvToRgbNode;
 use crate::render::nodes::yuv_upload::YuvUploadNode;
+use crate::render::nodes::tonemap::{ToneMapNode, ToneMapPushConstants, InputTransferFn, GamutConversion, ToneMapMode};
 use crate::render::resource::ResourceId;
 use crate::render::shader::registry::ShaderRegistry;
 use crate::render::still_image::StillImageCache;
@@ -220,23 +221,6 @@ impl ExportRenderer {
             let y_id  = ResourceId::next(&mut id_counter);
             let uv_id = ResourceId::next(&mut id_counter);
 
-            // Create YuvUpload with the clip's ACTUAL dimensions so the GPU
-            // textures are exactly the right size — no wasted rows, no green fill.
-            let upload_node = YuvUploadNode::new(
-                &self.device,
-                slot as u32,
-                clip.clip_width,
-                clip.clip_height,
-                y_id,
-                uv_id,
-            );
-
-            let node_idx = compiler.add_node(Box::new(upload_node));
-            upload_indices.push(Some(node_idx));
-
-            // YuvToRgb operates on clip dimensions and outputs an RGBA texture
-            // at clip resolution.  The Composite node handles letterboxing via
-            // the ClipTransform (which maps clip space → canvas space).
             // Look up the real ColorInfo from the source. Fall back to BT.709/Limited
             // for any source that doesn't have registered video info.
             let color_info = {
@@ -253,6 +237,22 @@ impl ExportRenderer {
                     })
             };
 
+            // Create YuvUpload with the clip's ACTUAL dimensions so the GPU
+            // textures are exactly the right size — no wasted rows, no green fill.
+            let upload_node = YuvUploadNode::new_with_depth(
+                &self.device,
+                slot as u32,
+                clip.clip_width,
+                clip.clip_height,
+                y_id,
+                uv_id,
+                color_info.bit_depth,
+            );
+
+            let node_idx = compiler.add_node(Box::new(upload_node));
+            upload_indices.push(Some(node_idx));
+
+
             compiler.add_node(Box::new(YuvToRgbNode::new(
                 &self.device,
                 &self.shaders,
@@ -265,8 +265,46 @@ impl ExportRenderer {
                 color_info,
             )));
 
-            comp_node.input_textures.push(rgba_id);
+            // Tone-map HDR clips to SDR for CPU/GPU export pipelines
+            let final_rgba_id = if color_info.is_hdr() {
+                use crate::timeline::source::{TransferFunction, ColorPrimaries};
+                let tonemapped_id = ResourceId::next(&mut id_counter);
+                let trc = match color_info.transfer_fn {
+                    TransferFunction::Pq  => InputTransferFn::Pq,
+                    TransferFunction::Hlg => InputTransferFn::Hlg,
+                    _                     => InputTransferFn::Linear,
+                };
+                let gamut = if color_info.effective_primaries(
+                    clip.clip_width, clip.clip_height
+                ) == ColorPrimaries::Bt2020 {
+                    GamutConversion::Bt2020ToBt709
+                } else {
+                    GamutConversion::None
+                };
+                let tm_params = ToneMapPushConstants::for_sdr_preview(
+                    trc,
+                    gamut,
+                    ToneMapMode::AcesFilmic,
+                    1000.0,
+                    clip.clip_width,
+                    clip.clip_height,
+                );
+                compiler.add_node(Box::new(ToneMapNode::new(
+                    &self.device,
+                    &self.shaders,
+                    &self.compute_cache,
+                    rgba_id,
+                    tonemapped_id,
+                    tm_params,
+                )));
+                tonemapped_id
+            } else {
+                rgba_id
+            };
+
+            comp_node.input_textures.push(final_rgba_id);
         }
+
 
         compiler.add_node(Box::new(comp_node));
 
@@ -352,6 +390,21 @@ impl ExportRenderer {
             let mut pending: Option<(usize, wgpu::SubmissionIndex)> = None;
 
             for frame_idx in segment.frame_start..=segment.frame_end {
+                // ── Check cancellation & pause ───────────────────────────────
+                if progress.control().is_cancelled() {
+                    log::info!("[export] cancelled by user during CPU render at frame {frame_idx}");
+                    progress.report(self.frames_done, ExportPhase::Cancelled);
+                    return Ok(());
+                }
+                while progress.control().is_paused() {
+                    if progress.control().is_cancelled() {
+                        progress.report(self.frames_done, ExportPhase::Cancelled);
+                        return Ok(());
+                    }
+                    progress.report(self.frames_done, ExportPhase::Paused);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
                 // ── Render the current frame ──────────────────────────────────────
                 if frame_idx < segment.frame_end {
                     let pts = self.job.frame_pts(frame_idx);
@@ -480,6 +533,20 @@ impl ExportRenderer {
             // skips rendering and only drains the final pending frame (same
             // pattern as the CPU readback path).
             for frame_idx in segment.frame_start..=segment.frame_end {
+                // ── Check cancellation & pause ───────────────────────────────
+                if progress.control().is_cancelled() {
+                    log::info!("[export] cancelled by user during CPU render at frame {frame_idx}");
+                    progress.report(self.frames_done, ExportPhase::Cancelled);
+                    return Ok(());
+                }
+                while progress.control().is_paused() {
+                    if progress.control().is_cancelled() {
+                        progress.report(self.frames_done, ExportPhase::Cancelled);
+                        return Ok(());
+                    }
+                    progress.report(self.frames_done, ExportPhase::Paused);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
 
                 // ── Render: submit GPU work for this frame ────────────────────
                 if frame_idx < segment.frame_end {

@@ -1,8 +1,10 @@
 struct ClipInstance {
-    transform: mat3x4<f32>,
-    opacity:   f32,
-    tex_index: u32,
-    _pad:      vec2<f32>,
+    transform:    mat3x4<f32>,
+    crop:         vec4<f32>,
+    opacity:      f32,
+    tex_index:    u32,
+    blend_mode:   u32,
+    crop_feather: f32,
 }
 
 @group(0) @binding(0) var<storage, read> instances: array<ClipInstance>;
@@ -13,6 +15,8 @@ struct VOut {
     @builtin(position) pos: vec4<f32>,
     @location(0)       uv:  vec2<f32>,
     @location(1)       opacity: f32,
+    @location(2)       crop: vec4<f32>,
+    @location(3)       crop_feather: f32,
 }
 
 @vertex
@@ -37,12 +41,28 @@ fn vs_main(
     out.pos = vec4(ndc_pos.x, ndc_pos.y, 0.0, 1.0);
     out.uv = uv;
     out.opacity = instances[iid].opacity;
+    out.crop = instances[iid].crop;
+    out.crop_feather = instances[iid].crop_feather;
     return out;
 }
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
+    var crop_alpha = 1.0;
+    if (in.crop_feather <= 0.0001) {
+        if (in.uv.x < in.crop.x || in.uv.x > in.crop.z || in.uv.y < in.crop.y || in.uv.y > in.crop.w) {
+            discard;
+        }
+    } else {
+        let half_f = in.crop_feather * 0.5;
+        let al = clamp((in.uv.x - in.crop.x) / half_f, 0.0, 1.0);
+        let ar = clamp((in.crop.z - in.uv.x) / half_f, 0.0, 1.0);
+        let at = clamp((in.uv.y - in.crop.y) / half_f, 0.0, 1.0);
+        let ab = clamp((in.crop.w - in.uv.y) / half_f, 0.0, 1.0);
+        crop_alpha = min(min(al, ar), min(at, ab));
+    }
+
     var color = textureSample(clip_tex, clip_smp, in.uv);
-    color *= in.opacity;
+    color *= in.opacity * crop_alpha;
     return color;
 }

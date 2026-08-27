@@ -105,10 +105,10 @@ impl ChromaKeyNode {
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::ReadOnly,
-                            format: wgpu::TextureFormat::Rgba16Float,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
                         },
                         count: None,
                     },
@@ -166,7 +166,7 @@ impl RenderNode for ChromaKeyNode {
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
         use crate::render::resource::TextureAccess;
-        builder.read(self.in_rgba, TextureAccess::StorageRead);
+        builder.read(self.in_rgba, TextureAccess::Sampled);
         builder.write(self.out_rgba, TextureAccess::StorageWrite);
     }
 

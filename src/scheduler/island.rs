@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use crate::timeline::ids::{TrackId, SourceId};
-use crate::timeline::transform::ClipTransform;
+use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode};
 use crate::timeline::store::TimelineStore;
 use crate::timeline::source::SourceRegistry;
 use crate::timeline::query::ActiveClip;
@@ -16,6 +16,10 @@ pub struct IslandClip {
     pub layer_order:  u16,
     pub opacity:      f32,
     pub transform:    ClipTransform,
+    pub blend_mode:   BlendMode,
+    pub crop:         CropRect,
+    pub corner_pin:   CornerPin,
+    pub matte_mode:   MatteMode,
     pub clip_width:   u32,
     pub clip_height:  u32,
     pub effect_start: u32,
@@ -48,6 +52,10 @@ pub fn build_islands(
         let source_pts = active.source_pts;
         let transform  = store.transform_at(idx).clone();
         let opacity    = store.opacity_at(idx);
+        let blend_mode = store.blend_mode_at(idx);
+        let crop       = *store.crop_at(idx);
+        let corner_pin = *store.corner_pin_at(idx);
+        let matte_mode = store.matte_mode_at(idx);
         let layer      = store.layer_order_at(idx);
         let (effect_start, effect_count) = store.effect_range_at(idx);
         
@@ -83,6 +91,10 @@ pub fn build_islands(
             layer_order: layer,
             opacity,
             transform,
+            blend_mode,
+            crop,
+            corner_pin,
+            matte_mode,
             clip_width,
             clip_height,
             effect_start,

@@ -79,6 +79,10 @@ int av_frame_get_format(AVFrame* f) { return f->format; }
 int av_frame_get_nb_samples(AVFrame* f) { return f->nb_samples; }
 uint8_t** av_frame_get_data(AVFrame* f) { return f->data; }
 int av_frame_get_sample_rate(AVFrame* f) { return f->sample_rate; }
+int av_frame_get_color_space(AVFrame* f) { return f->colorspace; }
+int av_frame_get_color_range(AVFrame* f) { return f->color_range; }
+int av_frame_get_color_trc(AVFrame* f) { return f->color_trc; }
+int av_frame_get_color_primaries(AVFrame* f) { return f->color_primaries; }
 
 SwrContext* swr_alloc_set_opts(SwrContext* s, int64_t out_ch_layout, enum AVSampleFormat out_sample_fmt, int out_sample_rate, int64_t in_ch_layout, enum AVSampleFormat in_sample_fmt, int in_sample_rate, int log_offset, void* log_ctx) {
     AVChannelLayout out_layout;

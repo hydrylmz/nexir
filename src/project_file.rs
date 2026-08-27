@@ -114,6 +114,7 @@ impl From<ProjectFile> for Project {
                                 },
                                 is_vfr: !is_still_image && s.is_vfr,
                                 time_base: s.time_base,
+                                rotation: crate::timeline::source::VideoRotation::None,
                             }
                         });
                     }

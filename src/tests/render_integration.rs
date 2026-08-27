@@ -113,8 +113,8 @@ mod render_integration {
         );
 
         let mut frame = FrameState::test_empty(W, H);
-        frame.clips.push(ClipRenderEntry { source_id: SourceId(0), texture_slot: 0, layer_order: 0, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 1.0, is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
-        frame.clips.push(ClipRenderEntry { source_id: SourceId(1), texture_slot: 1, layer_order: 1, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 0.5, is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
+        frame.clips.push(ClipRenderEntry { source_id: SourceId(0), texture_slot: 0, layer_order: 0, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 1.0, blend_mode: crate::timeline::transform::BlendMode::Normal, crop: crate::timeline::transform::CropRect::full(), corner_pin: crate::timeline::transform::CornerPin::identity(), matte_mode: crate::timeline::transform::MatteMode::None, is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
+        frame.clips.push(ClipRenderEntry { source_id: SourceId(1), texture_slot: 1, layer_order: 1, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 0.5, blend_mode: crate::timeline::transform::BlendMode::Normal, crop: crate::timeline::transform::CropRect::full(), corner_pin: crate::timeline::transform::CornerPin::identity(), matte_mode: crate::timeline::transform::MatteMode::None, is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
         frame.sort_clips();
 
         let mut compiler = RenderGraphCompiler::new();
@@ -193,9 +193,127 @@ mod render_integration {
         let mut compiler = RenderGraphCompiler::new();
         compiler.add_node(Box::new(NodeA));
         compiler.add_node(Box::new(NodeB));
-        
+
         let result = compiler.compile(100, 100);
-        assert!(matches!(result, Err(GraphError::CyclicDependency)));
+        match result {
+            Err(GraphError::CyclicDependency { cycle }) => {
+                assert!(cycle.contains(&"NodeA".to_string()));
+                assert!(cycle.contains(&"NodeB".to_string()));
+            }
+            Err(other) => panic!("Expected CyclicDependency, got {:?}", other),
+            Ok(_) => panic!("Expected CyclicDependency error, but compilation succeeded"),
+        }
+    }
+
+    // ── Phase 8: RenderGraph Hardening Tests ──────────────────────────────────
+
+    struct WriterNode { name: &'static str, res: ResourceId }
+    impl RenderNode for WriterNode {
+        fn name(&self) -> &str { self.name }
+        fn declare_resources(&self, builder: &mut ResourceBuilder) {
+            builder.creates.push((self.res, ResourceDescriptor {
+                label: Some(self.name.into()),
+                size: ResolutionSource::Fixed(W, H),
+                format: wgpu::TextureFormat::Rgba8Unorm,
+            }));
+            builder.write(self.res, TextureAccess::ColorAttachment);
+        }
+        fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
+    }
+
+    struct OverwriterNode { name: &'static str, res: ResourceId }
+    impl RenderNode for OverwriterNode {
+        fn name(&self) -> &str { self.name }
+        fn declare_resources(&self, builder: &mut ResourceBuilder) {
+            builder.write(self.res, TextureAccess::ColorAttachment);
+        }
+        fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
+    }
+
+    struct ReaderNode { name: &'static str, res: ResourceId }
+    impl RenderNode for ReaderNode {
+        fn name(&self) -> &str { self.name }
+        fn declare_resources(&self, builder: &mut ResourceBuilder) {
+            builder.read(self.res, TextureAccess::Sampled);
+        }
+        fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
+    }
+
+    #[test]
+    fn test_raw_hazard_ordering() {
+        // NodeA writes X, NodeB reads X -> Order must be [NodeA (0), NodeB (1)]
+        let res_x = ResourceId(10);
+        let mut compiler = RenderGraphCompiler::new();
+        compiler.add_node(Box::new(WriterNode { name: "NodeA", res: res_x }));
+        compiler.add_node(Box::new(ReaderNode { name: "NodeB", res: res_x }));
+
+        let compiled = compiler.compile(W, H).expect("Compilation failed");
+        assert_eq!(compiled.execution_order(), &[0, 1]);
+    }
+
+    #[test]
+    fn test_waw_and_raw_hazard_ordering() {
+        // NodeA writes X, NodeB writes X (overwrites), NodeC reads X
+        // Order must be [0, 1, 2]
+        let res_x = ResourceId(10);
+        let mut compiler = RenderGraphCompiler::new();
+        compiler.add_node(Box::new(WriterNode { name: "NodeA", res: res_x }));
+        compiler.add_node(Box::new(OverwriterNode { name: "NodeB", res: res_x }));
+        compiler.add_node(Box::new(ReaderNode { name: "NodeC", res: res_x }));
+
+        let compiled = compiler.compile(W, H).expect("Compilation failed");
+        assert_eq!(compiled.execution_order(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn test_war_hazard_ordering() {
+        // NodeA writes X, NodeB reads X, NodeC overwrites X, NodeD reads X (new version)
+        // Order must strictly be [0, 1, 2, 3] so NodeB reads before NodeC overwrites!
+        let res_x = ResourceId(10);
+        let mut compiler = RenderGraphCompiler::new();
+        compiler.add_node(Box::new(WriterNode { name: "NodeA", res: res_x }));
+        compiler.add_node(Box::new(ReaderNode { name: "NodeB", res: res_x }));
+        compiler.add_node(Box::new(OverwriterNode { name: "NodeC", res: res_x }));
+        compiler.add_node(Box::new(ReaderNode { name: "NodeD", res: res_x }));
+
+        let compiled = compiler.compile(W, H).expect("Compilation failed");
+        assert_eq!(compiled.execution_order(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_missing_producer_error_diagnostic() {
+        // Node attempts to read resource 999 which no node produces
+        let mut compiler = RenderGraphCompiler::new();
+        compiler.add_node(Box::new(ReaderNode { name: "OrphanReader", res: ResourceId(999) }));
+
+        let result = compiler.compile(W, H);
+        match result {
+            Err(GraphError::MissingProducer { node_name, resource }) => {
+                assert_eq!(node_name, "OrphanReader");
+                assert_eq!(resource, ResourceId(999));
+            }
+            Err(other) => panic!("Expected MissingProducer error, got {:?}", other),
+            Ok(_) => panic!("Expected MissingProducer error, but compilation succeeded"),
+        }
+    }
+
+    struct ConflictingAccessNode;
+    impl RenderNode for ConflictingAccessNode {
+        fn name(&self) -> &str { "ConflictingNode" }
+        fn declare_resources(&self, builder: &mut ResourceBuilder) {
+            builder.read(ResourceId::FINAL_COLOR, TextureAccess::ColorAttachment);
+            builder.write(ResourceId::FINAL_COLOR, TextureAccess::StorageWrite);
+        }
+        fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
+    }
+
+    #[test]
+    fn test_incompatible_access_diagnostic() {
+        let mut compiler = RenderGraphCompiler::new();
+        compiler.add_node(Box::new(ConflictingAccessNode));
+
+        let result = compiler.compile(W, H);
+        assert!(matches!(result, Err(GraphError::IncompatibleAccess { .. })));
     }
 
     #[test]

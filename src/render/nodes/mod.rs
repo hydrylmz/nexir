@@ -7,3 +7,5 @@ pub mod blit;
 pub mod color_correction;
 pub mod chroma_key;
 pub mod lut;
+pub mod tonemap;
+

@@ -2,7 +2,7 @@ use crate::export::audio_encoder::AudioMuxEncoder;
 use crate::export::job::ExportJob;
 use crate::export::muxer::Muxer;
 use crate::export::partitioner::SegmentPartitioner;
-use crate::export::progress::{progress_channel, ProgressReceiver, ProgressSender};
+use crate::export::progress::{progress_channel, ExportPhase, ProgressReceiver, ProgressSender};
 use crate::export::queue::{EncoderQueue, QueueItem};
 use crate::export::renderer::ExportRenderer;
 use crate::export::video_encoder::{VideoEncoder, VideoEncoderBackend};
@@ -165,22 +165,28 @@ impl ExportEngine {
         let job_clone2 = Arc::clone(&self.job);
         let muxer_for_audio = Arc::clone(&muxer);
         let timeline_audio = Arc::clone(&self.timeline);
+        let tracks_audio = Arc::clone(&self.tracks);
         let sources_audio = Arc::clone(&self.sources);
+        let prog_tx_audio = prog_tx.clone();
         std::thread::Builder::new()
             .name("ve-audio-enc".into())
             .spawn(move || {
                 Self::audio_thread(
                     job_clone2,
                     timeline_audio,
+                    tracks_audio,
                     sources_audio,
                     audio_enc,
                     muxer_for_audio,
+                    prog_tx_audio,
                 );
             })
             .map_err(ExportError::ThreadSpawn)?;
 
         // Spawn render/dispatch thread
         let muxer_for_dispatch = Arc::clone(&muxer);
+        let prog_tx_dispatch = prog_tx.clone();
+        let total_frames_count = self.job.total_frames();
         std::thread::Builder::new()
             .name("ve-export-dispatch".into())
             .spawn(move || {
@@ -208,6 +214,13 @@ impl ExportEngine {
                     );
 
                     for (i, seg) in segments.iter().enumerate() {
+                        if prog_tx.control().is_cancelled() {
+                            log::info!("[export] dispatch detected cancellation before segment {i}");
+                            queue.push(QueueItem::AllDone);
+                            prog_tx.report(renderer.frames_done, ExportPhase::Cancelled);
+                            return Ok(());
+                        }
+
                         log::info!("[export] starting segment {i}/{}", segments.len());
                         renderer
                             .render_segment(seg, &queue, &prog_tx)
@@ -233,21 +246,25 @@ impl ExportEngine {
                                 .map_err(|e| format!("NVENC flush failed: {e:?}"))?;
                         }
 
-                        // Spin-wait until audio thread finishes and drops its Arc<Muxer>
-                        while Arc::strong_count(&muxer_for_dispatch_clone) > 1 {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                        if let Ok(m) = Arc::try_unwrap(muxer_for_dispatch_clone) {
-                            m.finalise().map_err(|e| format!("muxer finalise failed: {e:?}"))?;
+                        // Thread-safe synchronous finalisation
+                        if let Err(e) = muxer_for_dispatch_clone.finalise_sync() {
+                            log::error!("[export] muxer finalise failed: {e:?}");
                         }
                     }
                     Ok(())
                 }));
 
                 match result {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        if is_gpu {
+                            if !prog_tx_dispatch.control().is_cancelled() {
+                                prog_tx_dispatch.report(total_frames_count, ExportPhase::Done);
+                            }
+                        }
+                    }
                     Ok(Err(e)) => {
                         log::error!("[export] dispatch thread error: {e}");
+                        prog_tx_dispatch.report(0, ExportPhase::Failed(e.clone()));
                         queue_err.push(QueueItem::AllDone);
                     }
                     Err(e) => {
@@ -259,7 +276,7 @@ impl ExportEngine {
                             "(unknown panic payload)".to_string()
                         };
                         log::error!("[export] dispatch thread PANICKED: {msg}");
-                        // Ensure the encoder thread unblocks
+                        prog_tx_dispatch.report(0, ExportPhase::Failed(msg));
                         queue_err.push(QueueItem::AllDone);
                     }
                 }
@@ -280,6 +297,19 @@ impl ExportEngine {
 
         let mut run = || -> Result<(), String> {
             loop {
+                if prog_tx.control().is_cancelled() {
+                    log::info!("[export] encoder thread cancelled");
+                    prog_tx.report(frames_encoded, ExportPhase::Cancelled);
+                    break;
+                }
+                while prog_tx.control().is_paused() {
+                    if prog_tx.control().is_cancelled() {
+                        prog_tx.report(frames_encoded, ExportPhase::Cancelled);
+                        return Ok(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
                 match queue.pop() {
                     Some(QueueItem::Frame(raw)) => {
                         let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
@@ -294,14 +324,16 @@ impl ExportEngine {
                     }
                     Some(QueueItem::SegmentDone { .. }) => {}
                     Some(QueueItem::AllDone) | None => {
-                        let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
-                            if let Err(e) = muxer.write_packet(pkt, true) {
-                                log::error!("[encoder] flush write_packet failed: {e:?}");
-                            }
-                        };
-                        video_enc.flush(&mut sink)
-                            .map_err(|e| format!("flush failed: {e:?}"))?;
-                        prog_tx.report(frames_encoded, ExportPhase::Done);
+                        if !prog_tx.control().is_cancelled() {
+                            let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
+                                if let Err(e) = muxer.write_packet(pkt, true) {
+                                    log::error!("[encoder] flush write_packet failed: {e:?}");
+                                }
+                            };
+                            video_enc.flush(&mut sink)
+                                .map_err(|e| format!("flush failed: {e:?}"))?;
+                            prog_tx.report(frames_encoded, ExportPhase::Done);
+                        }
                         break;
                     }
                 }
@@ -311,25 +343,25 @@ impl ExportEngine {
 
         if let Err(e) = run() {
             log::error!("[export] encoder_thread error: {e}");
+            prog_tx.report(frames_encoded, ExportPhase::Failed(e));
         }
 
-        while Arc::strong_count(&muxer) > 1 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        if let Ok(m) = Arc::try_unwrap(muxer) {
-            if let Err(e) = m.finalise() {
-                log::error!("[export] encoder_thread: muxer finalise failed: {e:?}");
-            }
+        if let Err(e) = muxer.finalise_sync() {
+            log::error!("[export] encoder_thread: muxer finalise failed: {e:?}");
         }
     }
 
-    /// Decode audio from all clips in the export range and encode into the muxer.
+    /// Decode audio from all clips in the export range, apply per-clip DSP, and
+    /// encode into the muxer. Respects track mute/solo, per-clip volume/pan/fades,
+    /// and track gain/pan. Applies a soft limiter to each AAC frame before encoding.
     fn audio_thread(
         job: Arc<ExportJob>,
         timeline: Arc<std::sync::RwLock<TimelineStore>>,
+        tracks: Arc<std::sync::RwLock<TrackList>>,
         sources: Arc<std::sync::RwLock<SourceRegistry>>,
         mut audio_enc: AudioMuxEncoder,
         muxer: Arc<Muxer>,
+        prog_tx: ProgressSender,
     ) {
         use crate::audio::ffi::avresample::{
             swr_alloc_set_opts, swr_convert, swr_free, swr_get_delay, swr_init,
@@ -346,30 +378,72 @@ impl ExportEngine {
             av_frame_alloc, av_frame_free, av_frame_get_data, av_frame_get_nb_samples,
         };
 
-        // Collect clips with audio that overlap the export range, sorted by timeline position
-        let clip_list: Vec<(crate::timeline::ids::SourceId, i64, i64, i64, f32)> = {
+        // Per-clip DSP params collected from the timeline + track list
+        #[allow(dead_code)]
+        struct ClipDsp {
+            src_id:      crate::timeline::ids::SourceId,
+            clip_t_in:   i64,
+            clip_t_out:  i64,
+            src_mat_in:  i64,
+            speed:       f32,
+            volume:      f32,  // clip vol × track gain
+            pan:         f32,  // clip pan + track pan, clamped
+            fade_in_pts: i64,
+            fade_out_pts: i64,
+            muted:       bool,
+        }
+
+        // Collect clips with audio that overlap the export range, with track DSP
+        let clip_list: Vec<ClipDsp> = {
             let store = timeline.read().unwrap();
-            let srcs = sources.read().unwrap();
+            let srcs  = sources.read().unwrap();
+            let trks  = tracks.read().unwrap();
+            let any_soloed = trks.any_soloed();
             let n = store.len();
             let mut clips = Vec::new();
             for i in 0..n {
-                let t_in = store.pts_in_at(i);
+                let t_in  = store.pts_in_at(i);
                 let t_out = store.pts_out_at(i);
-                let src = store.source_id_at(i);
-                let s_in = store.source_in_at(i);
-                let speed = store.speed_at(i);
                 // Skip clips outside export range
                 if t_out <= job.pts_in || t_in >= job.pts_out {
                     continue;
                 }
+                let src = store.source_id_at(i);
                 // Skip clips whose source has no audio
                 if srcs.audio_info(src).is_err() {
                     continue;
                 }
-                clips.push((src, t_in, t_out, s_in, speed));
+                // Respect track mute/solo
+                let track_id = store.track_id_at(i);
+                let (track_gain, track_pan, track_active) =
+                    if let Some(t) = trks.get(track_id) {
+                        (t.gain, t.pan, t.is_active(any_soloed))
+                    } else {
+                        (1.0, 0.0, true)
+                    };
+                if !track_active {
+                    continue;
+                }
+                let clip_muted = store.audio_muted_at(i);
+                let clip_vol   = store.volume_at(i);
+                let clip_pan   = store.pan_at(i);
+                let combined_vol = clip_vol * track_gain;
+                let combined_pan = (clip_pan + track_pan).clamp(-1.0, 1.0);
+                clips.push(ClipDsp {
+                    src_id:       src,
+                    clip_t_in:    t_in,
+                    clip_t_out:   t_out,
+                    src_mat_in:   store.source_in_at(i),
+                    speed:        store.speed_at(i),
+                    volume:       combined_vol,
+                    pan:          combined_pan,
+                    fade_in_pts:  store.fade_in_pts_at(i),
+                    fade_out_pts: store.fade_out_pts_at(i),
+                    muted:        clip_muted,
+                });
             }
             // Sort by timeline in-point
-            clips.sort_by_key(|&(_, t_in, _, _, _)| t_in);
+            clips.sort_by_key(|c| c.clip_t_in);
             clips
         };
 
@@ -381,44 +455,52 @@ impl ExportEngine {
         };
 
         let frame_size = audio_enc.frame_size();
-        // Accumulation buffers in interleaved f32 (left/right alternating)
-        let mut accum_left: Vec<f32> = Vec::new();
+        // Accumulation buffers (planar f32)
+        let mut accum_left:  Vec<f32> = Vec::new();
         let mut accum_right: Vec<f32> = Vec::new();
         let mut enc_pts: i64 = 0; // in samples @ 48 kHz
 
-        // Reusable out buffer for swr_convert (2 planes of `frame_size` f32)
+        // Reusable swr output buffer
         let swr_out_capacity = frame_size * 2 + 64;
-        let mut swr_left: Vec<f32> = vec![0.0; swr_out_capacity];
+        let mut swr_left:  Vec<f32> = vec![0.0; swr_out_capacity];
         let mut swr_right: Vec<f32> = vec![0.0; swr_out_capacity];
 
-        for (src_id, clip_t_in, clip_t_out, src_material_in, speed) in clip_list {
+        for dsp in clip_list {
+            if prog_tx.control().is_cancelled() {
+                log::info!("[export] audio thread detected cancellation");
+                return;
+            }
+            if dsp.muted {
+                continue; // muted clips contribute silence — skip decoding
+            }
+
             let path = {
                 let srcs = sources.read().unwrap();
-                match srcs.path(src_id) {
+                match srcs.path(dsp.src_id) {
                     Some(p) => (*p).clone(),
-                    None => continue,
+                    None    => continue,
                 }
             };
 
             let mut demuxer = match Demuxer::open(&path) {
-                Ok(d) => d,
+                Ok(d)  => d,
                 Err(_) => continue,
             };
 
             let audio_info = match demuxer.audio_stream().cloned() {
                 Some(s) => s,
-                None => continue,
+                None    => continue,
             };
 
             let mut decoder = match Decoder::open(&audio_info, audio_info.codecpar, false) {
-                Ok(d) => d,
+                Ok(d)  => d,
                 Err(_) => continue,
             };
 
             // Set up SwrContext for this source
             let (in_ch_layout, in_sample_fmt, mut in_sample_rate) = unsafe {
                 let ctx = decoder.ctx();
-                let sr = avcodec_ctx_get_sample_rate(ctx);
+                let sr  = avcodec_ctx_get_sample_rate(ctx);
                 let mut cl = avcodec_ctx_get_channel_layout(ctx);
                 let channels = avcodec_ctx_get_channels(ctx);
                 let fmt = avcodec_ctx_get_sample_fmt(ctx);
@@ -429,7 +511,7 @@ impl ExportEngine {
             };
 
             // Adjust input sample rate to stretch/squash the audio according to speed
-            in_sample_rate = (in_sample_rate as f32 * speed).round() as i32;
+            in_sample_rate = (in_sample_rate as f32 * dsp.speed).round() as i32;
 
             let swr = unsafe {
                 let s = swr_alloc_set_opts(
@@ -454,53 +536,51 @@ impl ExportEngine {
 
             let frame = unsafe { av_frame_alloc() };
             if frame.is_null() {
-                unsafe {
-                    swr_free(&mut { swr });
-                }
+                unsafe { swr_free(&mut { swr }); }
                 continue;
             }
 
             // Effective export overlap for this clip
-            let eff_t_in = clip_t_in.max(job.pts_in);
-            let eff_t_out = clip_t_out.min(job.pts_out);
+            let eff_t_in  = dsp.clip_t_in.max(job.pts_in);
+            let eff_t_out = dsp.clip_t_out.min(job.pts_out);
 
             // Translate effective timeline range to source material range (90 kHz project TB)
-            let src_seek_pts = src_material_in
-                + crate::timeline::rational::speed_scale_pts(eff_t_in - clip_t_in, speed);
-            let src_end_pts = src_material_in
-                + crate::timeline::rational::speed_scale_pts(eff_t_out - clip_t_in, speed);
+            let src_seek_pts = dsp.src_mat_in
+                + crate::timeline::rational::speed_scale_pts(eff_t_in - dsp.clip_t_in, dsp.speed);
+            let src_end_pts  = dsp.src_mat_in
+                + crate::timeline::rational::speed_scale_pts(eff_t_out - dsp.clip_t_in, dsp.speed);
 
             // Seek demuxer to just before the start of required audio
             let _ = demuxer.seek(src_seek_pts, job.project_tb);
             decoder.flush();
 
             // Convert PTS bounds to stream timebase
-            let stream_seek_pts = job
-                .project_tb
-                .rescale_pts(src_seek_pts, audio_info.time_base);
-            let stream_end_pts = job
-                .project_tb
-                .rescale_pts(src_end_pts, audio_info.time_base);
+            let stream_seek_pts = job.project_tb.rescale_pts(src_seek_pts, audio_info.time_base);
+            let stream_end_pts  = job.project_tb.rescale_pts(src_end_pts,  audio_info.time_base);
 
-            // ALWAYS discard audio packets until we reach the target PTS
+            // Discard audio packets until we reach the target PTS
             if src_seek_pts > 0 {
                 while let Ok(Some(pkt)) = demuxer.next_audio_packet() {
                     if pkt.pts != i64::MIN && pkt.pts >= stream_seek_pts {
-                        // Found the first packet we need. We must send it to the decoder
-                        // since we already read/consumed it.
-                        unsafe {
-                            let _ = avcodec_send_packet(decoder.ctx(), pkt.as_ptr());
-                        }
+                        unsafe { let _ = avcodec_send_packet(decoder.ctx(), pkt.as_ptr()); }
                         break;
                     }
                 }
             }
 
+            // Pre-compute constant-power pan gains for this clip
+            let (pan_l, pan_r) = crate::audio::audio_mixer::constant_power_pan(dsp.pan);
+            let gain_l = dsp.volume * pan_l;
+            let gain_r = dsp.volume * pan_r;
+
+            // Running sample counter for fade envelope
+            let mut samples_decoded: u64 = 0;
+
             // Decode all audio packets in the needed range
             'decode: loop {
                 let pkt = match demuxer.next_audio_packet() {
                     Ok(Some(p)) => p,
-                    _ => break,
+                    _           => break,
                 };
 
                 if pkt.pts != i64::MIN && pkt.pts > stream_end_pts {
@@ -530,8 +610,7 @@ impl ExportEngine {
                         }
 
                         // How many output samples swr will produce
-                        let out_max =
-                            (nb as i64 * 48_000 as i64 / in_sample_rate as i64 + 32) as usize;
+                        let out_max = (nb as i64 * 48_000 as i64 / in_sample_rate as i64 + 32) as usize;
                         if swr_left.len() < out_max {
                             swr_left.resize(out_max, 0.0);
                             swr_right.resize(out_max, 0.0);
@@ -539,7 +618,7 @@ impl ExportEngine {
 
                         let in_data = av_frame_get_data(frame) as *const *const u8;
                         let mut out_planes: [*mut u8; 2] = [
-                            swr_left.as_mut_ptr() as *mut u8,
+                            swr_left.as_mut_ptr()  as *mut u8,
                             swr_right.as_mut_ptr() as *mut u8,
                         ];
                         let converted = swr_convert(
@@ -553,13 +632,37 @@ impl ExportEngine {
                             continue;
                         }
 
-                        accum_left.extend_from_slice(&swr_left[..converted as usize]);
-                        accum_right.extend_from_slice(&swr_right[..converted as usize]);
+                        // Apply per-sample DSP: volume, pan, fade envelope
+                        let converted = converted as usize;
+                        for s in 0..converted {
+                            let sample_offset = samples_decoded + s as u64;
+                            // Map decoded sample index back to timeline PTS
+                            let tl_pts = eff_t_in
+                                + (sample_offset as f64 * 90_000.0 / 48_000.0) as i64;
 
-                        // Flush full frames out of accumulator
+                            let fade = crate::audio::audio_mixer::compute_fade_multiplier(
+                                tl_pts,
+                                dsp.clip_t_in,
+                                dsp.clip_t_out,
+                                dsp.fade_in_pts,
+                                dsp.fade_out_pts,
+                            );
+
+                            swr_left[s]  *= gain_l * fade;
+                            swr_right[s] *= gain_r * fade;
+                        }
+                        samples_decoded += converted as u64;
+
+                        accum_left.extend_from_slice(&swr_left[..converted]);
+                        accum_right.extend_from_slice(&swr_right[..converted]);
+
+                        // Flush full encoder frames out of accumulator
                         while accum_left.len() >= frame_size {
-                            let left_chunk: Vec<f32> = accum_left.drain(..frame_size).collect();
-                            let right_chunk: Vec<f32> = accum_right.drain(..frame_size).collect();
+                            let mut left_chunk: Vec<f32>  = accum_left.drain(..frame_size).collect();
+                            let mut right_chunk: Vec<f32> = accum_right.drain(..frame_size).collect();
+                            // Soft-limit the frame before encoding
+                            crate::audio::audio_mixer::soft_limit_buffer(&mut left_chunk);
+                            crate::audio::audio_mixer::soft_limit_buffer(&mut right_chunk);
                             let _ = audio_enc.encode_pcm_chunk(
                                 &left_chunk,
                                 &right_chunk,
@@ -585,7 +688,7 @@ impl ExportEngine {
                         swr_right.resize(out_max, 0.0);
                     }
                     let mut out_planes: [*mut u8; 2] = [
-                        swr_left.as_mut_ptr() as *mut u8,
+                        swr_left.as_mut_ptr()  as *mut u8,
                         swr_right.as_mut_ptr() as *mut u8,
                     ];
                     let converted = swr_convert(
@@ -598,11 +701,18 @@ impl ExportEngine {
                     if converted <= 0 {
                         break;
                     }
+                    // Apply pan gain to flushed samples (fade already fully done by now)
+                    for s in 0..converted as usize {
+                        swr_left[s]  *= gain_l;
+                        swr_right[s] *= gain_r;
+                    }
                     accum_left.extend_from_slice(&swr_left[..converted as usize]);
                     accum_right.extend_from_slice(&swr_right[..converted as usize]);
                     while accum_left.len() >= frame_size {
-                        let l: Vec<f32> = accum_left.drain(..frame_size).collect();
-                        let r: Vec<f32> = accum_right.drain(..frame_size).collect();
+                        let mut l: Vec<f32> = accum_left.drain(..frame_size).collect();
+                        let mut r: Vec<f32> = accum_right.drain(..frame_size).collect();
+                        crate::audio::audio_mixer::soft_limit_buffer(&mut l);
+                        crate::audio::audio_mixer::soft_limit_buffer(&mut r);
                         let _ = audio_enc.encode_pcm_chunk(&l, &r, enc_pts, &mut mux_sink);
                         enc_pts += frame_size as i64;
                     }
@@ -617,6 +727,8 @@ impl ExportEngine {
         if !accum_left.is_empty() {
             accum_left.resize(frame_size, 0.0);
             accum_right.resize(frame_size, 0.0);
+            crate::audio::audio_mixer::soft_limit_buffer(&mut accum_left);
+            crate::audio::audio_mixer::soft_limit_buffer(&mut accum_right);
             let _ = audio_enc.encode_pcm_chunk(&accum_left, &accum_right, enc_pts, &mut mux_sink);
         }
 

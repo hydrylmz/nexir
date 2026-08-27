@@ -22,6 +22,8 @@ pub struct YuvUploadNode {
     /// Maximum dimensions the staging buffers were allocated for.
     pub width:        u32,
     pub height:       u32,
+    /// Bit depth per channel (e.g. 8 for 8-bit, 10 for 10-bit).
+    pub bit_depth:    u8,
     /// Actual dimensions of the most-recently-uploaded frame (may be ≤ max).
     current_width:    AtomicU32,
     current_height:   AtomicU32,
@@ -41,14 +43,26 @@ impl YuvUploadNode {
         out_y:     ResourceId,
         out_uv:    ResourceId,
     ) -> Self {
-        let y_bytes_per_row  = round_up_256(width);
-        let uv_bytes_per_row = round_up_256(width);
+        Self::new_with_depth(device, clip_slot, width, height, out_y, out_uv, 8)
+    }
+
+    pub fn new_with_depth(
+        device:    &GpuDevice,
+        clip_slot: u32,
+        width:     u32,
+        height:    u32,
+        out_y:     ResourceId,
+        out_uv:    ResourceId,
+        bit_depth: u8,
+    ) -> Self {
+        let bpp = if bit_depth > 8 { 2u32 } else { 1u32 };
+        let y_bytes_per_row  = round_up_256(width * bpp);
+        let uv_bytes_per_row = round_up_256(width * bpp);
 
         let y_size  = y_bytes_per_row as u64 * height as u64;
         let uv_size = uv_bytes_per_row as u64 * (height / 2) as u64;
 
         // COPY_DST | COPY_SRC: written by queue.write_buffer, read by copy_buffer_to_texture.
-        // No MAP_WRITE needed — write_buffer uses wgpu's internal upload ring.
         let y_staging = device.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("y_staging"),
             size:  y_size,
@@ -67,6 +81,7 @@ impl YuvUploadNode {
             clip_slot,
             width,
             height,
+            bit_depth,
             current_width:  AtomicU32::new(width),
             current_height: AtomicU32::new(height),
             out_y,
@@ -79,10 +94,6 @@ impl YuvUploadNode {
 
     /// Upload a YUV frame into the staging buffers using the wgpu queue's
     /// internal upload ring (**non-blocking, no poll(Wait)**).
-    ///
-    /// `frame_width` and `frame_height` are the actual source frame dimensions,
-    /// which may differ from the node's maximum allocation dimensions.
-    /// Frames larger than the pre-allocated buffer are cropped to fit.
     pub fn upload_frame(
         &self,
         yuv_data:     &[u8],
@@ -94,12 +105,12 @@ impl YuvUploadNode {
         let w = frame_width.min(self.width);
         let h = frame_height.min(self.height);
 
+        let bpp = if self.bit_depth > 8 { 2usize } else { 1usize };
+        let y_size        = (frame_width * frame_height) as usize * bpp;
+        let uv_plane_size = ((frame_width / 2) * (frame_height / 2)) as usize * bpp;
 
-        let y_size        = (frame_width * frame_height) as usize;
-        let uv_plane_size = ((frame_width / 2) * (frame_height / 2)) as usize;
-
-        let y_bytes_per_row  = round_up_256(self.width) as usize;
-        let uv_bytes_per_row = round_up_256(self.width) as usize;
+        let y_bytes_per_row  = round_up_256(self.width * (bpp as u32)) as usize;
+        let uv_bytes_per_row = round_up_256(self.width * (bpp as u32)) as usize;
 
         // ── Y plane ──────────────────────────────────────────────────────────
         if y_size > yuv_data.len() {
@@ -111,11 +122,12 @@ impl YuvUploadNode {
 
         // Build a row-padded CPU buffer matching the staging buffer layout.
         let mut y_buf = vec![0u8; y_bytes_per_row * self.height as usize];
+        let row_bytes = w as usize * bpp;
         for row in 0..h as usize {
-            let src_start = row * frame_width as usize;
+            let src_start = row * frame_width as usize * bpp;
             let dst_start = row * y_bytes_per_row;
-            y_buf[dst_start..dst_start + w as usize]
-                .copy_from_slice(&src_y[src_start..src_start + w as usize]);
+            y_buf[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&src_y[src_start..src_start + row_bytes]);
         }
         self.queue.write_buffer(&self.y_staging, 0, &y_buf);
 
@@ -125,20 +137,39 @@ impl YuvUploadNode {
 
         if nv12 {
             let src_uv_start = y_size;
-            let src_uv_len   = (frame_width * (frame_height / 2)) as usize;
+            let src_uv_len   = (frame_width * (frame_height / 2)) as usize * bpp;
             if yuv_data.len() < src_uv_start + src_uv_len {
-                log::warn!("[upload] slot={} NV12 UV data too small, skipping UV", self.clip_slot);
+                log::warn!("[upload] slot={} NV12/P010 UV data too small, skipping UV", self.clip_slot);
             } else {
                 let src_uv = &yuv_data[src_uv_start..src_uv_start + src_uv_len];
+                let uv_row_bytes = w as usize * bpp;
                 for row in 0..uv_rows {
-                    let src_start = row * frame_width as usize;
+                    let src_start = row * frame_width as usize * bpp;
                     let dst_start = row * uv_bytes_per_row;
-                    uv_buf[dst_start..dst_start + w as usize]
-                        .copy_from_slice(&src_uv[src_start..src_start + w as usize]);
+                    uv_buf[dst_start..dst_start + uv_row_bytes]
+                        .copy_from_slice(&src_uv[src_start..src_start + uv_row_bytes]);
+                }
+            }
+        } else if self.bit_depth > 8 {
+            // Planar 10-bit (YUV420P10)
+            if yuv_data.len() < y_size + 2 * uv_plane_size {
+                log::warn!("[upload] slot={} 10-bit YUV UV data too small, skipping UV", self.clip_slot);
+            } else {
+                let u_plane = &yuv_data[y_size..y_size + uv_plane_size];
+                let v_plane = &yuv_data[y_size + uv_plane_size..y_size + 2 * uv_plane_size];
+                let uv_w = (frame_width / 2) as usize;
+                for row in 0..uv_rows {
+                    let dst_start = row * uv_bytes_per_row;
+                    for col in 0..(w / 2) as usize {
+                        let src_idx = (row * uv_w + col) * 2;
+                        let dst_idx = dst_start + col * 4;
+                        uv_buf[dst_idx..dst_idx + 2].copy_from_slice(&u_plane[src_idx..src_idx + 2]);
+                        uv_buf[dst_idx + 2..dst_idx + 4].copy_from_slice(&v_plane[src_idx..src_idx + 2]);
+                    }
                 }
             }
         } else {
-            // I420: U and V planes separate
+            // I420: U and V planes separate (8-bit)
             if yuv_data.len() < y_size + 2 * uv_plane_size {
                 log::warn!("[upload] slot={} I420 UV data too small, skipping UV", self.clip_slot);
             } else {
@@ -174,15 +205,20 @@ impl RenderNode for YuvUploadNode {
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
         use crate::render::resource::{ResourceDescriptor, ResolutionSource, TextureAccess};
+        let (y_fmt, uv_fmt) = if self.bit_depth > 8 {
+            (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm)
+        } else {
+            (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm)
+        };
         builder.creates.push((self.out_y, ResourceDescriptor {
             label: Some(format!("Yuv_Y_{}", self.out_y.0)),
             size: ResolutionSource::Fixed(self.width, self.height),
-            format: wgpu::TextureFormat::R8Unorm,
+            format: y_fmt,
         }));
         builder.creates.push((self.out_uv, ResourceDescriptor {
             label: Some(format!("Yuv_UV_{}", self.out_uv.0)),
             size: ResolutionSource::Fixed(self.width / 2, self.height / 2),
-            format: wgpu::TextureFormat::Rg8Unorm,
+            format: uv_fmt,
         }));
         builder.write(self.out_y, TextureAccess::CopyDst);
         builder.write(self.out_uv, TextureAccess::CopyDst);
@@ -198,8 +234,9 @@ impl RenderNode for YuvUploadNode {
         let cw = self.current_width.load(Ordering::Relaxed);
         let ch = self.current_height.load(Ordering::Relaxed);
 
+        let bpp = if self.bit_depth > 8 { 2u32 } else { 1u32 };
         let y_res            = ctx.get(self.out_y);
-        let y_bytes_per_row  = round_up_256(self.width);
+        let y_bytes_per_row  = round_up_256(self.width * bpp);
 
         encoder.copy_buffer_to_texture(
             wgpu::ImageCopyBuffer {
@@ -220,7 +257,7 @@ impl RenderNode for YuvUploadNode {
         );
 
         let uv_res            = ctx.get(self.out_uv);
-        let uv_bytes_per_row  = round_up_256(self.width);
+        let uv_bytes_per_row  = round_up_256(self.width * bpp);
 
         encoder.copy_buffer_to_texture(
             wgpu::ImageCopyBuffer {
@@ -241,3 +278,4 @@ impl RenderNode for YuvUploadNode {
         );
     }
 }
+
