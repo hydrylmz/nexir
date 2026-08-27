@@ -1596,10 +1596,10 @@ pub fn draw(
                         }
                     };
                     project.register_source(path.clone(), vid_info, aud_info);
-                    // Evict this specific path from still-image cache and probe-decode
-                    // so we emit helpful logs for PNG/JPG imports done via timeline.
-                    still_cache.lock().unwrap().evict(&path);
-                    still_cache.lock().unwrap().probe_decode(&path);
+                    if !path.to_string_lossy().starts_with("nexir://") {
+                        still_cache.lock().unwrap().evict(&path);
+                        still_cache.lock().unwrap().probe_decode(&path);
+                    }
                 }
                 let source_id = project.sources.read().unwrap().id_for_path(&path);
                 if let Some(source_id) = source_id {

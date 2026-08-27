@@ -312,6 +312,7 @@ fn run_benchmark(device: &Arc<GpuDevice>, config: &BenchmarkConfig) -> Profiling
             crop: nexir::timeline::transform::CropRect::full(),
             corner_pin: nexir::timeline::transform::CornerPin::identity(),
             matte_mode: nexir::timeline::transform::MatteMode::None,
+            effects: Default::default(),
             is_nv12: true,
             kind: ClipKind::Video,
         });

@@ -8,4 +8,6 @@ pub mod color_correction;
 pub mod chroma_key;
 pub mod lut;
 pub mod tonemap;
-
+pub mod gaussian_blur;
+pub mod sharpen;
+pub mod vignette;

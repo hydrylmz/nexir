@@ -1,6 +1,6 @@
 // src/render/frame_state.rs
 
-use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode};
+use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode, ClipEffects};
 use crate::timeline::ids::SourceId;
 
 /// One clip's contribution to the current frame.
@@ -20,6 +20,7 @@ pub struct ClipRenderEntry {
     pub crop:          CropRect,
     pub corner_pin:    CornerPin,
     pub matte_mode:    MatteMode,
+    pub effects:       ClipEffects,
     pub is_nv12:       bool,
     pub kind:          crate::timeline::store::ClipKind,
 }

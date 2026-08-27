@@ -194,6 +194,7 @@ impl FrameScheduler {
                     crop: clip.crop,
                     corner_pin: clip.corner_pin,
                     matte_mode: clip.matte_mode,
+                    effects: clip.effects,
                     is_nv12: false,
                     kind: clip.kind.clone(),
                 });
@@ -218,6 +219,7 @@ impl FrameScheduler {
                 crop: clip.crop,
                 corner_pin: clip.corner_pin,
                 matte_mode: clip.matte_mode,
+                effects: clip.effects,
                 is_nv12,
                 kind: clip.kind.clone(),
             });
@@ -292,6 +294,7 @@ impl FrameScheduler {
                     crop: clip.crop,
                     corner_pin: clip.corner_pin,
                     matte_mode: clip.matte_mode,
+                    effects: clip.effects,
                     is_nv12: false,
                     kind: clip.kind.clone(),
                 });
@@ -323,6 +326,7 @@ impl FrameScheduler {
                 crop: clip.crop,
                 corner_pin: clip.corner_pin,
                 matte_mode: clip.matte_mode,
+                effects: clip.effects,
                 is_nv12,
                 kind: clip.kind.clone(),
             });

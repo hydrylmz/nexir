@@ -1,86 +1,62 @@
-// src/render/nodes/color_correction.rs
+// src/render/nodes/sharpen.rs
 
 use std::sync::Arc;
-use crate::render::graph::RenderNode;
-use crate::render::resource::{ResourceBuilder, ResourceId, ViewId};
-use crate::render::context::RenderContext;
 use std::sync::Mutex;
+use crate::render::graph::RenderNode;
+use crate::render::resource::{ResourceBuilder, ResourceId, ViewId, ResourceDescriptor, ResolutionSource, TextureAccess};
+use crate::render::context::RenderContext;
 use crate::render::frame_state::FrameState;
 use crate::render::device::GpuDevice;
 use crate::render::compute::{ComputePipelineCache, ComputePassHelper, PipelineKey};
 use crate::render::shader::registry::{ShaderRegistry, BuiltinShader};
 
-/// Push constants for the color correction compute shader. 80 bytes = 5 vec4s.
-/// Matches WGSL `struct ColorParams` exactly.
+/// Push constants for the Sharpen compute shader. 16 bytes.
+/// Matches WGSL `struct SharpenParams` exactly.
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-pub struct ColorCorrectionParams {
-    /// Per-channel lift [R, G, B]. Range typically [-0.5, 0.5]. Alpha unused.
-    pub lift:       [f32; 4],
-    /// Per-channel gamma [R, G, B]. Value 1.0 = no change.
-    pub gamma:      [f32; 4],
-    /// Per-channel gain [R, G, B]. Value 1.0 = no change.
-    pub gain:       [f32; 4],
-    /// Scalar saturation. 0.0 = grey, 1.0 = no change.
-    pub saturation: f32,
-    /// Brightness offset. 0.0 = no change.
-    pub brightness: f32,
-    /// Contrast multiplier. 1.0 = no change.
-    pub contrast:   f32,
-    /// Hue shift in radians. 0.0 = no change.
-    pub hue_shift:  f32,
-    /// Texture dimensions for bounds check.
-    pub width:      u32,
-    pub height:     u32,
-    pub _pad0:      f32,
-    pub _pad1:      f32,
+pub struct SharpenParams {
+    /// Sharpen amount: 0.0 (identity) to 2.0+ (aggressive)
+    pub amount: f32,
+    pub width:  u32,
+    pub height: u32,
+    pub _pad:   f32,
 }
 
-// Compile-time size assertion: must be exactly 80 bytes
-const _: () = assert!(std::mem::size_of::<ColorCorrectionParams>() == 80);
+const _: () = assert!(std::mem::size_of::<SharpenParams>() == 16);
 
-impl ColorCorrectionParams {
-    /// Identity params — no change to any channel.
-    pub fn identity(width: u32, height: u32) -> Self {
+impl SharpenParams {
+    pub fn new(amount: f32, width: u32, height: u32) -> Self {
         Self {
-            lift:       [0.0, 0.0, 0.0, 0.0],
-            gamma:      [1.0, 1.0, 1.0, 1.0],
-            gain:       [1.0, 1.0, 1.0, 1.0],
-            saturation: 1.0,
-            brightness: 0.0,
-            contrast:   1.0,
-            hue_shift:  0.0,
+            amount: amount.max(0.0),
             width,
             height,
-            _pad0:      0.0,
-            _pad1:      0.0,
+            _pad: 0.0,
         }
     }
 }
 
-pub struct ColorCorrectionNode {
-    pub in_rgba:       ResourceId,
-    pub out_rgba:      ResourceId,
-    pub params:        ColorCorrectionParams,
-    pipeline:          Arc<wgpu::ComputePipeline>,
-    bind_group_layout: wgpu::BindGroupLayout,
-    device:            Arc<wgpu::Device>,
-    bg_cache:          Mutex<Option<([ViewId; 2], wgpu::BindGroup)>>,
+pub struct SharpenNode {
+    pub in_rgba:           ResourceId,
+    pub out_rgba:          ResourceId,
+    pub params:            SharpenParams,
+    pipeline:              Arc<wgpu::ComputePipeline>,
+    bind_group_layout:     wgpu::BindGroupLayout,
+    device:                Arc<wgpu::Device>,
+    bg_cache:              Mutex<Option<([ViewId; 2], wgpu::BindGroup)>>,
 }
 
-impl ColorCorrectionNode {
+impl SharpenNode {
     pub fn new(
         device:         &GpuDevice,
         shaders:        &ShaderRegistry,
         pipeline_cache: &ComputePipelineCache,
         in_rgba:        ResourceId,
         out_rgba:       ResourceId,
-        params:         ColorCorrectionParams,
+        params:         SharpenParams,
     ) -> Self {
-        // Step 1 — Build bind group layout: in (rgba16f read), out (rgba16f write)
         let bind_group_layout = device.device.create_bind_group_layout(
             &wgpu::BindGroupLayoutDescriptor {
-                label: Some("color_correction_bgl"),
+                label: Some("sharpen_bgl"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
@@ -106,23 +82,21 @@ impl ColorCorrectionNode {
             },
         );
 
-        // Step 2 — Build pipeline layout with 80-byte push constants
         let pipeline_layout = device.device.create_pipeline_layout(
             &wgpu::PipelineLayoutDescriptor {
-                label: Some("color_correction_layout"),
+                label: Some("sharpen_layout"),
                 bind_group_layouts: &[&bind_group_layout],
                 push_constant_ranges: &[wgpu::PushConstantRange {
                     stages: wgpu::ShaderStages::COMPUTE,
-                    range: 0..80,
+                    range: 0..16,
                 }],
             },
         );
 
-        // Step 3 — Compile pipeline
-        let shader_mod = shaders.get(BuiltinShader::ColorCorrection);
+        let shader_mod = shaders.get(BuiltinShader::Sharpen);
         let pipeline = pipeline_cache.get_or_compile(
             device,
-            PipelineKey { shader: BuiltinShader::ColorCorrection, entry_point: "cs_main" },
+            PipelineKey { shader: BuiltinShader::Sharpen, entry_point: "cs_main" },
             &pipeline_layout,
             &shader_mod,
         );
@@ -138,19 +112,17 @@ impl ColorCorrectionNode {
         }
     }
 
-    /// Update parameters between frames (no pipeline recompile needed).
-    pub fn set_params(&mut self, new_params: ColorCorrectionParams) {
+    pub fn set_params(&mut self, new_params: SharpenParams) {
         self.params = new_params;
     }
 }
 
-impl RenderNode for ColorCorrectionNode {
-    fn name(&self) -> &str { "ColorCorrection" }
+impl RenderNode for SharpenNode {
+    fn name(&self) -> &str { "Sharpen" }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        use crate::render::resource::{ResourceDescriptor, ResolutionSource, TextureAccess};
         builder.creates.push((self.out_rgba, ResourceDescriptor {
-            label: Some(format!("ColorCorrection_{}", self.out_rgba.0)),
+            label: Some(format!("Sharpen_{}", self.out_rgba.0)),
             size: ResolutionSource::Fixed(self.params.width, self.params.height),
             format: wgpu::TextureFormat::Rgba16Float,
         }));
@@ -167,13 +139,12 @@ impl RenderNode for ColorCorrectionNode {
         let in_res  = ctx.get(self.in_rgba);
         let out_res = ctx.get(self.out_rgba);
 
-        // Views are already native format from pool
         let mut cache = self.bg_cache.lock().unwrap();
         let cache_key = [in_res.view_id, out_res.view_id];
         
         if cache.is_none() || cache.as_ref().unwrap().0 != cache_key {
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("color_correction_bg"),
+                label: Some("sharpen_bg"),
                 layout: &self.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(in_res.view) },
@@ -184,11 +155,10 @@ impl RenderNode for ColorCorrectionNode {
         }
 
         let bind_group = &cache.as_ref().unwrap().1;
-
         let push_bytes = bytemuck::bytes_of(&self.params);
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("color_correction"),
+            label: Some("sharpen"),
             timestamp_writes: None,
         });
         ComputePassHelper::dispatch(

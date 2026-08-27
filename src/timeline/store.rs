@@ -2,7 +2,7 @@
 // src/timeline/store.rs
 
 use crate::timeline::ids::{ClipId, TrackId, SourceId};
-use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode};
+use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode, ClipEffects};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ClipKind {
@@ -61,6 +61,8 @@ pub struct TimelineStore {
     pub(crate) corner_pin:   Vec<CornerPin>,
     #[serde(default)]
     pub(crate) matte_mode:   Vec<MatteMode>,
+    #[serde(default)]
+    pub(crate) effects:      Vec<ClipEffects>,
     pub(crate) volume:       Vec<f32>,
     pub(crate) pan:          Vec<f32>,
     pub(crate) audio_muted:  Vec<bool>,
@@ -107,6 +109,7 @@ impl TimelineStore {
             crop: Vec::new(),
             corner_pin: Vec::new(),
             matte_mode: Vec::new(),
+            effects: Vec::new(),
             volume: Vec::new(),
             pan: Vec::new(),
             audio_muted: Vec::new(),
@@ -153,6 +156,7 @@ impl TimelineStore {
         apply_perm(&mut self.crop, &permutation);
         apply_perm(&mut self.corner_pin, &permutation);
         apply_perm(&mut self.matte_mode, &permutation);
+        apply_perm(&mut self.effects, &permutation);
         apply_perm(&mut self.volume, &permutation);
         apply_perm(&mut self.pan, &permutation);
         apply_perm(&mut self.audio_muted, &permutation);
@@ -185,6 +189,7 @@ impl TimelineStore {
         assert_eq!(self.crop.len(), n);
         assert_eq!(self.corner_pin.len(), n);
         assert_eq!(self.matte_mode.len(), n);
+        assert_eq!(self.effects.len(), n);
         assert_eq!(self.volume.len(), n);
         assert_eq!(self.pan.len(), n);
         assert_eq!(self.audio_muted.len(), n);
@@ -380,6 +385,16 @@ impl TimelineStore {
     pub fn set_matte_mode_at(&mut self, idx: usize, mode: MatteMode) {
         if idx < self.matte_mode.len() {
             self.matte_mode[idx] = mode;
+        }
+    }
+
+    pub fn effects_at(&self, idx: usize) -> ClipEffects {
+        self.effects.get(idx).copied().unwrap_or_default()
+    }
+
+    pub fn set_effects_at(&mut self, idx: usize, effects: ClipEffects) {
+        if idx < self.effects.len() {
+            self.effects[idx] = effects;
         }
     }
 }

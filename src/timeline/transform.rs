@@ -529,6 +529,57 @@ impl std::fmt::Display for ParamError {
                 write!(f, "Parameter index {} out of range (max {})", index, max)
             }
         }
+    }
+}
 
+/// Parameters for all built-in GPU effects applied to a clip.
+#[derive(Copy, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClipEffects {
+    pub brightness: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub hue: f32,
+
+    pub blur_enabled: bool,
+    pub blur_radius: f32,
+    pub blur_sigma: f32,
+
+    pub sharpen_enabled: bool,
+    pub sharpen_amount: f32,
+
+    pub vignette_enabled: bool,
+    pub vignette_intensity: f32,
+    pub vignette_radius: f32,
+    pub vignette_softness: f32,
+    pub vignette_roundness: f32,
+
+    pub chroma_key_enabled: bool,
+    pub chroma_key_color: [f32; 3],
+    pub chroma_key_tolerance: f32,
+    pub chroma_key_softness: f32,
+}
+
+impl Default for ClipEffects {
+    fn default() -> Self {
+        Self {
+            brightness: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            hue: 0.0,
+            blur_enabled: false,
+            blur_radius: 10.0,
+            blur_sigma: 5.0,
+            sharpen_enabled: false,
+            sharpen_amount: 0.5,
+            vignette_enabled: false,
+            vignette_intensity: 0.5,
+            vignette_radius: 0.75,
+            vignette_softness: 0.45,
+            vignette_roundness: 1.0,
+            chroma_key_enabled: false,
+            chroma_key_color: [0.0, 1.0, 0.0],
+            chroma_key_tolerance: 0.3,
+            chroma_key_softness: 0.1,
+        }
     }
 }

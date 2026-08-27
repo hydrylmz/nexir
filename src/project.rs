@@ -235,6 +235,7 @@ impl Project {
         let crop = *self.clips.crop_at(idx);
         let corner_pin = *self.clips.corner_pin_at(idx);
         let matte_mode = self.clips.matte_mode_at(idx);
+        let effects = self.clips.effects_at(idx);
         let kind = self.clips.kind_at(idx).clone();
 
         // Ripple remove from old track (closes gap)
@@ -258,6 +259,7 @@ impl Project {
                 crop,
                 corner_pin,
                 matte_mode,
+                effects,
                 volume,
                 pan,
                 audio_muted,

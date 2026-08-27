@@ -7,6 +7,8 @@ use crate::timeline::transform::EffectParams;
 pub enum EffectKind {
     ColorCorrection,
     GaussianBlur,
+    Sharpen,
+    Vignette,
     ChromaKey,
     Transform2D,
     /// A user-supplied WGSL shader. The ShaderId is looked up in the ShaderRegistry (Phase 3).

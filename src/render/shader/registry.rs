@@ -14,6 +14,9 @@ pub enum BuiltinShader {
     ChromaKey,
     Lut3D,
     ToneMap,
+    GaussianBlur,
+    Sharpen,
+    Vignette,
 }
 
 pub struct ShaderRegistry {
@@ -33,6 +36,9 @@ impl ShaderRegistry {
             (BuiltinShader::ChromaKey,        include_str!("chroma_key.wgsl")),
             (BuiltinShader::Lut3D,            include_str!("lut.wgsl")),
             (BuiltinShader::ToneMap,          include_str!("tonemap.wgsl")),
+            (BuiltinShader::GaussianBlur,     include_str!("blur.wgsl")),
+            (BuiltinShader::Sharpen,          include_str!("sharpen.wgsl")),
+            (BuiltinShader::Vignette,         include_str!("vignette.wgsl")),
         ];
 
         for &(shader_id, src) in sources {
@@ -47,6 +53,9 @@ impl ShaderRegistry {
                 BuiltinShader::ChromaKey       => "chroma_key_shader",
                 BuiltinShader::Lut3D           => "lut_3d_shader",
                 BuiltinShader::ToneMap         => "tonemap_shader",
+                BuiltinShader::GaussianBlur     => "gaussian_blur_shader",
+                BuiltinShader::Sharpen          => "sharpen_shader",
+                BuiltinShader::Vignette         => "vignette_shader",
             };
 
 

@@ -38,6 +38,24 @@ pub struct InspectorState {
     pub bg_padding: f32,
 
     // Effects
+    pub brightness: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub hue: f32,
+
+    pub blur_enabled: bool,
+    pub blur_radius: f32,
+    pub blur_sigma: f32,
+
+    pub sharpen_enabled: bool,
+    pub sharpen_amount: f32,
+
+    pub vignette_enabled: bool,
+    pub vignette_intensity: f32,
+    pub vignette_radius: f32,
+    pub vignette_softness: f32,
+    pub vignette_roundness: f32,
+
     pub chroma_key_enabled: bool,
     pub chroma_key_color: [f32; 3],
     pub chroma_key_tolerance: f32,
@@ -79,6 +97,20 @@ impl Default for InspectorState {
             bg_enabled: false,
             bg_color: [0.0, 0.0, 0.0, 0.85],
             bg_padding: 12.0,
+            brightness: 0.0,
+            contrast: 100.0,
+            saturation: 100.0,
+            hue: 0.0,
+            blur_enabled: false,
+            blur_radius: 10.0,
+            blur_sigma: 5.0,
+            sharpen_enabled: false,
+            sharpen_amount: 50.0,
+            vignette_enabled: false,
+            vignette_intensity: 50.0,
+            vignette_radius: 75.0,
+            vignette_softness: 45.0,
+            vignette_roundness: 100.0,
             chroma_key_enabled: false,
             chroma_key_color: [0.0, 1.0, 0.0],
             chroma_key_tolerance: 0.3,
@@ -137,6 +169,27 @@ fn draw_inner(
             state.crop_right = crop.right * 100.0;
             state.crop_bottom = crop.bottom * 100.0;
             state.crop_feather = crop.feather;
+
+            let eff = project.clips.effects_at(idx);
+            state.brightness = eff.brightness * 100.0;
+            state.contrast = eff.contrast * 100.0;
+            state.saturation = eff.saturation * 100.0;
+            state.hue = eff.hue;
+            state.blur_enabled = eff.blur_enabled;
+            state.blur_radius = eff.blur_radius;
+            state.blur_sigma = eff.blur_sigma;
+            state.sharpen_enabled = eff.sharpen_enabled;
+            state.sharpen_amount = eff.sharpen_amount * 100.0;
+            state.vignette_enabled = eff.vignette_enabled;
+            state.vignette_intensity = eff.vignette_intensity * 100.0;
+            state.vignette_radius = eff.vignette_radius * 100.0;
+            state.vignette_softness = eff.vignette_softness * 100.0;
+            state.vignette_roundness = eff.vignette_roundness * 100.0;
+            state.chroma_key_enabled = eff.chroma_key_enabled;
+            state.chroma_key_color = eff.chroma_key_color;
+            state.chroma_key_tolerance = eff.chroma_key_tolerance;
+            state.chroma_key_softness = eff.chroma_key_softness;
+
             // Load text clip properties
             match project.clips.kind_at(idx) {
                 nexir::timeline::store::ClipKind::Text {
@@ -635,6 +688,113 @@ fn draw_inner(
 
             // ── Effects ───────────────────────────────────────────────────
             ui.collapsing("✨  Effects", |ui| {
+                // 1. Color & Light
+                ui.collapsing("🎨  Color & Light", |ui| {
+                    egui::Grid::new("color_light_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Brightness");
+                            ui.add(egui::Slider::new(&mut state.brightness, -100.0..=100.0).suffix("%"));
+                            ui.end_row();
+
+                            ui.label("Contrast");
+                            ui.add(egui::Slider::new(&mut state.contrast, 0.0..=200.0).suffix("%"));
+                            ui.end_row();
+
+                            ui.label("Saturation");
+                            ui.add(egui::Slider::new(&mut state.saturation, 0.0..=200.0).suffix("%"));
+                            ui.end_row();
+
+                            ui.label("Hue Shift");
+                            ui.add(egui::Slider::new(&mut state.hue, -180.0..=180.0).suffix("°"));
+                            ui.end_row();
+                        });
+
+                    ui.add_space(4.0);
+                    if ui.button("↺  Reset Color").clicked() {
+                        state.brightness = 0.0;
+                        state.contrast = 100.0;
+                        state.saturation = 100.0;
+                        state.hue = 0.0;
+                    }
+                });
+                ui.add_space(4.0);
+
+                // 2. Gaussian Blur
+                ui.collapsing("💧  Gaussian Blur", |ui| {
+                    egui::Grid::new("blur_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Enable");
+                            ui.checkbox(&mut state.blur_enabled, "");
+                            ui.end_row();
+
+                            if state.blur_enabled {
+                                ui.label("Radius");
+                                ui.add(egui::Slider::new(&mut state.blur_radius, 1.0..=50.0).suffix(" px"));
+                                ui.end_row();
+
+                                ui.label("Sigma");
+                                ui.add(egui::Slider::new(&mut state.blur_sigma, 0.5..=25.0));
+                                ui.end_row();
+                            }
+                        });
+                });
+                ui.add_space(4.0);
+
+                // 3. Sharpen
+                ui.collapsing("⚡  Sharpen", |ui| {
+                    egui::Grid::new("sharpen_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Enable");
+                            ui.checkbox(&mut state.sharpen_enabled, "");
+                            ui.end_row();
+
+                            if state.sharpen_enabled {
+                                ui.label("Amount");
+                                ui.add(egui::Slider::new(&mut state.sharpen_amount, 0.0..=200.0).suffix("%"));
+                                ui.end_row();
+                            }
+                        });
+                });
+                ui.add_space(4.0);
+
+                // 4. Vignette
+                ui.collapsing("🌑  Vignette", |ui| {
+                    egui::Grid::new("vignette_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Enable");
+                            ui.checkbox(&mut state.vignette_enabled, "");
+                            ui.end_row();
+
+                            if state.vignette_enabled {
+                                ui.label("Intensity");
+                                ui.add(egui::Slider::new(&mut state.vignette_intensity, 0.0..=100.0).suffix("%"));
+                                ui.end_row();
+
+                                ui.label("Radius");
+                                ui.add(egui::Slider::new(&mut state.vignette_radius, 10.0..=150.0).suffix("%"));
+                                ui.end_row();
+
+                                ui.label("Softness");
+                                ui.add(egui::Slider::new(&mut state.vignette_softness, 0.0..=100.0).suffix("%"));
+                                ui.end_row();
+
+                                ui.label("Roundness");
+                                ui.add(egui::Slider::new(&mut state.vignette_roundness, 0.0..=100.0).suffix("%"));
+                                ui.end_row();
+                            }
+                        });
+                });
+                ui.add_space(4.0);
+
+                // 5. Chroma Key
                 ui.collapsing("🟢  Chroma Key (Green Screen)", |ui| {
                     egui::Grid::new("chroma_key_grid")
                         .num_columns(2)
@@ -683,6 +843,29 @@ fn draw_inner(
                         });
                 });
             });
+
+            // Sync effect changes back to clip in timeline store
+            let eff = nexir::timeline::transform::ClipEffects {
+                brightness: state.brightness / 100.0,
+                contrast: state.contrast / 100.0,
+                saturation: state.saturation / 100.0,
+                hue: state.hue,
+                blur_enabled: state.blur_enabled,
+                blur_radius: state.blur_radius,
+                blur_sigma: state.blur_sigma,
+                sharpen_enabled: state.sharpen_enabled,
+                sharpen_amount: state.sharpen_amount / 100.0,
+                vignette_enabled: state.vignette_enabled,
+                vignette_intensity: state.vignette_intensity / 100.0,
+                vignette_radius: state.vignette_radius / 100.0,
+                vignette_softness: state.vignette_softness / 100.0,
+                vignette_roundness: state.vignette_roundness / 100.0,
+                chroma_key_enabled: state.chroma_key_enabled,
+                chroma_key_color: state.chroma_key_color,
+                chroma_key_tolerance: state.chroma_key_tolerance,
+                chroma_key_softness: state.chroma_key_softness,
+            };
+            project.clips.set_effects_at(idx, eff);
         }
     }
 }

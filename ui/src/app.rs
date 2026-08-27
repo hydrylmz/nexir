@@ -1073,33 +1073,8 @@ impl NexirApp {
         );
 
         for clip in &frame.clips {
-            // If this clip's source is a still image, use the StillImageUploadNode
-            let is_still = self
-                .project
-                .sources
-                .read()
-                .unwrap()
-                .path(clip.source_id)
-                .map(|p| nexir::timeline::source::is_still_image_path(p.as_ref()))
-                .unwrap_or(false);
-
-            if is_still {
-                if let Some(path) = self.project.sources.read().unwrap().path(clip.source_id) {
-                    if let Some(cached) = self.still_cache.lock().unwrap().get_or_load(device, path.as_ref()) {
-                        let rgba_id = ResourceId::next(&mut id_counter);
-                        compiler.add_node(Box::new(StillImageUploadNode::new(cached, rgba_id)));
-                        comp_node.input_textures.push(rgba_id);
-                        continue;
-                    } else {
-                        log::warn!("Still image load failed for {:?}", path);
-                    }
-                } else {
-                    log::warn!("compile_export_graph: clip source_id={:?} has no registered path", clip.source_id);
-                }
-                // Fallthrough to YUV path if still image failed to load.
-            }
-
-            if let nexir::timeline::store::ClipKind::Text {
+            // Determine input source type: Text, Still Image, or Video
+            let (initial_rgba_id, clip_w, clip_h) = if let nexir::timeline::store::ClipKind::Text {
                 text, font_size, color, stroke_color, stroke_width, background_color, bg_padding
             } = &clip.kind {
                 let cached = self.text_cache.lock().unwrap().get_or_create(
@@ -1107,103 +1082,225 @@ impl NexirApp {
                     *stroke_color, *stroke_width, *background_color, *bg_padding,
                 );
                 let rgba_id = ResourceId::next(&mut id_counter);
+                let (w, h) = (cached.width, cached.height);
                 compiler.add_node(Box::new(nexir::render::text_cache::TextUploadNode::new(cached, rgba_id)));
-                comp_node.input_textures.push(rgba_id);
-                continue;
-            }
-
-
-
-            let tier = (clip.texture_slot >> 16) as u8;
-            let index = (clip.texture_slot & 0xFFFF) as u16;
-            let slot_id = nexir::io::slot_pool::FrameSlotId { tier, index };
-
-            let y_id = ResourceId::next(&mut id_counter);
-            let uv_id = ResourceId::next(&mut id_counter);
-
-            let color_info = self
-                .project
-                .sources
-                .read()
-                .unwrap()
-                .video_info(clip.source_id)
-                .map(|vi| vi.color_info)
-                .unwrap_or_default();
-
-            let mut upload_node =
-                YuvUploadNode::new_with_depth(device, 0, clip.clip_width, clip.clip_height, y_id, uv_id, color_info.bit_depth);
-
-            // Upload YUV data from the slot pool into staging buffers
-            self.io_layer.pool.with_buffer_read(slot_id, |data| {
-                upload_node.upload_frame(data, clip.is_nv12, clip.clip_width, clip.clip_height);
-            });
-
-            compiler.add_node(Box::new(upload_node));
-
-            // Add YuvToRgb node
-            let rgba_id = ResourceId::next(&mut id_counter);
-
-
-            compiler.add_node(Box::new(
-                nexir::render::nodes::yuv_to_rgb::YuvToRgbNode::new(
-                    device,
-                    &self.shaders,
-                    &self.compute_cache,
-                    y_id,
-                    uv_id,
-                    rgba_id,
-                    clip.clip_width,
-                    clip.clip_height,
-                    color_info,
-                ),
-            ));
-
-            // Insert tone-mapping for HDR clips targeting SDR viewport
-            let final_rgba_id = if color_info.is_hdr() {
-                use nexir::render::nodes::tonemap::{
-                    ToneMapNode, InputTransferFn, GamutConversion, ToneMapPushConstants,
-                    ToneMapMode,
-                };
-                use nexir::timeline::source::TransferFunction;
-
-                let tonemapped_id = ResourceId::next(&mut id_counter);
-                let trc = match color_info.transfer_fn {
-                    TransferFunction::Pq  => InputTransferFn::Pq,
-                    TransferFunction::Hlg => InputTransferFn::Hlg,
-                    _                     => InputTransferFn::Linear,
-                };
-                let gamut = if color_info.effective_primaries(
-                    clip.clip_width, clip.clip_height
-                ) == nexir::timeline::source::ColorPrimaries::Bt2020 {
-                    GamutConversion::Bt2020ToBt709
-                } else {
-                    GamutConversion::None
-                };
-                let tm_params = ToneMapPushConstants::for_sdr_preview(
-                    trc,
-                    gamut,
-                    ToneMapMode::AcesFilmic,
-                    1000.0,
-                    clip.clip_width,
-                    clip.clip_height,
-                );
-                compiler.add_node(Box::new(ToneMapNode::new(
-                    device,
-                    &self.shaders,
-                    &self.compute_cache,
-                    rgba_id,
-                    tonemapped_id,
-                    tm_params,
-                )));
-                tonemapped_id
+                (rgba_id, w, h)
             } else {
-                rgba_id
+                let is_still = self
+                    .project
+                    .sources
+                    .read()
+                    .unwrap()
+                    .path(clip.source_id)
+                    .map(|p| nexir::timeline::source::is_still_image_path(p.as_ref()))
+                    .unwrap_or(false);
+
+                if is_still {
+                    if let Some(path) = self.project.sources.read().unwrap().path(clip.source_id) {
+                        if let Some(cached) = self.still_cache.lock().unwrap().get_or_load(device, path.as_ref()) {
+                            let rgba_id = ResourceId::next(&mut id_counter);
+                            let (w, h) = (cached.width, cached.height);
+                            compiler.add_node(Box::new(StillImageUploadNode::new(cached, rgba_id)));
+                            (rgba_id, w, h)
+                        } else {
+                            log::warn!("Still image load failed for {:?}", path);
+                            continue;
+                        }
+                    } else {
+                        log::warn!("compile_export_graph: clip source_id={:?} has no registered path", clip.source_id);
+                        continue;
+                    }
+                } else {
+                    let tier = (clip.texture_slot >> 16) as u8;
+                    let index = (clip.texture_slot & 0xFFFF) as u16;
+                    let slot_id = nexir::io::slot_pool::FrameSlotId { tier, index };
+
+                    let y_id = ResourceId::next(&mut id_counter);
+                    let uv_id = ResourceId::next(&mut id_counter);
+
+                    let color_info = self
+                        .project
+                        .sources
+                        .read()
+                        .unwrap()
+                        .video_info(clip.source_id)
+                        .map(|vi| vi.color_info)
+                        .unwrap_or_default();
+
+                    let mut upload_node =
+                        YuvUploadNode::new_with_depth(device, 0, clip.clip_width, clip.clip_height, y_id, uv_id, color_info.bit_depth);
+
+                    // Upload YUV data from the slot pool into staging buffers
+                    self.io_layer.pool.with_buffer_read(slot_id, |data| {
+                        upload_node.upload_frame(data, clip.is_nv12, clip.clip_width, clip.clip_height);
+                    });
+
+                    compiler.add_node(Box::new(upload_node));
+
+                    // Add YuvToRgb node
+                    let rgba_id = ResourceId::next(&mut id_counter);
+
+                    compiler.add_node(Box::new(
+                        nexir::render::nodes::yuv_to_rgb::YuvToRgbNode::new(
+                            device,
+                            &self.shaders,
+                            &self.compute_cache,
+                            y_id,
+                            uv_id,
+                            rgba_id,
+                            clip.clip_width,
+                            clip.clip_height,
+                            color_info,
+                        ),
+                    ));
+
+                    // Insert tone-mapping for HDR clips targeting SDR viewport
+                    let final_rgba_id = if color_info.is_hdr() {
+                        use nexir::render::nodes::tonemap::{
+                            ToneMapNode, InputTransferFn, GamutConversion, ToneMapPushConstants,
+                            ToneMapMode,
+                        };
+                        use nexir::timeline::source::TransferFunction;
+
+                        let tonemapped_id = ResourceId::next(&mut id_counter);
+                        let trc = match color_info.transfer_fn {
+                            TransferFunction::Pq  => InputTransferFn::Pq,
+                            TransferFunction::Hlg => InputTransferFn::Hlg,
+                            _                     => InputTransferFn::Linear,
+                        };
+                        let gamut = if color_info.effective_primaries(
+                            clip.clip_width, clip.clip_height
+                        ) == nexir::timeline::source::ColorPrimaries::Bt2020 {
+                            GamutConversion::Bt2020ToBt709
+                        } else {
+                            GamutConversion::None
+                        };
+                        let tm_params = ToneMapPushConstants::for_sdr_preview(
+                            trc,
+                            gamut,
+                            ToneMapMode::AcesFilmic,
+                            1000.0,
+                            clip.clip_width,
+                            clip.clip_height,
+                        );
+                        compiler.add_node(Box::new(ToneMapNode::new(
+                            device,
+                            &self.shaders,
+                            &self.compute_cache,
+                            rgba_id,
+                            tonemapped_id,
+                            tm_params,
+                        )));
+                        tonemapped_id
+                    } else {
+                        rgba_id
+                    };
+
+                    (final_rgba_id, clip.clip_width, clip.clip_height)
+                }
             };
 
-            let post_process_id = if self.inspector.chroma_key_enabled {
-                let r = self.inspector.chroma_key_color[0];
-                let g = self.inspector.chroma_key_color[1];
-                let b = self.inspector.chroma_key_color[2];
+            let mut cur_id = initial_rgba_id;
+
+            let eff = &clip.effects;
+
+            // 1. Color & Light Adjustment (Brightness, Contrast, Saturation, Hue)
+            if eff.brightness.abs() > 0.001
+                || (eff.contrast - 1.0).abs() > 0.001
+                || (eff.saturation - 1.0).abs() > 0.001
+                || eff.hue.abs() > 0.001
+            {
+                let cc_out = ResourceId::next(&mut id_counter);
+                let mut params = nexir::render::nodes::color_correction::ColorCorrectionParams::identity(
+                    clip_w,
+                    clip_h,
+                );
+                params.brightness = eff.brightness;
+                params.contrast = eff.contrast.max(0.0);
+                params.saturation = eff.saturation.max(0.0);
+                params.hue_shift = eff.hue.to_radians();
+
+                compiler.add_node(Box::new(nexir::render::nodes::color_correction::ColorCorrectionNode::new(
+                    device,
+                    &self.shaders,
+                    &self.compute_cache,
+                    cur_id,
+                    cc_out,
+                    params,
+                )));
+                cur_id = cc_out;
+            }
+
+            // 2. Gaussian Blur
+            if eff.blur_enabled && eff.blur_radius > 0.1 {
+                use nexir::render::nodes::gaussian_blur::{BlurPassNode, BlurParams};
+                let h_out = ResourceId::next(&mut id_counter);
+                compiler.add_node(Box::new(BlurPassNode::new(
+                    device,
+                    &self.shaders,
+                    &self.compute_cache,
+                    cur_id,
+                    h_out,
+                    BlurParams::horizontal(eff.blur_radius, eff.blur_sigma, clip_w, clip_h),
+                    "BlurH",
+                )));
+                let v_out = ResourceId::next(&mut id_counter);
+                compiler.add_node(Box::new(BlurPassNode::new(
+                    device,
+                    &self.shaders,
+                    &self.compute_cache,
+                    h_out,
+                    v_out,
+                    BlurParams::vertical(eff.blur_radius, eff.blur_sigma, clip_w, clip_h),
+                    "BlurV",
+                )));
+                cur_id = v_out;
+            }
+
+            // 3. Sharpen
+            if eff.sharpen_enabled && eff.sharpen_amount > 0.001 {
+                use nexir::render::nodes::sharpen::{SharpenNode, SharpenParams};
+                let sharp_out = ResourceId::next(&mut id_counter);
+                compiler.add_node(Box::new(SharpenNode::new(
+                    device,
+                    &self.shaders,
+                    &self.compute_cache,
+                    cur_id,
+                    sharp_out,
+                    SharpenParams::new(eff.sharpen_amount, clip_w, clip_h),
+                )));
+                cur_id = sharp_out;
+            }
+
+            // 4. Vignette
+            if eff.vignette_enabled && eff.vignette_intensity > 0.001 {
+                use nexir::render::nodes::vignette::{VignetteNode, VignetteParams};
+                let vig_out = ResourceId::next(&mut id_counter);
+                compiler.add_node(Box::new(VignetteNode::new(
+                    device,
+                    &self.shaders,
+                    &self.compute_cache,
+                    cur_id,
+                    vig_out,
+                    VignetteParams {
+                        intensity: eff.vignette_intensity,
+                        radius: eff.vignette_radius,
+                        softness: eff.vignette_softness,
+                        roundness: eff.vignette_roundness,
+                        center_x: 0.5,
+                        center_y: 0.5,
+                        width: clip_w,
+                        height: clip_h,
+                    },
+                )));
+                cur_id = vig_out;
+            }
+
+            // 5. Chroma Key
+            if eff.chroma_key_enabled {
+                let r = eff.chroma_key_color[0];
+                let g = eff.chroma_key_color[1];
+                let b = eff.chroma_key_color[2];
                 let max = r.max(g).max(b);
                 let min = r.min(g).min(b);
                 let delta = max - min;
@@ -1216,8 +1313,8 @@ impl NexirApp {
                 } else {
                     ((r - g) / delta + 4.0) * 60.0
                 };
-                let tol = (self.inspector.chroma_key_tolerance * 180.0).max(1.0);
-                let soft = (self.inspector.chroma_key_softness * 180.0).min(tol - 0.1).max(0.01);
+                let tol = (eff.chroma_key_tolerance * 180.0).max(1.0);
+                let soft = (eff.chroma_key_softness * 180.0).min(tol - 0.1).max(0.01);
                 let ck_params = nexir::render::nodes::chroma_key::ChromaKeyParams {
                     key_hue: hue,
                     tolerance: tol,
@@ -1225,22 +1322,22 @@ impl NexirApp {
                     min_saturation: 0.15,
                     min_value: 0.08,
                     spill_suppress: 0.3,
-                    width: clip.clip_width,
-                    height: clip.clip_height,
+                    width: clip_w,
+                    height: clip_h,
                 };
                 let ck_out_id = ResourceId::next(&mut id_counter);
                 compiler.add_node(Box::new(nexir::render::nodes::chroma_key::ChromaKeyNode::new(
                     device,
                     &self.shaders,
                     &self.compute_cache,
-                    final_rgba_id,
+                    cur_id,
                     ck_out_id,
                     ck_params,
                 )));
-                ck_out_id
-            } else {
-                final_rgba_id
-            };
+                cur_id = ck_out_id;
+            }
+
+            let post_process_id = cur_id;
 
             // Provide RGBA texture to compositor
             comp_node.input_textures.push(post_process_id);

@@ -26,6 +26,9 @@ pub struct StillImageCache {
 
 impl StillImageCache {
     pub fn get_or_load(&mut self, device: &GpuDevice, path: &Path) -> Option<CachedStillImage> {
+        if path.to_string_lossy().starts_with("nexir://") {
+            return None;
+        }
         if let Some(cached) = self.images.get(path) {
             return Some(cached.clone());
         }
@@ -130,6 +133,9 @@ impl StillImageCache {
     /// resources and is safe to call from import-time code where no `device` is
     /// available.
     pub fn probe_decode(&mut self, path: &Path) {
+        if path.to_string_lossy().starts_with("nexir://") {
+            return;
+        }
         match image::ImageReader::open(path) {
             Ok(r) => match r.with_guessed_format() {
                 Ok(r2) => match r2.decode() {

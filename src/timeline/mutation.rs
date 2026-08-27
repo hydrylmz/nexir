@@ -2,7 +2,7 @@
 
 use crate::timeline::ids::{ClipId, SourceId, TrackId};
 use crate::timeline::store::TimelineStore;
-use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode};
+use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode, ClipEffects};
 
 /// Parameters for inserting a new clip.
 #[derive(Clone, Debug)]
@@ -20,6 +20,7 @@ pub struct ClipInsertParams {
     pub crop: CropRect,
     pub corner_pin: CornerPin,
     pub matte_mode: MatteMode,
+    pub effects: ClipEffects,
     /// Linear clip gain (1.0 = unity).
     pub volume: f32,
     /// Stereo pan (-1.0 = left, 0.0 = center, 1.0 = right).
@@ -52,6 +53,7 @@ impl Default for ClipInsertParams {
             crop: CropRect::full(),
             corner_pin: CornerPin::identity(),
             matte_mode: MatteMode::None,
+            effects: ClipEffects::default(),
             volume: 1.0,
             pan: 0.0,
             audio_muted: false,
@@ -91,6 +93,7 @@ pub fn insert_clip(
     store.crop.insert(pos, params.crop);
     store.corner_pin.insert(pos, params.corner_pin);
     store.matte_mode.insert(pos, params.matte_mode);
+    store.effects.insert(pos, params.effects);
     store.volume.insert(pos, params.volume);
     store.pan.insert(pos, params.pan);
     store.audio_muted.insert(pos, params.audio_muted);
@@ -147,6 +150,7 @@ pub fn insert_clip_overwrite(
         CropRect,
         CornerPin,
         MatteMode,
+        ClipEffects,
         f32,
         f32,
         bool,
@@ -177,6 +181,7 @@ pub fn insert_clip_overwrite(
                     *store.crop_at(i),
                     *store.corner_pin_at(i),
                     store.matte_mode_at(i),
+                    store.effects_at(i),
                     store.volume[i],
                     store.pan[i],
                     store.audio_muted[i],
@@ -204,6 +209,7 @@ pub fn insert_clip_overwrite(
         ex_crop,
         ex_corner_pin,
         ex_matte,
+        ex_effects,
         ex_volume,
         ex_pan,
         ex_audio_muted,
@@ -239,6 +245,7 @@ pub fn insert_clip_overwrite(
                     crop: ex_crop,
                     corner_pin: ex_corner_pin,
                     matte_mode: ex_matte,
+                    effects: ex_effects,
                     volume: ex_volume,
                     pan: ex_pan,
                     audio_muted: ex_audio_muted,
@@ -265,6 +272,7 @@ pub fn insert_clip_overwrite(
                     crop: ex_crop,
                     corner_pin: ex_corner_pin,
                     matte_mode: ex_matte,
+                    effects: ex_effects,
                     volume: ex_volume,
                     pan: ex_pan,
                     audio_muted: ex_audio_muted,
@@ -293,6 +301,7 @@ pub fn insert_clip_overwrite(
                     crop: ex_crop,
                     corner_pin: ex_corner_pin,
                     matte_mode: ex_matte,
+                    effects: ex_effects,
                     volume: ex_volume,
                     pan: ex_pan,
                     audio_muted: ex_audio_muted,
@@ -322,6 +331,7 @@ pub fn insert_clip_overwrite(
                     crop: ex_crop,
                     corner_pin: ex_corner_pin,
                     matte_mode: ex_matte,
+                    effects: ex_effects,
                     volume: ex_volume,
                     pan: ex_pan,
                     audio_muted: ex_audio_muted,
@@ -355,6 +365,7 @@ pub fn remove_clip(store: &mut TimelineStore, id: ClipId) -> Result<(), Mutation
     store.crop.remove(idx);
     store.corner_pin.remove(idx);
     store.matte_mode.remove(idx);
+    store.effects.remove(idx);
     store.volume.remove(idx);
     store.pan.remove(idx);
     store.audio_muted.remove(idx);
@@ -392,6 +403,7 @@ pub fn move_clip(
         crop: *store.crop_at(idx),
         corner_pin: *store.corner_pin_at(idx),
         matte_mode: store.matte_mode_at(idx),
+        effects: store.effects_at(idx),
         volume: store.volume[idx],
         pan: store.pan[idx],
         audio_muted: store.audio_muted[idx],
@@ -439,6 +451,7 @@ pub fn trim_clip_in(
         crop: *store.crop_at(idx),
         corner_pin: *store.corner_pin_at(idx),
         matte_mode: store.matte_mode_at(idx),
+        effects: store.effects_at(idx),
         volume: store.volume[idx],
         pan: store.pan[idx],
         audio_muted: store.audio_muted[idx],
@@ -497,6 +510,7 @@ pub fn split_clip(
         crop: *store.crop_at(idx),
         corner_pin: *store.corner_pin_at(idx),
         matte_mode: store.matte_mode_at(idx),
+        effects: store.effects_at(idx),
         volume: store.volume[idx],
         pan: store.pan[idx],
         audio_muted: store.audio_muted[idx],
@@ -531,6 +545,7 @@ pub fn duplicate_clip(store: &mut TimelineStore, id: ClipId) -> Result<ClipId, M
         crop: *store.crop_at(idx),
         corner_pin: *store.corner_pin_at(idx),
         matte_mode: store.matte_mode_at(idx),
+        effects: store.effects_at(idx),
         volume: store.volume[idx],
         pan: store.pan[idx],
         audio_muted: store.audio_muted[idx],
@@ -570,6 +585,7 @@ pub fn ripple_remove_clip(store: &mut TimelineStore, id: ClipId) -> Result<(), M
                     crop: *store.crop_at(i),
                     corner_pin: *store.corner_pin_at(i),
                     matte_mode: store.matte_mode_at(i),
+                    effects: store.effects_at(i),
                     volume: store.volume[i],
                     pan: store.pan[i],
                     audio_muted: store.audio_muted[i],
@@ -656,6 +672,7 @@ pub fn insert_clip_ripple(
                 crop: *store.crop_at(i),
                 corner_pin: *store.corner_pin_at(i),
                 matte_mode: store.matte_mode_at(i),
+                effects: store.effects_at(i),
                 volume: store.volume[i],
                 pan: store.pan[i],
                 audio_muted: store.audio_muted[i],
@@ -678,6 +695,7 @@ pub fn insert_clip_ripple(
                 crop: *store.crop_at(i),
                 corner_pin: *store.corner_pin_at(i),
                 matte_mode: store.matte_mode_at(i),
+                effects: store.effects_at(i),
                 volume: store.volume[i],
                 pan: store.pan[i],
                 audio_muted: store.audio_muted[i],
@@ -710,6 +728,7 @@ pub fn insert_clip_ripple(
                         crop: *store.crop_at(i),
                         corner_pin: *store.corner_pin_at(i),
                         matte_mode: store.matte_mode_at(i),
+                        effects: store.effects_at(i),
                         volume: store.volume[i],
                         pan: store.pan[i],
                         audio_muted: store.audio_muted[i],
@@ -761,6 +780,7 @@ pub fn insert_clip_ripple(
                         crop: *store.crop_at(j),
                         corner_pin: *store.corner_pin_at(j),
                         matte_mode: store.matte_mode_at(j),
+                        effects: store.effects_at(j),
                         volume: store.volume[j],
                         pan: store.pan[j],
                         audio_muted: store.audio_muted[j],
@@ -783,6 +803,7 @@ pub fn insert_clip_ripple(
                         crop: *store.crop_at(j),
                         corner_pin: *store.corner_pin_at(j),
                         matte_mode: store.matte_mode_at(j),
+                        effects: store.effects_at(j),
                         volume: store.volume[j],
                         pan: store.pan[j],
                         audio_muted: store.audio_muted[j],
@@ -825,6 +846,7 @@ pub fn insert_clip_ripple(
                             crop: *store.crop_at(j),
                             corner_pin: *store.corner_pin_at(j),
                             matte_mode: store.matte_mode_at(j),
+                            effects: store.effects_at(j),
                             volume: store.volume[j],
                             pan: store.pan[j],
                             audio_muted: store.audio_muted[j],
@@ -891,6 +913,7 @@ pub fn move_clip_ripple(
         crop: *store.crop_at(idx),
         corner_pin: *store.corner_pin_at(idx),
         matte_mode: store.matte_mode_at(idx),
+        effects: store.effects_at(idx),
         volume: store.volume[idx],
         pan: store.pan[idx],
         audio_muted: store.audio_muted[idx],
@@ -967,6 +990,16 @@ pub fn set_matte_mode(
 ) -> Result<(), MutationError> {
     let idx = store.index_of(id).ok_or(MutationError::ClipNotFound(id))?;
     store.set_matte_mode_at(idx, mode);
+    Ok(())
+}
+
+pub fn set_effects(
+    store: &mut TimelineStore,
+    id: ClipId,
+    effects: ClipEffects,
+) -> Result<(), MutationError> {
+    let idx = store.index_of(id).ok_or(MutationError::ClipNotFound(id))?;
+    store.set_effects_at(idx, effects);
     Ok(())
 }
 
@@ -1084,6 +1117,7 @@ pub fn duplicate_clip_to(
         crop: *store.crop_at(idx),
         corner_pin: *store.corner_pin_at(idx),
         matte_mode: store.matte_mode_at(idx),
+        effects: store.effects_at(idx),
         volume: store.volume[idx],
         pan: store.pan[idx],
         audio_muted: store.audio_muted[idx],

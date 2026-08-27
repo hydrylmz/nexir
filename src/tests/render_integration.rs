@@ -113,8 +113,8 @@ mod render_integration {
         );
 
         let mut frame = FrameState::test_empty(W, H);
-        frame.clips.push(ClipRenderEntry { source_id: SourceId(0), texture_slot: 0, layer_order: 0, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 1.0, blend_mode: crate::timeline::transform::BlendMode::Normal, crop: crate::timeline::transform::CropRect::full(), corner_pin: crate::timeline::transform::CornerPin::identity(), matte_mode: crate::timeline::transform::MatteMode::None, is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
-        frame.clips.push(ClipRenderEntry { source_id: SourceId(1), texture_slot: 1, layer_order: 1, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 0.5, blend_mode: crate::timeline::transform::BlendMode::Normal, crop: crate::timeline::transform::CropRect::full(), corner_pin: crate::timeline::transform::CornerPin::identity(), matte_mode: crate::timeline::transform::MatteMode::None, is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
+        frame.clips.push(ClipRenderEntry { source_id: SourceId(0), texture_slot: 0, layer_order: 0, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 1.0, blend_mode: crate::timeline::transform::BlendMode::Normal, crop: crate::timeline::transform::CropRect::full(), corner_pin: crate::timeline::transform::CornerPin::identity(), matte_mode: crate::timeline::transform::MatteMode::None, effects: Default::default(), is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
+        frame.clips.push(ClipRenderEntry { source_id: SourceId(1), texture_slot: 1, layer_order: 1, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 0.5, blend_mode: crate::timeline::transform::BlendMode::Normal, crop: crate::timeline::transform::CropRect::full(), corner_pin: crate::timeline::transform::CornerPin::identity(), matte_mode: crate::timeline::transform::MatteMode::None, effects: Default::default(), is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
         frame.sort_clips();
 
         let mut compiler = RenderGraphCompiler::new();
@@ -321,5 +321,107 @@ mod render_integration {
         let device = pollster::block_on(GpuDevice::new_headless()).unwrap();
         let result = ShaderRegistry::compile_all(&device);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_phase14_effects_pipeline_execution() {
+        use crate::render::compute::ComputePipelineCache;
+        use crate::render::nodes::gaussian_blur::{BlurPassNode, BlurParams};
+        use crate::render::nodes::sharpen::{SharpenNode, SharpenParams};
+        use crate::render::nodes::vignette::{VignetteNode, VignetteParams};
+        use crate::render::nodes::color_correction::{ColorCorrectionNode, ColorCorrectionParams};
+
+        let device = Arc::new(pollster::block_on(GpuDevice::new_headless()).unwrap());
+        let shaders = ShaderRegistry::compile_all(&device).unwrap();
+        let compute_cache = Arc::new(ComputePipelineCache::new());
+
+        let mut compiler = RenderGraphCompiler::new();
+        let mut id_counter = 2u32;
+
+        let in_id = ResourceId::next(&mut id_counter);
+        let cc_out = ResourceId::next(&mut id_counter);
+        let blur_h_out = ResourceId::next(&mut id_counter);
+        let blur_v_out = ResourceId::next(&mut id_counter);
+        let sharpen_out = ResourceId::next(&mut id_counter);
+        let final_out = ResourceId::FINAL_COLOR;
+
+        // Dummy initial producer
+        struct DummyProducer(ResourceId);
+        impl RenderNode for DummyProducer {
+            fn name(&self) -> &str { "DummyProducer" }
+            fn declare_resources(&self, builder: &mut ResourceBuilder) {
+                builder.creates.push((self.0, ResourceDescriptor {
+                    label: Some("InitialTexture".into()),
+                    size: ResolutionSource::Fixed(W, H),
+                    format: wgpu::TextureFormat::Rgba16Float,
+                }));
+                builder.write(self.0, TextureAccess::StorageWrite);
+            }
+            fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
+        }
+        compiler.add_node(Box::new(DummyProducer(in_id)));
+
+        // 1. Color correction
+        let mut cc_params = ColorCorrectionParams::identity(W, H);
+        cc_params.brightness = 0.1;
+        cc_params.contrast = 1.1;
+        cc_params.saturation = 1.2;
+        cc_params.hue_shift = 0.2;
+        compiler.add_node(Box::new(ColorCorrectionNode::new(
+            &device,
+            &shaders,
+            &compute_cache,
+            in_id,
+            cc_out,
+            cc_params,
+        )));
+
+        // 2. Gaussian Blur (H + V)
+        compiler.add_node(Box::new(BlurPassNode::new(
+            &device,
+            &shaders,
+            &compute_cache,
+            cc_out,
+            blur_h_out,
+            BlurParams::horizontal(5.0, 2.5, W, H),
+            "BlurH",
+        )));
+        compiler.add_node(Box::new(BlurPassNode::new(
+            &device,
+            &shaders,
+            &compute_cache,
+            blur_h_out,
+            blur_v_out,
+            BlurParams::vertical(5.0, 2.5, W, H),
+            "BlurV",
+        )));
+
+        // 3. Sharpen
+        compiler.add_node(Box::new(SharpenNode::new(
+            &device,
+            &shaders,
+            &compute_cache,
+            blur_v_out,
+            sharpen_out,
+            SharpenParams::new(0.5, W, H),
+        )));
+
+        // 4. Vignette
+        compiler.add_node(Box::new(VignetteNode::new(
+            &device,
+            &shaders,
+            &compute_cache,
+            sharpen_out,
+            final_out,
+            VignetteParams::default_preset(W, H),
+        )));
+
+        let graph = compiler.compile(W, H).expect("Effects pipeline graph failed to compile");
+        let frame_state = FrameState::test_empty(W, H);
+
+        let mut encoder = device.begin_frame();
+        graph.execute(&mut encoder, &device, &frame_state);
+        let submission_id = device.submit(encoder);
+        device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(submission_id));
     }
 }
