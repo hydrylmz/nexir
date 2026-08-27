@@ -165,7 +165,12 @@ impl RenderNode for ChromaKeyNode {
     fn name(&self) -> &str { "ChromaKey" }
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
-        use crate::render::resource::TextureAccess;
+        use crate::render::resource::{ResourceDescriptor, ResolutionSource, TextureAccess};
+        builder.creates.push((self.out_rgba, ResourceDescriptor {
+            label: Some(format!("ChromaKey_{}", self.out_rgba.0)),
+            size: ResolutionSource::Fixed(self.params.width, self.params.height),
+            format: wgpu::TextureFormat::Rgba16Float,
+        }));
         builder.read(self.in_rgba, TextureAccess::Sampled);
         builder.write(self.out_rgba, TextureAccess::StorageWrite);
     }
