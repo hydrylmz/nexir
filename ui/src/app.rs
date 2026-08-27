@@ -46,6 +46,9 @@ pub struct PreviewState {
     pub height: u32,
     pub video_width: u32, // actual decoded frame dimensions
     pub video_height: u32,
+    /// CPU-side copy of the last rendered preview frame (width, height, RGBA8 bytes).
+    /// Updated each frame for use by the eyedropper magnifier.
+    pub preview_pixels: Option<(u32, u32, Vec<u8>)>,
 }
 
 pub struct ActiveAudioDecoder {
@@ -321,6 +324,7 @@ impl NexirApp {
                 height: 0,
                 video_width: 0,
                 video_height: 0,
+                preview_pixels: None,
             },
             inspector: InspectorState::default(),
             media_pool: MediaPoolState::default(),
@@ -556,6 +560,7 @@ impl NexirApp {
         let mut vp_result = crate::layout::viewport::ViewportDrawResult {
             size: egui::Vec2::ZERO,
             eyedropper_pick: None,
+            eyedropper_hover_uv: None,
         };
         egui::CentralPanel::default().show(&self.egui_ctx, |ui| {
             vp_result = crate::layout::viewport::draw(
@@ -568,9 +573,15 @@ impl NexirApp {
                 &active_clips,
                 &mut self.history,
                 self.inspector.eyedropper_active,
+                self.preview.preview_pixels.as_ref(),
             );
         });
         let viewport_size = vp_result.size;
+
+        // While eyedropper is hovering, request continuous repaints for the live magnifier
+        if self.inspector.eyedropper_active && vp_result.eyedropper_hover_uv.is_some() {
+            self.egui_ctx.request_repaint();
+        }
 
         // Eyedropper: if a pick was requested and we have a preview texture, do a GPU readback.
         if let Some(uv) = vp_result.eyedropper_pick {
@@ -1559,6 +1570,63 @@ impl NexirApp {
 
         device.submit(encoder);
         surface_texture.present();
+
+        // Eyedropper magnifier: keep preview_pixels current after the frame has been committed.
+        // We do this after device.submit() so the blit into preview_texture is guaranteed complete.
+        // Only runs when eyedropper is active to avoid per-frame overhead.
+        if self.inspector.eyedropper_active {
+            if let Some(ref preview_texture) = self.preview.texture {
+                let pw = preview_texture.width();
+                let ph = preview_texture.height();
+                if pw > 0 && ph > 0 {
+                    let bytes_per_row = (pw * 4 + 255) & !255u32;
+                    let buf_size = (bytes_per_row * ph) as u64;
+                    let staging = device.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("eyedropper_preview_staging"),
+                        size: buf_size,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    });
+                    let mut copy_enc = device.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor { label: Some("preview_pixel_copy") }
+                    );
+                    copy_enc.copy_texture_to_buffer(
+                        preview_texture.as_image_copy(),
+                        wgpu::ImageCopyBuffer {
+                            buffer: &staging,
+                            layout: wgpu::ImageDataLayout {
+                                offset: 0,
+                                bytes_per_row: Some(bytes_per_row),
+                                rows_per_image: Some(ph),
+                            },
+                        },
+                        wgpu::Extent3d { width: pw, height: ph, depth_or_array_layers: 1 },
+                    );
+                    device.queue.submit([copy_enc.finish()]);
+                    device.device.poll(wgpu::Maintain::Wait);
+
+                    let buf_slice = staging.slice(..);
+                    buf_slice.map_async(wgpu::MapMode::Read, |_| {});
+                    device.device.poll(wgpu::Maintain::Wait);
+                    let data = buf_slice.get_mapped_range();
+                    // Strip row padding: copy only the pixel data (pw * 4 bytes per row)
+                    let mut pixels = Vec::with_capacity((pw * ph * 4) as usize);
+                    for row in 0..ph {
+                        let row_start = (row * bytes_per_row) as usize;
+                        let row_end = row_start + (pw * 4) as usize;
+                        if row_end <= data.len() {
+                            pixels.extend_from_slice(&data[row_start..row_end]);
+                        }
+                    }
+                    drop(data);
+                    staging.unmap();
+                    self.preview.preview_pixels = Some((pw, ph, pixels));
+                }
+            }
+        } else {
+            // Clear cached pixels when eyedropper is not active
+            self.preview.preview_pixels = None;
+        }
 
         for id in &output.textures_delta.free {
             self.egui_renderer.free_texture(id);

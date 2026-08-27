@@ -57,6 +57,8 @@ pub struct ViewportDrawResult {
     /// If the eyedropper was active and the user clicked inside the video area,
     /// this is the normalized UV coordinate (0..1 range) of the click.
     pub eyedropper_pick: Option<egui::Vec2>,
+    /// The current hover UV while eyedropper is active (for requesting repaints).
+    pub eyedropper_hover_uv: Option<egui::Vec2>,
 }
 
 /// Draw the preview viewport, preserving the video's aspect ratio via letter-boxing / pillar-boxing.
@@ -70,6 +72,8 @@ pub fn draw(
     active_clips: &[ActiveClip],
     history: &mut HistoryState,
     eyedropper_active: bool,
+    // CPU-side RGBA8 pixel buffer for the magnifier (width, height, pixels).
+    preview_pixels: Option<&(u32, u32, Vec<u8>)>,
 ) -> ViewportDrawResult {
     let fps = project.settings.frame_rate.num.max(1);
     let f = state.playhead_frame;
@@ -96,7 +100,13 @@ pub fn draw(
     let controls_height = 40.0;
     let viewport_size = Vec2::new(available_size.x, available_size.y - controls_height);
 
-    let (rect, response) = ui.allocate_exact_size(viewport_size, egui::Sense::click());
+    // Use hover + click sense so we get pointer position even without pressing
+    let sense = if eyedropper_active {
+        egui::Sense::hover().union(egui::Sense::click())
+    } else {
+        egui::Sense::click()
+    };
+    let (rect, response) = ui.allocate_exact_size(viewport_size, sense);
     ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
 
     let canvas_w = project.settings.width as f32;
@@ -133,22 +143,162 @@ pub fn draw(
         );
     }
 
-    // Eyedropper mode cursor feedback
-    if eyedropper_active {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-    }
-
-    // Eyedropper pick — intercept click before normal hit-testing
+    // --- Eyedropper mode ---
     let mut eyedropper_pick: Option<egui::Vec2> = None;
-    if eyedropper_active && response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos()
-            .or_else(|| ui.input(|i| i.pointer.latest_pos()))
-            .or_else(|| ui.ctx().pointer_interact_pos())
-        {
+    let mut eyedropper_hover_uv: Option<egui::Vec2> = None;
+
+    if eyedropper_active {
+        // Always use crosshair cursor in eyedropper mode
+        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+
+        // Get current pointer position inside the video draw_rect
+        let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+
+        if let Some(pos) = pointer_pos {
             if draw_rect.contains(pos) {
-                let u = (pos.x - draw_rect.min.x) / draw_rect.width();
-                let v = (pos.y - draw_rect.min.y) / draw_rect.height();
-                eyedropper_pick = Some(egui::vec2(u.clamp(0.0, 1.0), v.clamp(0.0, 1.0)));
+                let u = ((pos.x - draw_rect.min.x) / draw_rect.width()).clamp(0.0, 1.0);
+                let v = ((pos.y - draw_rect.min.y) / draw_rect.height()).clamp(0.0, 1.0);
+                let hover_uv = egui::vec2(u, v);
+                eyedropper_hover_uv = Some(hover_uv);
+
+                // ---- Draw magnifier popup ----
+                // Magnifier shows a GRID_SIZE x GRID_SIZE pixel neighborhood, each pixel
+                // rendered as a CELL_PX × CELL_PX square. Center pixel = what will be picked.
+                const GRID_SIZE: i32 = 9;
+                const CELL_PX: f32 = 14.0;
+                const POPUP_SIZE: f32 = GRID_SIZE as f32 * CELL_PX;
+                const BORDER: f32 = 2.0;
+
+                // Position popup above-right of cursor, flipping sides near edges
+                let popup_offset_x = 18.0;
+                let popup_offset_y = -(POPUP_SIZE + BORDER * 2.0 + 28.0);
+                let mut popup_min = pos2(
+                    pos.x + popup_offset_x,
+                    pos.y + popup_offset_y,
+                );
+                // Flip horizontally if near right edge
+                if popup_min.x + POPUP_SIZE + BORDER * 2.0 > rect.max.x {
+                    popup_min.x = pos.x - POPUP_SIZE - BORDER * 2.0 - popup_offset_x;
+                }
+                // Flip vertically if near top edge
+                if popup_min.y < rect.min.y {
+                    popup_min.y = pos.y + 20.0;
+                }
+
+                let popup_rect = Rect::from_min_size(
+                    popup_min - Vec2::splat(BORDER),
+                    Vec2::splat(POPUP_SIZE + BORDER * 2.0),
+                );
+
+                let painter = ui.painter();
+
+                // Background + border
+                painter.rect_filled(popup_rect, 3.0, Color32::from_black_alpha(200));
+                painter.rect_stroke(popup_rect, 3.0, egui::Stroke::new(1.5, Color32::from_gray(120)));
+
+                // Sample and draw pixels
+                if let Some((pw, ph, pixels)) = preview_pixels {
+                    let center_px_x = (u * *pw as f32) as i32;
+                    let center_px_y = (v * *ph as f32) as i32;
+                    let half = GRID_SIZE / 2;
+
+                    for gy in 0..GRID_SIZE {
+                        for gx in 0..GRID_SIZE {
+                            let sx = (center_px_x + gx - half).clamp(0, *pw as i32 - 1) as u32;
+                            let sy = (center_px_y + gy - half).clamp(0, *ph as i32 - 1) as u32;
+                            let idx = (sy * pw + sx) as usize * 4;
+                            let color = if idx + 3 < pixels.len() {
+                                Color32::from_rgb(pixels[idx], pixels[idx + 1], pixels[idx + 2])
+                            } else {
+                                Color32::BLACK
+                            };
+
+                            let cell_min = pos2(
+                                popup_min.x + gx as f32 * CELL_PX,
+                                popup_min.y + gy as f32 * CELL_PX,
+                            );
+                            let cell_rect = Rect::from_min_size(cell_min, Vec2::splat(CELL_PX));
+                            painter.rect_filled(cell_rect, 0.0, color);
+
+                            // Highlight the center pixel
+                            if gx == half && gy == half {
+                                painter.rect_stroke(
+                                    cell_rect,
+                                    0.0,
+                                    egui::Stroke::new(2.0, Color32::WHITE),
+                                );
+                                // Inner dark outline for contrast
+                                let inner = cell_rect.shrink(2.0);
+                                painter.rect_stroke(
+                                    inner,
+                                    0.0,
+                                    egui::Stroke::new(1.0, Color32::BLACK),
+                                );
+                            }
+                        }
+                    }
+
+                    // Show the center pixel color below the grid
+                    let center_idx = (center_px_y.clamp(0, *ph as i32 - 1) as u32 * pw
+                        + center_px_x.clamp(0, *pw as i32 - 1) as u32) as usize * 4;
+                    let (cr, cg, cb) = if center_idx + 2 < pixels.len() {
+                        (pixels[center_idx], pixels[center_idx + 1], pixels[center_idx + 2])
+                    } else {
+                        (0, 0, 0)
+                    };
+
+                    // Color swatch + hex
+                    let swatch_rect = Rect::from_min_size(
+                        pos2(popup_rect.min.x + BORDER, popup_rect.max.y + 4.0),
+                        Vec2::new(16.0, 16.0),
+                    );
+                    painter.rect_filled(swatch_rect, 2.0, Color32::from_rgb(cr, cg, cb));
+                    painter.rect_stroke(swatch_rect, 2.0, egui::Stroke::new(1.0, Color32::from_gray(100)));
+                    painter.text(
+                        pos2(swatch_rect.max.x + 4.0, swatch_rect.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("#{:02X}{:02X}{:02X}", cr, cg, cb),
+                        egui::FontId::monospace(11.0),
+                        Color32::WHITE,
+                    );
+                } else {
+                    // No pixel data yet — just draw gray placeholder cells
+                    let painter = ui.painter();
+                    for gy in 0..GRID_SIZE {
+                        for gx in 0..GRID_SIZE {
+                            let cell_min = pos2(
+                                popup_min.x + gx as f32 * CELL_PX,
+                                popup_min.y + gy as f32 * CELL_PX,
+                            );
+                            painter.rect_filled(
+                                Rect::from_min_size(cell_min, Vec2::splat(CELL_PX)),
+                                0.0,
+                                Color32::from_gray(60),
+                            );
+                        }
+                    }
+                }
+
+                // Draw a crosshair at the cursor position
+                let ch_len = 8.0;
+                let ch_stroke = egui::Stroke::new(1.5, Color32::WHITE);
+                let ch_stroke_dark = egui::Stroke::new(2.5, Color32::BLACK);
+                // Draw dark outline first, then white on top
+                painter.line_segment([pos2(pos.x - ch_len, pos.y), pos2(pos.x + ch_len, pos.y)], ch_stroke_dark);
+                painter.line_segment([pos2(pos.x, pos.y - ch_len), pos2(pos.x, pos.y + ch_len)], ch_stroke_dark);
+                painter.line_segment([pos2(pos.x - ch_len, pos.y), pos2(pos.x + ch_len, pos.y)], ch_stroke);
+                painter.line_segment([pos2(pos.x, pos.y - ch_len), pos2(pos.x, pos.y + ch_len)], ch_stroke);
+
+                // Pick on click
+                if response.clicked() {
+                    eyedropper_pick = Some(hover_uv);
+                }
+            } else {
+                // Pointer is outside video — still show crosshair
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                if response.clicked() {
+                    // Click outside video area — cancel eyedropper
+                }
             }
         }
     }
@@ -568,5 +718,5 @@ pub fn draw(
         );
     });
 
-    ViewportDrawResult { size: viewport_size, eyedropper_pick }
+    ViewportDrawResult { size: viewport_size, eyedropper_pick, eyedropper_hover_uv }
 }
