@@ -290,13 +290,15 @@ pub fn draw(
                 painter.line_segment([pos2(pos.x, pos.y - ch_len), pos2(pos.x, pos.y + ch_len)], ch_stroke);
 
                 // Pick on click
-                if response.clicked() {
+                let clicked = response.clicked()
+                    || ui.input(|i| i.pointer.primary_clicked() || i.pointer.any_click());
+                if clicked {
                     eyedropper_pick = Some(hover_uv);
                 }
             } else {
                 // Pointer is outside video — still show crosshair
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-                if response.clicked() {
+                if response.clicked() || ui.input(|i| i.pointer.primary_clicked()) {
                     // Click outside video area — cancel eyedropper
                 }
             }
@@ -351,14 +353,15 @@ pub fn draw(
         }
     }
 
-    // Selected clip overlay
-    if let Some(idx) = state.selected_clip {
-        if active_clips.iter().any(|c| c.store_index == idx) {
-            let track_id = project.clips.track_id_at(idx);
-            let is_video_track = project.tracks.get(track_id).map_or(false, |t| {
-                matches!(t.kind, nexir::timeline::track::TrackKind::Video)
-            });
-            if is_video_track {
+    // Selected clip overlay (only interactive when eyedropper is NOT active)
+    if !eyedropper_active {
+        if let Some(idx) = state.selected_clip {
+            if active_clips.iter().any(|c| c.store_index == idx) {
+                let track_id = project.clips.track_id_at(idx);
+                let is_video_track = project.tracks.get(track_id).map_or(false, |t| {
+                    matches!(t.kind, nexir::timeline::track::TrackKind::Video)
+                });
+                if is_video_track {
                 let (clip_w, clip_h) = {
                     let kind = project.clips.kind_at(idx);
                     if let nexir::timeline::store::ClipKind::Text {
@@ -669,6 +672,7 @@ pub fn draw(
             }
         }
     }
+}
 
     if state.viewport_resize().is_some() && ui.input(|input| input.pointer.any_released()) {
         state.finish_viewport_resize();
