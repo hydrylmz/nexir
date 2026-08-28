@@ -138,7 +138,6 @@ impl AudioMixer {
                         if let Ok(dec) = nexir::audio::audio_decoder::AudioDecoder::new(
                             &path_clone,
                             ring_clone,
-                            clock_clone,
                             project_tb,
                             sd_clone,
                             seek_clone,

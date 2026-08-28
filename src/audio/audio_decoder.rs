@@ -31,7 +31,6 @@ pub struct AudioDecoder {
     swr: *mut SwrContext,
     frame: *mut AVFrame,
     ring: Arc<AudioRingBuffer>,
-    clock: Arc<crate::sync::master_clock::MasterClock>,
     project_tb: Rational,
     shutdown: Arc<AtomicBool>,
     seek_request: Arc<Mutex<Option<(i64, i64)>>>, // (source_pts, timeline_pts)
@@ -57,7 +56,6 @@ impl AudioDecoder {
     pub fn new(
         path: &std::path::Path,
         ring: Arc<AudioRingBuffer>,
-        clock: Arc<crate::sync::master_clock::MasterClock>,
         project_tb: Rational,
         shutdown: Arc<AtomicBool>,
         seek_request: Arc<Mutex<Option<(i64, i64)>>>,
@@ -71,7 +69,7 @@ impl AudioDecoder {
         source_in_pts: i64,
         source_out_pts: i64,
     ) -> Result<Self, AudioError> {
-        let mut demuxer = Demuxer::open(path).map_err(AudioError::Demux)?;
+        let demuxer = Demuxer::open(path).map_err(AudioError::Demux)?;
 
         let audio_stream = demuxer
             .audio_stream()
@@ -144,7 +142,6 @@ impl AudioDecoder {
             swr,
             frame,
             ring,
-            clock,
             project_tb,
             shutdown,
             seek_request,
@@ -166,7 +163,7 @@ impl AudioDecoder {
     }
 
     pub fn run(mut self) {
-        eprintln!("[audio] decoder run() started");
+        log::debug!("[audio] decoder run() started");
         while !self.shutdown.load(Ordering::Relaxed) {
             let seek_req = self.seek_request.lock().unwrap().take();
             if let Some((source_pts, timeline_pts)) = seek_req {
@@ -175,7 +172,7 @@ impl AudioDecoder {
                 // Seek demuxer to the file PTS (demuxer.seek converts project_tb -> stream_tb internally)
                 let mut result = self.demuxer.seek(source_pts, self.project_tb);
                 if result.is_err() {
-                    eprintln!(
+                    log::warn!(
                         "[audio] seek failed, attempting to reopen demuxer: {:?}",
                         result
                     );
@@ -209,11 +206,14 @@ impl AudioDecoder {
                     self.current_timeline_pts = timeline_pts;
                     self.current_timeline_out_pts =
                         timeline_pts + self.timeline_pts_until_source_out(source_pts);
-
-                    // Reset the master clock to the timeline PTS!
-                    self.clock.seek(timeline_pts);
-                    eprintln!("[audio] seek done, clock reset to pts={}", timeline_pts);
                 }
+            }
+
+            let current_pts = self.current_timeline_pts
+                + (self.samples_written as f64 * 90000.0 / OUT_SAMPLE_RATE as f64) as i64;
+            if current_pts >= self.current_timeline_out_pts {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
             }
 
             let available = self.ring.available_write();
@@ -292,18 +292,30 @@ impl AudioDecoder {
 
         let written_usize = written as usize;
         let mut interleaved = Vec::with_capacity(written_usize * 2);
-        for i in 0..written_usize {
-            interleaved.push(out_buf[0][i]);
-            interleaved.push(out_buf[1][i]);
+        for (&left, &right) in out_buf[0].iter().zip(&out_buf[1]).take(written_usize) {
+            interleaved.push(left);
+            interleaved.push(right);
         }
 
         // ── Apply volume, pan, mute DSP ──────────────────────────────────
         if self.muted {
             interleaved.fill(0.0);
+            let mut valid_samples = 0;
+            for sample_idx in 0..written_usize {
+                let current_sample_index = self.samples_written + sample_idx as u64;
+                let current_timeline_pts = self.current_timeline_pts
+                    + (current_sample_index as f64 * 90000.0 / OUT_SAMPLE_RATE as f64) as i64;
+                if current_timeline_pts >= self.current_timeline_out_pts {
+                    break;
+                }
+                valid_samples += 1;
+            }
+            interleaved.truncate(valid_samples * 2);
         } else {
             let (c_pan_l, c_pan_r) = crate::audio::audio_mixer::constant_power_pan(self.pan);
             let base_left_gain = self.volume * c_pan_l;
             let base_right_gain = self.volume * c_pan_r;
+            let mut valid_samples = 0;
             for (sample_idx, frame) in interleaved.chunks_exact_mut(2).enumerate() {
                 let current_sample_index = self.samples_written + sample_idx as u64;
                 let current_timeline_pts = self.current_timeline_pts
@@ -312,6 +324,11 @@ impl AudioDecoder {
                 let clip_pts_in = self.current_timeline_pts
                     - self.timeline_pts_since_source_in(self.current_seek_pts);
                 let clip_pts_out = self.current_timeline_out_pts;
+
+                if current_timeline_pts >= clip_pts_out {
+                    break;
+                }
+                valid_samples += 1;
 
                 let fade_factor = crate::audio::audio_mixer::compute_fade_multiplier(
                     current_timeline_pts,
@@ -324,16 +341,26 @@ impl AudioDecoder {
                 frame[0] *= base_left_gain * fade_factor;
                 frame[1] *= base_right_gain * fade_factor;
             }
+            interleaved.truncate(valid_samples * 2);
         }
 
-        self.ring.write(&interleaved);
-        self.samples_written += written_usize as u64;
+        if !interleaved.is_empty() {
+            let samples_added = (interleaved.len() / 2) as u64;
+            self.ring.write(&interleaved);
+            self.samples_written += samples_added;
+        }
 
         Ok(())
     }
 
     fn flush_swr(&mut self) {
         loop {
+            let current_pts = self.current_timeline_pts
+                + (self.samples_written as f64 * 90000.0 / OUT_SAMPLE_RATE as f64) as i64;
+            if current_pts >= self.current_timeline_out_pts {
+                break;
+            }
+
             let delay = unsafe { swr_get_delay(self.swr, OUT_SAMPLE_RATE as i64) };
             if delay <= 0 {
                 break;
@@ -361,23 +388,47 @@ impl AudioDecoder {
 
             let written_usize = written as usize;
             let mut interleaved = Vec::with_capacity(written_usize * 2);
-            for i in 0..written_usize {
-                interleaved.push(out_buf[0][i]);
-                interleaved.push(out_buf[1][i]);
+            for (&left, &right) in out_buf[0].iter().zip(&out_buf[1]).take(written_usize) {
+                interleaved.push(left);
+                interleaved.push(right);
             }
             // Apply volume/pan/mute DSP
             if self.muted {
                 interleaved.fill(0.0);
+                let mut valid_samples = 0;
+                for sample_idx in 0..written_usize {
+                    let current_sample_index = self.samples_written + sample_idx as u64;
+                    let current_timeline_pts = self.current_timeline_pts
+                        + (current_sample_index as f64 * 90000.0 / OUT_SAMPLE_RATE as f64) as i64;
+                    if current_timeline_pts >= self.current_timeline_out_pts {
+                        break;
+                    }
+                    valid_samples += 1;
+                }
+                interleaved.truncate(valid_samples * 2);
             } else {
                 let (c_pan_l, c_pan_r) = crate::audio::audio_mixer::constant_power_pan(self.pan);
                 let left_gain = self.volume * c_pan_l;
                 let right_gain = self.volume * c_pan_r;
-                for frame in interleaved.chunks_exact_mut(2) {
+                let mut valid_samples = 0;
+                for (sample_idx, frame) in interleaved.chunks_exact_mut(2).enumerate() {
+                    let current_sample_index = self.samples_written + sample_idx as u64;
+                    let current_timeline_pts = self.current_timeline_pts
+                        + (current_sample_index as f64 * 90000.0 / OUT_SAMPLE_RATE as f64) as i64;
+                    if current_timeline_pts >= self.current_timeline_out_pts {
+                        break;
+                    }
+                    valid_samples += 1;
                     frame[0] *= left_gain;
                     frame[1] *= right_gain;
                 }
+                interleaved.truncate(valid_samples * 2);
             }
-            self.ring.write(&interleaved);
+            if !interleaved.is_empty() {
+                let samples_added = (interleaved.len() / 2) as u64;
+                self.ring.write(&interleaved);
+                self.samples_written += samples_added;
+            }
         }
     }
 

@@ -1,11 +1,6 @@
 // src/audio/audio_mixer.rs
 
-use crate::timeline::ids::{ClipId, SourceId, TrackId};
-use crate::timeline::rational::Rational;
-use crate::timeline::store::TimelineStore;
-use crate::timeline::track::TrackList;
-use crate::timeline::source::SourceRegistry;
-use std::f32::consts::PI;
+use std::f32::consts::{FRAC_1_SQRT_2, PI};
 
 pub const MIXER_SAMPLE_RATE: u32 = 48_000;
 pub const MIXER_CHANNELS: usize = 2;
@@ -202,10 +197,8 @@ pub fn downmix_channels_to_stereo(
         ChannelLayout::Mono => {
             if let Some(&mono) = input_channels.first() {
                 let n = count.min(mono.len());
-                for i in 0..n {
-                    out_left[i] = mono[i];
-                    out_right[i] = mono[i];
-                }
+                out_left[..n].copy_from_slice(&mono[..n]);
+                out_right[..n].copy_from_slice(&mono[..n]);
             }
         }
         ChannelLayout::Stereo => {
@@ -213,23 +206,19 @@ pub fn downmix_channels_to_stereo(
                 let left_in = input_channels[0];
                 let right_in = input_channels[1];
                 let n = count.min(left_in.len()).min(right_in.len());
-                for i in 0..n {
-                    out_left[i] = left_in[i];
-                    out_right[i] = right_in[i];
-                }
+                out_left[..n].copy_from_slice(&left_in[..n]);
+                out_right[..n].copy_from_slice(&right_in[..n]);
             } else if let Some(&mono) = input_channels.first() {
                 let n = count.min(mono.len());
-                for i in 0..n {
-                    out_left[i] = mono[i];
-                    out_right[i] = mono[i];
-                }
+                out_left[..n].copy_from_slice(&mono[..n]);
+                out_right[..n].copy_from_slice(&mono[..n]);
             }
         }
         ChannelLayout::Surround5_1 => {
             // 5.1 layout: 0=Left, 1=Right, 2=Center, 3=LFE, 4=Left Surround, 5=Right Surround
             let num_ch = input_channels.len();
-            let c_gain = 0.7071f32;
-            let s_gain = 0.7071f32;
+            let c_gain = FRAC_1_SQRT_2;
+            let s_gain = FRAC_1_SQRT_2;
             let lfe_gain = 0.5f32;
             for i in 0..count {
                 let l = if num_ch > 0 && i < input_channels[0].len() { input_channels[0][i] } else { 0.0 };
@@ -246,7 +235,7 @@ pub fn downmix_channels_to_stereo(
         ChannelLayout::Surround7_1 => {
             // 7.1 layout: 0=L, 1=R, 2=C, 3=LFE, 4=Ls, 5=Rs, 6=Rls, 7=Rrs
             let num_ch = input_channels.len();
-            let c_gain = 0.7071f32;
+            let c_gain = FRAC_1_SQRT_2;
             let s_gain = 0.5f32;
             let lfe_gain = 0.5f32;
             for i in 0..count {
@@ -351,10 +340,11 @@ mod tests {
         );
 
         let (c_l, c_r) = constant_power_pan(0.0);
-        let expected_gain = c_l * c_l; // clip pan center * track pan center
+        let expected_left_gain = c_l * c_l; // clip pan center * track pan center
+        let expected_right_gain = c_r * c_r;
 
-        assert!((accum.left[0] - expected_gain).abs() < 1e-4);
-        assert!((accum.right[0] - expected_gain).abs() < 1e-4);
+        assert!((accum.left[0] - expected_left_gain).abs() < 1e-4);
+        assert!((accum.right[0] - expected_right_gain).abs() < 1e-4);
         assert_eq!(accum.left[50], 0.0); // beyond chunk length
     }
 

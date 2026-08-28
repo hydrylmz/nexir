@@ -2,7 +2,6 @@
 
 use std::sync::{Arc, Mutex};
 use dashmap::DashMap;
-use crate::render::device::GpuDevice;
 use crate::timeline::ids::SourceId;
 use crate::timeline::rational::Rational;
 use crate::io::demuxer::Demuxer;
@@ -112,7 +111,7 @@ impl IoLayer {
         // Only seek if target is before last decoded position or too far ahead (>5s in 90kHz ticks).
         let prev_pts = self.last_decoded_pts.get(&source_id).map(|v| *v).unwrap_or(i64::MIN);
         // 5 seconds in project timebase (90000 ticks/second)
-        let five_seconds_pts = 5 * self.project_tb.den as i64;
+        let five_seconds_pts = 5 * self.project_tb.den;
         let need_seek = is_still_image
             || prev_pts == i64::MIN
             || pts < prev_pts
@@ -157,7 +156,7 @@ impl IoLayer {
 
         let mut final_is_nv12 = false;
         let mut decoded_anything = false;
-        let decoded_pts = {
+        let _decoded_pts = {
             let mut dec = decoder_arc.lock().unwrap();
             let mut dem = demuxer_arc.lock().unwrap();
             let mut found_pts = target_stream_pts;

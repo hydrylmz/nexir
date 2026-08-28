@@ -110,7 +110,7 @@ impl AudioRingBuffer {
         let second_len = n - first_len;
 
         unsafe {
-            let data_ptr = self.data.as_ptr() as *const std::cell::UnsafeCell<f32> as *const f32;
+            let data_ptr = self.data.as_ptr() as *const f32;
             std::ptr::copy_nonoverlapping(data_ptr.add(r), out.as_mut_ptr(), first_len);
             if second_len > 0 {
                 std::ptr::copy_nonoverlapping(

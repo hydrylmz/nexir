@@ -40,7 +40,7 @@ impl Lut3D {
             } else if trimmed
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_ascii_digit() || c == '-' || c == '+')
+                .is_some_and(|c| c.is_ascii_digit() || c == '-' || c == '+')
             {
                 // Step 2 — Parse data line
                 let vals: Vec<f32> = trimmed

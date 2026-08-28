@@ -39,11 +39,14 @@ impl Decoder {
 
     /// Open a decoder for the given stream.
     /// Set `enable_hw` to false for audio decoders (skips slow GPU device probing).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn open(
         stream_info:     &StreamInfo,
         stream_codecpar: *mut AVCodecParameters,
         enable_hw:       bool,
     ) -> Result<Self, DecodeError> {
+        // SAFETY: `stream_codecpar` is sourced from the owning Demuxer stream
+        // metadata and is copied into this decoder context during open.
         // Step 1 — Find the codec
         let codec = unsafe { avcodec_find_decoder(stream_info.codec_id) };
         if codec.is_null() {
@@ -113,10 +116,13 @@ impl Decoder {
 
     /// Open a software-only decoder (no hardware acceleration).
     /// Use this for image codecs (MJPEG, PNG, etc.) that CUDA cannot handle.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn open_sw(
         stream_info:     &StreamInfo,
         stream_codecpar: *mut AVCodecParameters,
     ) -> Result<Self, DecodeError> {
+        // SAFETY: `stream_codecpar` is sourced from the owning Demuxer stream
+        // metadata and is copied into this decoder context during open.
         // Step 1 — Find the codec
         let codec = unsafe { avcodec_find_decoder(stream_info.codec_id) };
         if codec.is_null() {

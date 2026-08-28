@@ -62,8 +62,6 @@ impl LinearRgb {
 /// Uses f64 throughout to avoid accumulation of floating-point error.
 /// All angles in degrees; converted to radians only for trig functions.
 pub fn delta_e_2000(c1: Lab, c2: Lab) -> f64 {
-    use std::f64::consts::PI;
-
     // Step 1 — Adjust a* for chroma weighting
     let c1_ab = (c1.a.powi(2) + c1.b.powi(2)).sqrt();
     let c2_ab = (c2.a.powi(2) + c2.b.powi(2)).sqrt();

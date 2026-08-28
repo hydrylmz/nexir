@@ -496,13 +496,16 @@ pub fn split_clip(
     let delta = split_pts - pts_in;
     let old_fade_out = store.fade_out_pts[idx];
 
+    let speed = store.speed[idx];
+    let source_delta = crate::timeline::rational::speed_scale_pts(delta, speed);
+
     let params = ClipInsertParams {
         track_id: store.track_ids[idx],
         source_id: store.source_ids[idx],
         kind: store.kind[idx].clone(),
         pts_in: split_pts,
-        pts_out: pts_out,
-        source_in: store.source_in[idx] + delta,
+        pts_out,
+        source_in: store.source_in[idx] + source_delta,
         layer_order: store.layer_order[idx],
         opacity: store.opacity[idx],
         transform: store.transform[idx],
@@ -706,7 +709,7 @@ pub fn insert_clip_ripple(
             };
 
             to_split.push((store.ids[i], head_params, tail_params));
-            boundary = boundary + (ex_out - new_in);
+            boundary += ex_out - new_in;
         } else if ex_in >= new_in {
             // Starts at or after new_in.
             if ex_in < boundary {

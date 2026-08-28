@@ -135,8 +135,8 @@ impl TimelineStore {
         let mut permutation: Vec<usize> = (0..self.ids.len()).collect();
         permutation.sort_by_key(|&i| self.pts_in[i]);
 
-        fn apply_perm<T: Clone>(v: &mut Vec<T>, perm: &[usize]) {
-            let old = v.clone();
+        fn apply_perm<T: Clone>(v: &mut [T], perm: &[usize]) {
+            let old = v.to_owned();
             for (new_idx, &old_idx) in perm.iter().enumerate() {
                 v[new_idx] = old[old_idx].clone();
             }

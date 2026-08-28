@@ -15,6 +15,12 @@ impl ViewId {
     }
 }
 
+impl Default for ViewId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A stable name for a texture resource within the Render Graph.
 /// Nodes use ResourceIds to declare dependencies — they never own textures.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]

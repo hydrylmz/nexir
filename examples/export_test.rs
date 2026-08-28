@@ -3,7 +3,6 @@ use nexir::export::job::{AudioCodec, Container, CpuPreset, ExportJob, VideoCodec
 use nexir::io::frame_cache::FrameCache;
 use nexir::io::slot_pool::FrameSlotPool;
 use nexir::io::io_layer::IoLayer;
-use nexir::io::prefetch::PrefetchWorker;
 use nexir::render::device::GpuDevice;
 use nexir::timeline::rational::Rational;
 use nexir::timeline::store::TimelineStore;

@@ -3,7 +3,7 @@
 mod av_sync {
     use std::sync::Arc;
     use crate::sync::master_clock::MasterClock;
-    use crate::sync::drift_corrector::{DriftCorrector, KP};
+    use crate::sync::drift_corrector::DriftCorrector;
     use crate::sync::presentation::{PresentationDecider, PresentAction};
     use crate::audio::ring_buffer::AudioRingBuffer;
     use crate::timeline::rational::Rational;

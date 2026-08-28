@@ -1,6 +1,9 @@
+use crate::autosave::{AutosaveState, RecoveryInfo};
 use crate::history::HistoryState;
 use crate::layout::inspector::InspectorState;
 use crate::layout::media_pool::MediaPoolState;
+use crate::layout::recovery_dialog::{self, RecoveryAction};
+use crate::layout::relink_dialog::{self, RelinkDialogState};
 use crate::layout::timeline::TimelineState;
 use egui::Context;
 use egui_wgpu::{Renderer, ScreenDescriptor};
@@ -135,6 +138,11 @@ pub struct NexirApp {
     still_cache: Mutex<StillImageCache>,
     text_cache: Mutex<nexir::render::text_cache::TextCache>,
     composite_pipelines: Arc<nexir::render::nodes::composite::CompositePipelines>,
+
+    // Autosave & Crash Recovery
+    pub autosave: AutosaveState,
+    pub pending_recovery: Option<RecoveryInfo>,
+    pub relink_dialog: RelinkDialogState,
 }
 
 pub struct AppResponse {
@@ -312,6 +320,10 @@ impl NexirApp {
             wgpu::TextureFormat::Rgba16Float,
         ));
 
+        let pending_recovery = AutosaveState::check_for_recovery(None);
+        let autosave = AutosaveState::new();
+        let relink_dialog = RelinkDialogState::default();
+
         log::info!("NexirApp::new: completed successfully!");
         Self {
             egui_ctx,
@@ -358,6 +370,9 @@ impl NexirApp {
             still_cache: Mutex::new(StillImageCache::default()),
             text_cache: Mutex::new(nexir::render::text_cache::TextCache::default()),
             composite_pipelines,
+            autosave,
+            pending_recovery,
+            relink_dialog,
         }
     }
 
@@ -464,8 +479,8 @@ impl NexirApp {
 
         egui::SidePanel::left("media_pool")
             .resizable(true)
-            .default_width(300.0)
-            .width_range(150.0..=400.0)
+            .default_width(320.0)
+            .width_range(180.0..=800.0)
             .show(&self.egui_ctx, |ui| {
                 crate::layout::media_pool::draw(ui, &mut self.media_pool);
             });
@@ -540,8 +555,8 @@ impl NexirApp {
 
         egui::SidePanel::right("inspector")
             .resizable(true)
-            .default_width(300.0)
-            .width_range(150.0..=400.0)
+            .default_width(320.0)
+            .width_range(180.0..=800.0)
             .show(&self.egui_ctx, |ui| {
                 crate::layout::inspector::draw(
                     ui,
@@ -762,7 +777,6 @@ impl NexirApp {
                         let ring = AudioRingBuffer::new(32768); // ~680ms at 48kHz stereo
                         let shutdown = Arc::new(AtomicBool::new(false));
                         let seek = Arc::new(Mutex::new(Some((info.source_pts, playhead_pts))));
-                        let clock = Arc::clone(&self.audio_clock);
                         let mixer_bufs = Arc::clone(&self.audio_mixer_bufs);
 
                         // Register ring in the mixer list
@@ -780,7 +794,6 @@ impl NexirApp {
                             match AudioDecoder::new(
                                 &info_clone.path,
                                 ring_dec,
-                                clock,
                                 project_tb,
                                 shutdown_dec,
                                 seek_dec,
@@ -821,7 +834,9 @@ impl NexirApp {
                     }
                 }
 
-                self.audio_clock.seek(playhead_pts);
+                if force_seek {
+                    self.audio_clock.seek(playhead_pts);
+                }
             }
         }
 
@@ -886,6 +901,61 @@ impl NexirApp {
                     self.start_export();
                 }
             }
+        }
+
+        // ── Crash recovery modal ─────────────────────────────────────────────
+        // Shown on the first frame after startup (or project open) when a stale
+        // autosave was detected.  Blocks all other interaction via modal window.
+        if let Some(info) = self.pending_recovery.clone() {
+            if let Some(action) = recovery_dialog::draw(&self.egui_ctx, &info) {
+                match action {
+                    RecoveryAction::Restore => {
+                        match ProjectFile::load(&info.autosave_path) {
+                            Ok(mut project) => {
+                                self.stop_playback();
+                                self.io_layer.reset_for_new_project(&project.sources);
+                                project.sources = self.io_layer.source_reg.clone();
+                                self.still_cache.lock().unwrap().clear();
+                                self.project = project;
+                                self.history = crate::history::HistoryState::default();
+                                self.timeline.clear_interaction();
+                                self.timeline.selected_clip = None;
+                                self.media_pool = crate::layout::media_pool::MediaPoolState::default();
+                                // Remove autosave now that it's been restored.
+                                ProjectFile::delete_autosave(&info.autosave_path);
+                                log::info!("[recovery] project restored from autosave");
+                                // Check for missing media in the recovered project.
+                                self.relink_dialog.refresh(&self.project);
+                            }
+                            Err(e) => {
+                                log::error!("[recovery] failed to load autosave: {:?}", e);
+                            }
+                        }
+                    }
+                    RecoveryAction::Discard => {
+                        ProjectFile::delete_autosave(&info.autosave_path);
+                        log::info!("[recovery] autosave discarded by user");
+                    }
+                }
+                self.pending_recovery = None;
+            }
+        }
+
+        // ── Missing media / relink dialog ────────────────────────────────────
+        relink_dialog::draw(
+            &self.egui_ctx,
+            &mut self.relink_dialog,
+            &mut self.project,
+            &self.still_cache,
+        );
+
+        // ── Autosave tick ────────────────────────────────────────────────────
+        // Don't tick autosave while the recovery dialog is open — we only want
+        // to start accumulating saves once the user is actually editing.
+        if self.pending_recovery.is_none() {
+            let token = self.history.change_token();
+            let proj_path = self.current_project_path.as_deref();
+            self.autosave.tick(&self.project, token, proj_path);
         }
 
         viewport_size
@@ -961,6 +1031,12 @@ impl NexirApp {
     /// Reset the project to a blank slate, clearing history.
     fn new_project(&mut self) {
         self.stop_playback();
+        // Flush any unsaved changes to the autosave file before wiping the project.
+        let token = self.history.change_token();
+        let proj_path = self.current_project_path.as_deref();
+        self.autosave.flush(&self.project, token, proj_path);
+        // Delete the old autosave now that it has been flushed and we are clearing the project.
+        self.autosave.delete_last_autosave();
         self.project = Project::new("Untitled Project");
         let _ = self.project.add_video_track("Video 1");
         let _ = self.project.add_video_track("Video 2");
@@ -976,6 +1052,8 @@ impl NexirApp {
         self.timeline.clear_interaction();
         self.timeline.selected_clip = None;
         self.media_pool = crate::layout::media_pool::MediaPoolState::default();
+        self.pending_recovery = None;
+        self.relink_dialog = RelinkDialogState::default();
     }
 
     /// Show a file-open dialog and load a .nexp project.
@@ -989,6 +1067,11 @@ impl NexirApp {
             match ProjectFile::load(&path) {
                 Ok(mut project) => {
                     self.stop_playback();
+                    // Flush & delete the previous project's autosave before switching.
+                    let old_token = self.history.change_token();
+                    let old_path = self.current_project_path.as_deref();
+                    self.autosave.flush(&self.project, old_token, old_path);
+                    self.autosave.delete_last_autosave();
                     // Sync IoLayer: copy loaded registry into IoLayer's shared Arc,
                     // then point the project to use that same Arc.
                     self.io_layer.reset_for_new_project(&project.sources);
@@ -996,11 +1079,37 @@ impl NexirApp {
                     // Clear still-image cache because source registry changed.
                     self.still_cache.lock().unwrap().clear();
                     self.project = project;
-                    self.current_project_path = Some(path);
+                    self.current_project_path = Some(path.clone());
                     self.history = crate::history::HistoryState::default();
                     self.timeline.clear_interaction();
                     self.timeline.selected_clip = None;
                     self.media_pool = crate::layout::media_pool::MediaPoolState::default();
+                    self.relink_dialog = RelinkDialogState::default();
+
+                    // Check if there is an autosave for the freshly-opened project
+                    // that is *newer* than the saved .nexp file (e.g. the user had
+                    // unsaved changes from a previous session).
+                    let saved_mtime = std::fs::metadata(&path)
+                        .ok()
+                        .and_then(|m| m.modified().ok());
+                    let autosave_path = ProjectFile::autosave_path_for(Some(&path));
+                    if let Some(recovery) = ProjectFile::find_autosave_newer_than(&autosave_path, saved_mtime) {
+                        use crate::autosave::peek_project_name_from;
+                        let project_name = peek_project_name_from(&recovery)
+                            .unwrap_or_else(|| "Untitled".into());
+                        let modified = std::fs::metadata(&recovery).ok().and_then(|m| m.modified().ok());
+                        self.pending_recovery = Some(RecoveryInfo {
+                            autosave_path: recovery,
+                            project_name,
+                            modified,
+                        });
+                    } else {
+                        self.pending_recovery = None;
+                        // Delete any stale autosave for this project path (older than saved file).
+                        ProjectFile::delete_autosave(&autosave_path);
+                        // Check for offline/missing media in the loaded project.
+                        self.relink_dialog.refresh(&self.project);
+                    }
                 }
                 Err(e) => {
                     log::error!("Failed to load project: {:?}", e);
@@ -1011,9 +1120,14 @@ impl NexirApp {
 
     /// Save to the current path, or prompt if none set.
     fn save_project(&mut self) {
-        if let Some(ref path) = self.current_project_path {
+        if let Some(ref path) = self.current_project_path.clone() {
             if let Err(e) = ProjectFile::save(path, &self.project) {
                 log::error!("Failed to save project: {:?}", e);
+            } else {
+                // Clean up the autosave file — the project is now explicitly saved.
+                let autosave_path = ProjectFile::autosave_path_for(Some(path));
+                ProjectFile::delete_autosave(&autosave_path);
+                self.autosave.delete_last_autosave();
             }
         } else {
             self.save_project_as();
@@ -1037,6 +1151,10 @@ impl NexirApp {
             if let Err(e) = ProjectFile::save(&path, &self.project) {
                 log::error!("Failed to save project: {:?}", e);
             } else {
+                // Delete the autosave for both the old and new path.
+                let old_autosave = ProjectFile::autosave_path_for(self.current_project_path.as_deref());
+                ProjectFile::delete_autosave(&old_autosave);
+                self.autosave.delete_last_autosave();
                 self.current_project_path = Some(path);
             }
         }
@@ -1205,10 +1323,11 @@ impl NexirApp {
             let eff = &clip.effects;
 
             // 1. Color & Light Adjustment (Brightness, Contrast, Saturation, Hue)
-            if eff.brightness.abs() > 0.001
-                || (eff.contrast - 1.0).abs() > 0.001
-                || (eff.saturation - 1.0).abs() > 0.001
-                || eff.hue.abs() > 0.001
+            if eff.color_enabled
+                && (eff.brightness.abs() > 0.001
+                    || (eff.contrast - 1.0).abs() > 0.001
+                    || (eff.saturation - 1.0).abs() > 0.001
+                    || eff.hue.abs() > 0.001)
             {
                 let cc_out = ResourceId::next(&mut id_counter);
                 let mut params = nexir::render::nodes::color_correction::ColorCorrectionParams::identity(

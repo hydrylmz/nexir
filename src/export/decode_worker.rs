@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use crate::io::io_layer::IoLayer;
 use crate::io::frame_cache::FrameCache;
 use crate::timeline::ids::SourceId;
-use crate::timeline::rational::Rational;
 
 /// How many frames the decode worker tries to stay ahead of the render cursor.
 pub const DECODE_LOOKAHEAD: usize = 16;

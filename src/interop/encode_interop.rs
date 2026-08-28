@@ -136,7 +136,6 @@ pub enum EncodeInteropError {
 /// NVENC function table loaded from the driver.
 struct NvencFunctions {
     open_session:          functions::OpenEncodeSessionEx,
-    get_preset_config:     functions::GetPresetConfig,
     initialize:            functions::InitializeEncoder,
     create_bitstream:      functions::CreateBitstreamBuffer,
     destroy_bitstream:     functions::DestroyBitstreamBuffer,
@@ -197,9 +196,9 @@ unsafe impl Send for EncodeInterop {}
 #[cfg(target_os = "windows")]
 const WAIT_OBJECT_0: u32 = 0x00000000;
 
-/// Win32 kernel32 functions needed for asynchronous NVENC completion events.
-/// These are the standard Windows synchronization APIs; we declare them here
-/// rather than pulling in the `windows-sys` crate to avoid a new dependency.
+// Win32 kernel32 functions needed for asynchronous NVENC completion events.
+// These are the standard Windows synchronization APIs; we declare them here
+// rather than pulling in the `windows-sys` crate to avoid a new dependency.
 #[cfg(target_os = "windows")]
 extern "system" {
     fn CreateEventA(
@@ -314,7 +313,6 @@ impl EncodeInterop {
         let base = function_list as *const usize;
         let funcs = unsafe {
             let open_off              = 30usize; // nvEncOpenEncodeSessionEx
-            let preset_cfg_off        = 10usize; // nvEncGetEncodePresetConfig
             let init_off              = 12usize; // nvEncInitializeEncoder
             let create_bs_off         = 15usize; // nvEncCreateBitstreamBuffer
             let destroy_bs_off        = 16usize; // nvEncDestroyBitstreamBuffer
@@ -330,7 +328,6 @@ impl EncodeInterop {
 
             NvencFunctions {
                 open_session:           std::mem::transmute(*base.add(open_off)),
-                get_preset_config:      std::mem::transmute(*base.add(preset_cfg_off)),
                 initialize:             std::mem::transmute(*base.add(init_off)),
                 create_bitstream:       std::mem::transmute(*base.add(create_bs_off)),
                 destroy_bitstream:      std::mem::transmute(*base.add(destroy_bs_off)),

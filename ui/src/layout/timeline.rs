@@ -1,5 +1,5 @@
 use crate::history::HistoryState;
-use crate::layout::media_pool::MediaEntry;
+use crate::layout::media_pool::{MediaEntry, MediaKind};
 use egui::{Align2, Color32, Rect, RichText, Sense, Ui, Vec2};
 use nexir::project::Project;
 use crate::image_still::StillImageCache;
@@ -632,9 +632,14 @@ pub fn draw(
                 );
                 track_lane_rects.push((track.id, lane));
 
+                let is_effect_drag = dragging_item
+                    .as_ref()
+                    .map_or(false, |item| item.kind == MediaKind::Effect);
+
                 // ── Determine lane highlight ──────────────────────────────
                 // Priority: media-pool drag > clip drag > normal
-                let is_media_drop_target = dragging_item.is_some()
+                let is_media_drop_target = !is_effect_drag
+                    && dragging_item.is_some()
                     && pointer_pos.map(|p| lane.contains(p)).unwrap_or(false);
                 let is_clip_drag_target =
                     state.drag.is_some() && pointer_pos.map(|p| lane.contains(p)).unwrap_or(false);
@@ -785,6 +790,32 @@ pub fn draw(
                         }
                     }
 
+                    // ── Effect drop on clip ───────────────────────────────
+                    let is_effect_hover = is_effect_drag
+                        && pointer_pos.map_or(false, |p| clip_rect.contains(p));
+
+                    if is_effect_hover && pointer_released {
+                        if let Some(item) = dragging_item.take() {
+                            let mut eff = project.clips.effects_at(idx);
+                            let path_str = item.path.to_string_lossy();
+                            if path_str.ends_with("blur") {
+                                eff.blur_enabled = true;
+                            } else if path_str.ends_with("sharpen") {
+                                eff.sharpen_enabled = true;
+                            } else if path_str.ends_with("vignette") {
+                                eff.vignette_enabled = true;
+                            } else if path_str.ends_with("chroma_key") {
+                                eff.chroma_key_enabled = true;
+                            } else if path_str.ends_with("color") {
+                                eff.color_enabled = true;
+                            }
+                            history.record(project);
+                            project.clips.set_effects_at(idx, eff);
+                            state.selected_clip = Some(idx);
+                            clicked_a_clip = true;
+                        }
+                    }
+
                     // Drag start
                     if clip_resp.drag_started()
                         && state.drag.is_none()
@@ -853,6 +884,20 @@ pub fn draw(
                     };
 
                     ui.painter().rect_filled(clip_rect, 3.0, base_color);
+
+                    // If an effect is being hovered over this clip, draw glowing effect border
+                    if is_effect_hover {
+                        ui.painter().rect_stroke(
+                            clip_rect,
+                            3.0,
+                            egui::Stroke::new(2.5, Color32::from_rgb(255, 200, 0)),
+                        );
+                        ui.painter().rect_filled(
+                            clip_rect,
+                            3.0,
+                            Color32::from_rgba_unmultiplied(255, 200, 0, 45),
+                        );
+                    }
 
                     // Top strip
                     let top_strip =

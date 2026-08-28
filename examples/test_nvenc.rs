@@ -40,7 +40,6 @@ fn main() {
     let fn_table_size = std::mem::size_of::<usize>() * 64;
     let mut fn_table_raw = vec![0u8; fn_table_size];
     let mut success = false;
-    let mut discovered_major = 0;
 
     for major_ver in (8..=15).rev() {
         let version = (major_ver as u32) | (2 << 16) | (0x7 << 28);
@@ -52,7 +51,6 @@ fn main() {
         let ret = unsafe { NvEncodeAPICreateInstance(function_list) };
         if ret == NV_ENC_SUCCESS {
             success = true;
-            discovered_major = major_ver;
             println!(
                 "NvEncodeAPICreateInstance SUCCEEDED with major version: {}",
                 major_ver

@@ -4,7 +4,6 @@
 // Run with: cargo run -p nexir --bin bench --release
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use nexir::colour::lut_parser::Lut3D;
 use nexir::profiling::{FrameProfile, PipelineStage, ProfilingSession, SystemMetrics};
@@ -422,12 +421,9 @@ fn run_benchmark(device: &Arc<GpuDevice>, config: &BenchmarkConfig) -> Profiling
 
         // Stage 7: NVENC / Interop staging
         profile.measure(PipelineStage::Nvenc, || {
-            match config.path {
-                ExecutionPath::GpuNvencZeroCopy => {
-                    // Simulates NVENC lock + bitstream query overhead (~0.2ms)
-                    std::thread::yield_now();
-                }
-                _ => {}
+            if let ExecutionPath::GpuNvencZeroCopy = config.path {
+                // Simulates NVENC lock + bitstream query overhead (~0.2ms)
+                std::thread::yield_now();
             }
         });
 
@@ -529,6 +525,7 @@ fn main() {
 
     for bench in BENCHMARKS {
         println!(">>> Running: {}", bench.name);
+        println!("    Clips: {}", bench.clip_count);
         let session = run_benchmark(&device, bench);
         let report = session.generate_report();
         println!("{}", report.format_table());
@@ -536,4 +533,3 @@ fn main() {
 
     println!("All benchmarks completed successfully.\n");
 }
-

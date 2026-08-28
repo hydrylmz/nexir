@@ -32,3 +32,9 @@ impl EncoderQueue {
         self.rx.lock().unwrap().try_recv().ok()
     }
 }
+
+impl Default for EncoderQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}

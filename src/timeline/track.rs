@@ -132,6 +132,10 @@ impl TrackList {
 
         self.tracks.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.tracks.is_empty()
+    }
 }
 
 #[derive(Debug)]

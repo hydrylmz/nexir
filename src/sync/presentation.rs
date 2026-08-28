@@ -33,7 +33,7 @@ impl PresentationDecider {
 
     /// Decide whether to drop, hold, or present a frame with the given PTS.
     pub fn decide(&self, frame_pts: i64) -> PresentAction {
-        let frame_dur_ns = (self.frame_rate.den as i64 * 1_000_000_000i64) / self.frame_rate.num as i64;
+        let frame_dur_ns = (self.frame_rate.den * 1_000_000_000i64) / self.frame_rate.num;
         let master_pts = self.clock.pts();
         let pts_diff   = frame_pts - master_pts;
         let drift_ns   = self.project_tb.pts_to_ns(pts_diff);
@@ -49,7 +49,7 @@ impl PresentationDecider {
 
     /// Compute the expected PTS of the next frame that should be presented.
     pub fn next_frame_pts(&self) -> i64 {
-        let frame_dur_pts = (self.project_tb.den as i64) / (self.frame_rate.num as i64);
+        let frame_dur_pts = self.project_tb.den / self.frame_rate.num;
         self.clock.pts() + frame_dur_pts
     }
 }

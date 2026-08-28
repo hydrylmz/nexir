@@ -15,6 +15,7 @@ pub enum MediaKind {
     Audio,
     Image,
     Text,
+    Effect,
 }
 
 impl MediaEntry {
@@ -48,6 +49,7 @@ impl MediaEntry {
             MediaKind::Audio => "🔊",
             MediaKind::Image => "🖼",
             MediaKind::Text => "T",
+            MediaKind::Effect => "✨",
         }
     }
 }
@@ -56,6 +58,7 @@ impl MediaEntry {
 pub enum LibraryPanel {
     MediaPool,
     Text,
+    Effects,
 }
 
 impl Default for LibraryPanel {
@@ -118,6 +121,19 @@ pub fn draw(ui: &mut Ui, state: &mut MediaPoolState) {
                 if ui.add(text_btn).on_hover_text("Text Overlays").clicked() {
                     state.active_panel = LibraryPanel::Text;
                 }
+
+                ui.add_space(8.0);
+
+                let effects_selected = state.active_panel == LibraryPanel::Effects;
+                let effects_color = if effects_selected { Color32::WHITE } else { Color32::GRAY };
+                let effects_bg = if effects_selected { Color32::from_rgb(60, 60, 60) } else { Color32::TRANSPARENT };
+                let effects_btn = egui::Button::new(RichText::new("✨").color(effects_color).size(20.0))
+                    .fill(effects_bg)
+                    .min_size(button_size);
+
+                if ui.add(effects_btn).on_hover_text("Effects").clicked() {
+                    state.active_panel = LibraryPanel::Effects;
+                }
             });
         });
         
@@ -125,12 +141,110 @@ pub fn draw(ui: &mut Ui, state: &mut MediaPoolState) {
         
         // --- Main Content Area ---
         ui.vertical(|ui| {
+            ui.set_min_width(ui.available_width());
             match state.active_panel {
                 LibraryPanel::MediaPool => draw_media_pool(ui, state),
                 LibraryPanel::Text => draw_text_panel(ui, state),
+                LibraryPanel::Effects => draw_effects_panel(ui, state),
             }
         });
     });
+}
+
+fn draw_effects_panel(ui: &mut Ui, state: &mut MediaPoolState) {
+    ui.horizontal(|ui| {
+        ui.strong(RichText::new("Effects").color(Color32::WHITE));
+    });
+    ui.separator();
+    ui.add_space(6.0);
+
+    let effects_list = [
+        (
+            "Color & Light",
+            "🎨",
+            "Adjust brightness, contrast, saturation, and hue",
+            "nexir://internal/effect/color",
+        ),
+        (
+            "Gaussian Blur",
+            "💧",
+            "Smooth gaussian blur filter",
+            "nexir://internal/effect/blur",
+        ),
+        (
+            "Sharpen",
+            "⚡",
+            "High-pass edge sharpening",
+            "nexir://internal/effect/sharpen",
+        ),
+        (
+            "Vignette",
+            "🌑",
+            "Cinematic lens vignette shading",
+            "nexir://internal/effect/vignette",
+        ),
+        (
+            "Chroma Key",
+            "🟢",
+            "Green & blue screen background removal",
+            "nexir://internal/effect/chroma_key",
+        ),
+    ];
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (i, (title, icon, desc, uri)) in effects_list.iter().enumerate() {
+                let effect_entry = MediaEntry {
+                    path: PathBuf::from(uri),
+                    name: title.to_string(),
+                    kind: MediaKind::Effect,
+                };
+
+                let bg = if i % 2 == 0 {
+                    Color32::from_rgb(32, 32, 32)
+                } else {
+                    Color32::from_rgb(28, 28, 28)
+                };
+
+                let response = egui::Frame::none()
+                    .fill(bg)
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .rounding(6.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(*icon).size(22.0));
+                            ui.add_space(8.0);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(*title).size(13.0).strong().color(Color32::WHITE));
+                                ui.label(RichText::new(*desc).size(11.0).color(Color32::GRAY));
+                            });
+                        });
+                    })
+                    .response
+                    .interact(egui::Sense::click_and_drag());
+
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+
+                if response.drag_started() {
+                    state.dragging_item = Some(effect_entry.clone());
+                }
+
+                if response.dragged() {
+                    egui::show_tooltip_at_pointer(ui.ctx(), egui::Id::new("drag_effect_tooltip"), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(*icon).size(16.0));
+                            ui.label(RichText::new(format!("{} (Drag onto a clip)", title)).strong());
+                        });
+                    });
+                }
+
+                ui.add_space(4.0);
+            }
+        });
 }
 
 fn draw_text_panel(ui: &mut Ui, state: &mut MediaPoolState) {
@@ -138,7 +252,7 @@ fn draw_text_panel(ui: &mut Ui, state: &mut MediaPoolState) {
         ui.strong(RichText::new("Text").color(Color32::WHITE));
     });
     ui.separator();
-    ui.add_space(20.0);
+    ui.add_space(6.0);
     
     let text_entry = MediaEntry {
         path: PathBuf::from("nexir://internal/text"),
@@ -148,19 +262,26 @@ fn draw_text_panel(ui: &mut Ui, state: &mut MediaPoolState) {
     
     let response = egui::Frame::none()
         .fill(Color32::from_rgb(32, 32, 32))
-        .inner_margin(egui::Margin::symmetric(16.0, 16.0))
-        .rounding(8.0)
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .rounding(6.0)
         .show(ui, |ui| {
-            ui.set_min_width(ui.available_width() - 20.0);
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new("T").size(24.0));
+                ui.label(RichText::new("T").size(22.0).strong());
                 ui.add_space(8.0);
-                ui.label(RichText::new("Basic Text").size(16.0));
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Basic Text").size(13.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new("Drag onto timeline to add text overlay").size(11.0).color(Color32::GRAY));
+                });
             });
         })
         .response
         .interact(egui::Sense::click_and_drag());
         
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+
     if response.drag_started() {
         state.dragging_item = Some(text_entry.clone());
     }

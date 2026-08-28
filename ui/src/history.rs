@@ -28,6 +28,11 @@ impl ProjectSnapshot {
 pub struct HistoryState {
     undo_stack: Vec<ProjectSnapshot>,
     redo_stack: Vec<ProjectSnapshot>,
+    /// Monotonically-increasing counter incremented on every `record()` or
+    /// `undo()` / `redo()` call.  The autosave ticker compares this against
+    /// the value it last snapshotted to detect whether the project has changed
+    /// since the last autosave write, without needing a deep project comparison.
+    change_token: u64,
 }
 
 impl HistoryState {
@@ -39,12 +44,19 @@ impl HistoryState {
         !self.redo_stack.is_empty()
     }
 
+    /// Current change token.  The autosave ticker stores this and compares on
+    /// each frame; a different value means the project has changed.
+    pub fn change_token(&self) -> u64 {
+        self.change_token
+    }
+
     pub fn record(&mut self, project: &Project) {
         self.undo_stack.push(ProjectSnapshot::capture(project));
         if self.undo_stack.len() > MAX_HISTORY {
             self.undo_stack.remove(0);
         }
         self.redo_stack.clear();
+        self.change_token = self.change_token.wrapping_add(1);
     }
 
     pub fn undo(&mut self, project: &mut Project) -> bool {
@@ -53,6 +65,7 @@ impl HistoryState {
         };
         self.redo_stack.push(ProjectSnapshot::capture(project));
         snapshot.restore(project);
+        self.change_token = self.change_token.wrapping_add(1);
         true
     }
 
@@ -62,6 +75,7 @@ impl HistoryState {
         };
         self.undo_stack.push(ProjectSnapshot::capture(project));
         snapshot.restore(project);
+        self.change_token = self.change_token.wrapping_add(1);
         true
     }
 }

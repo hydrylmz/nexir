@@ -617,7 +617,7 @@ impl ExportRenderer {
                             let interop = video_enc.nvenc_interop_mut()
                                 .expect("nvenc_interop_mut: invariant — GpuNvenc arm");
                             let muxer_ref = &**muxer;
-                            let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
+                            let sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
                                 if let Err(e) = muxer_ref.write_packet(pkt, true) {
                                     log::error!("[export] NVENC mux write_packet failed for frame {prev_idx}: {e:?}");
                                 }
@@ -672,7 +672,7 @@ impl ExportRenderer {
                             let interop  = video_enc.nvenc_interop_mut()
                                 .expect("nvenc_interop_mut: invariant — GpuNvenc arm");
                             let muxer_ref = &**muxer;
-                            let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
+                            let sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
                                 if let Err(e) = muxer_ref.write_packet(pkt, true) {
                                     log::error!("[export] NVENC mux write_packet (drain) failed for frame {prev_idx}: {e:?}");
                                 }

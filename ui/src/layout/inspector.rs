@@ -38,6 +38,7 @@ pub struct InspectorState {
     pub bg_padding: f32,
 
     // Effects
+    pub color_enabled: bool,
     pub brightness: f32,
     pub contrast: f32,
     pub saturation: f32,
@@ -97,6 +98,7 @@ impl Default for InspectorState {
             bg_enabled: false,
             bg_color: [0.0, 0.0, 0.0, 0.85],
             bg_padding: 12.0,
+            color_enabled: false,
             brightness: 0.0,
             contrast: 100.0,
             saturation: 100.0,
@@ -171,6 +173,7 @@ fn draw_inner(
             state.crop_feather = crop.feather;
 
             let eff = project.clips.effects_at(idx);
+            state.color_enabled = eff.color_enabled;
             state.brightness = eff.brightness * 100.0;
             state.contrast = eff.contrast * 100.0;
             state.saturation = eff.saturation * 100.0;
@@ -687,127 +690,196 @@ fn draw_inner(
             ui.add_space(6.0);
 
             // ── Effects ───────────────────────────────────────────────────
+            let any_effects = state.color_enabled
+                || state.blur_enabled
+                || state.sharpen_enabled
+                || state.vignette_enabled
+                || state.chroma_key_enabled;
+
+            let mut effects_changed = false;
+
             ui.collapsing("✨  Effects", |ui| {
-                // 1. Color & Light
-                ui.collapsing("🎨  Color & Light", |ui| {
-                    egui::Grid::new("color_light_grid")
-                        .num_columns(2)
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Brightness");
-                            ui.add(egui::Slider::new(&mut state.brightness, -100.0..=100.0).suffix("%"));
-                            ui.end_row();
-
-                            ui.label("Contrast");
-                            ui.add(egui::Slider::new(&mut state.contrast, 0.0..=200.0).suffix("%"));
-                            ui.end_row();
-
-                            ui.label("Saturation");
-                            ui.add(egui::Slider::new(&mut state.saturation, 0.0..=200.0).suffix("%"));
-                            ui.end_row();
-
-                            ui.label("Hue Shift");
-                            ui.add(egui::Slider::new(&mut state.hue, -180.0..=180.0).suffix("°"));
-                            ui.end_row();
-                        });
-
+                if !any_effects {
                     ui.add_space(4.0);
-                    if ui.button("↺  Reset Color").clicked() {
-                        state.brightness = 0.0;
-                        state.contrast = 100.0;
-                        state.saturation = 100.0;
-                        state.hue = 0.0;
-                    }
-                });
-                ui.add_space(4.0);
-
-                // 2. Gaussian Blur
-                ui.collapsing("💧  Gaussian Blur", |ui| {
-                    egui::Grid::new("blur_grid")
-                        .num_columns(2)
-                        .spacing([8.0, 6.0])
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(24, 24, 24))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(45, 45, 45)))
+                        .rounding(6.0)
+                        .inner_margin(egui::Margin::symmetric(12.0, 12.0))
                         .show(ui, |ui| {
-                            ui.label("Enable");
-                            ui.checkbox(&mut state.blur_enabled, "");
-                            ui.end_row();
+                            ui.set_min_width(ui.available_width());
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new("✨").size(24.0));
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("No effects applied")
+                                        .color(Color32::from_rgb(160, 160, 160))
+                                        .strong()
+                                        .size(12.0),
+                                );
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new("Drag effects from the Effects tab on the left onto this clip.")
+                                        .color(Color32::from_rgb(110, 110, 110))
+                                        .size(11.0),
+                                );
+                            });
+                        });
+                } else {
+                    // 1. Color & Light
+                    if state.color_enabled {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("🎨  Color & Light").strong().color(Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(RichText::new("🗑").color(Color32::from_rgb(220, 80, 80))).on_hover_text("Remove effect").clicked() {
+                                    state.color_enabled = false;
+                                    effects_changed = true;
+                                }
+                            });
+                        });
+                        egui::Grid::new("color_light_grid")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Brightness");
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.brightness, -100.0..=100.0).suffix("%")).changed();
+                                ui.end_row();
 
-                            if state.blur_enabled {
+                                ui.label("Contrast");
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.contrast, 0.0..=200.0).suffix("%")).changed();
+                                ui.end_row();
+
+                                ui.label("Saturation");
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.saturation, 0.0..=200.0).suffix("%")).changed();
+                                ui.end_row();
+
+                                ui.label("Hue Shift");
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.hue, -180.0..=180.0).suffix("°")).changed();
+                                ui.end_row();
+                            });
+
+                        ui.add_space(2.0);
+                        if ui.button("↺  Reset Color").clicked() {
+                            state.brightness = 0.0;
+                            state.contrast = 100.0;
+                            state.saturation = 100.0;
+                            state.hue = 0.0;
+                            effects_changed = true;
+                        }
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                    }
+
+                    // 2. Gaussian Blur
+                    if state.blur_enabled {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("💧  Gaussian Blur").strong().color(Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(RichText::new("🗑").color(Color32::from_rgb(220, 80, 80))).on_hover_text("Remove effect").clicked() {
+                                    state.blur_enabled = false;
+                                    effects_changed = true;
+                                }
+                            });
+                        });
+                        egui::Grid::new("blur_grid")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
                                 ui.label("Radius");
-                                ui.add(egui::Slider::new(&mut state.blur_radius, 1.0..=50.0).suffix(" px"));
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.blur_radius, 1.0..=50.0).suffix(" px")).changed();
                                 ui.end_row();
 
                                 ui.label("Sigma");
-                                ui.add(egui::Slider::new(&mut state.blur_sigma, 0.5..=25.0));
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.blur_sigma, 0.5..=25.0)).changed();
                                 ui.end_row();
-                            }
+                            });
+
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                    }
+
+                    // 3. Sharpen
+                    if state.sharpen_enabled {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("⚡  Sharpen").strong().color(Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(RichText::new("🗑").color(Color32::from_rgb(220, 80, 80))).on_hover_text("Remove effect").clicked() {
+                                    state.sharpen_enabled = false;
+                                    effects_changed = true;
+                                }
+                            });
                         });
-                });
-                ui.add_space(4.0);
-
-                // 3. Sharpen
-                ui.collapsing("⚡  Sharpen", |ui| {
-                    egui::Grid::new("sharpen_grid")
-                        .num_columns(2)
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Enable");
-                            ui.checkbox(&mut state.sharpen_enabled, "");
-                            ui.end_row();
-
-                            if state.sharpen_enabled {
+                        egui::Grid::new("sharpen_grid")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
                                 ui.label("Amount");
-                                ui.add(egui::Slider::new(&mut state.sharpen_amount, 0.0..=200.0).suffix("%"));
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.sharpen_amount, 0.0..=200.0).suffix("%")).changed();
                                 ui.end_row();
-                            }
+                            });
+
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                    }
+
+                    // 4. Vignette
+                    if state.vignette_enabled {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("🌑  Vignette").strong().color(Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(RichText::new("🗑").color(Color32::from_rgb(220, 80, 80))).on_hover_text("Remove effect").clicked() {
+                                    state.vignette_enabled = false;
+                                    effects_changed = true;
+                                }
+                            });
                         });
-                });
-                ui.add_space(4.0);
-
-                // 4. Vignette
-                ui.collapsing("🌑  Vignette", |ui| {
-                    egui::Grid::new("vignette_grid")
-                        .num_columns(2)
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Enable");
-                            ui.checkbox(&mut state.vignette_enabled, "");
-                            ui.end_row();
-
-                            if state.vignette_enabled {
+                        egui::Grid::new("vignette_grid")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
                                 ui.label("Intensity");
-                                ui.add(egui::Slider::new(&mut state.vignette_intensity, 0.0..=100.0).suffix("%"));
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.vignette_intensity, 0.0..=100.0).suffix("%")).changed();
                                 ui.end_row();
 
                                 ui.label("Radius");
-                                ui.add(egui::Slider::new(&mut state.vignette_radius, 10.0..=150.0).suffix("%"));
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.vignette_radius, 10.0..=150.0).suffix("%")).changed();
                                 ui.end_row();
 
                                 ui.label("Softness");
-                                ui.add(egui::Slider::new(&mut state.vignette_softness, 0.0..=100.0).suffix("%"));
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.vignette_softness, 0.0..=100.0).suffix("%")).changed();
                                 ui.end_row();
 
                                 ui.label("Roundness");
-                                ui.add(egui::Slider::new(&mut state.vignette_roundness, 0.0..=100.0).suffix("%"));
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.vignette_roundness, 0.0..=100.0).suffix("%")).changed();
                                 ui.end_row();
-                            }
+                            });
+
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                    }
+
+                    // 5. Chroma Key
+                    if state.chroma_key_enabled {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("🟢  Chroma Key").strong().color(Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(RichText::new("🗑").color(Color32::from_rgb(220, 80, 80))).on_hover_text("Remove effect").clicked() {
+                                    state.chroma_key_enabled = false;
+                                    effects_changed = true;
+                                }
+                            });
                         });
-                });
-                ui.add_space(4.0);
-
-                // 5. Chroma Key
-                ui.collapsing("🟢  Chroma Key (Green Screen)", |ui| {
-                    egui::Grid::new("chroma_key_grid")
-                        .num_columns(2)
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Enable");
-                            ui.checkbox(&mut state.chroma_key_enabled, "");
-                            ui.end_row();
-
-                            if state.chroma_key_enabled {
+                        egui::Grid::new("chroma_key_grid")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
                                 ui.label("Key Color");
                                 ui.horizontal(|ui| {
-                                    ui.color_edit_button_rgb(&mut state.chroma_key_color);
+                                    effects_changed |= ui.color_edit_button_rgb(&mut state.chroma_key_color).changed();
                                     let eye_label = if state.eyedropper_active { "💉 Picking…" } else { "🔍 Pick" };
                                     let eye_btn = egui::Button::new(eye_label);
                                     let eye_btn = if state.eyedropper_active {
@@ -825,27 +897,34 @@ fn draw_inner(
                                 ui.horizontal(|ui| {
                                     if ui.button("🟩 Green").clicked() {
                                         state.chroma_key_color = [0.0, 1.0, 0.0];
+                                        effects_changed = true;
                                     }
                                     if ui.button("🟦 Blue").clicked() {
                                         state.chroma_key_color = [0.0, 0.0, 1.0];
+                                        effects_changed = true;
                                     }
                                 });
                                 ui.end_row();
 
                                 ui.label("Tolerance");
-                                ui.add(egui::Slider::new(&mut state.chroma_key_tolerance, 0.01..=1.0));
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.chroma_key_tolerance, 0.01..=1.0)).changed();
                                 ui.end_row();
 
                                 ui.label("Softness");
-                                ui.add(egui::Slider::new(&mut state.chroma_key_softness, 0.0..=state.chroma_key_tolerance));
+                                effects_changed |= ui.add(egui::Slider::new(&mut state.chroma_key_softness, 0.0..=state.chroma_key_tolerance)).changed();
                                 ui.end_row();
-                            }
-                        });
-                });
+                            });
+                    }
+                }
             });
+
+            if effects_changed {
+                history.record(project);
+            }
 
             // Sync effect changes back to clip in timeline store
             let eff = nexir::timeline::transform::ClipEffects {
+                color_enabled: state.color_enabled,
                 brightness: state.brightness / 100.0,
                 contrast: state.contrast / 100.0,
                 saturation: state.saturation / 100.0,

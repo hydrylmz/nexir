@@ -363,8 +363,8 @@ fn extract_cycle(
     }
 
     for &start in unresolved_nodes {
-        if !visited[start] {
-            if dfs(
+        if !visited[start]
+            && dfs(
                 start,
                 &unresolved_set,
                 dependents,
@@ -373,9 +373,9 @@ fn extract_cycle(
                 &mut stack,
                 &mut cycle_path,
                 node_names,
-            ) {
-                return cycle_path;
-            }
+            )
+        {
+            return cycle_path;
         }
     }
 

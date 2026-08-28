@@ -24,7 +24,7 @@ impl SegmentPartitioner {
             return vec![];
         }
         let n_segments = job.render_threads.min(total);
-        let fps = (total + n_segments - 1) / n_segments;
+        let fps = total.div_ceil(n_segments);
 
         let mut segments = Vec::with_capacity(n_segments);
         for i in 0..n_segments {

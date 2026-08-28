@@ -71,6 +71,7 @@ impl DecodeInteropTarget {
     /// Copy an NVDEC-decoded frame directly into this target's Y/UV textures.
     /// Called instead of Decoder::decode_into's CPU-copy path whenever
     /// InteropCapability::is_available() is true and the source hw_type is Cuda.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn copy_from_nvdec_frame(
         &self,
         cuda_ctx: &CudaContext,
@@ -78,6 +79,8 @@ impl DecodeInteropTarget {
         width:    u32,
         height:   u32,
     ) -> Result<(), CudaError> {
+        // SAFETY: `frame` is supplied by the decoder while the decoded AVFrame
+        // is still alive; we only read FFmpeg's data and linesize arrays.
         // Step 1 — Extract NVDEC's output device pointers and pitch from the AVFrame.
         let (y_devptr, uv_devptr, pitch) = unsafe {
             let data = av_frame_get_data(frame);

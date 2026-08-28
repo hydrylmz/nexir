@@ -93,6 +93,10 @@ impl FrameCache {
         self.index.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
     /// Evict all cached frames, releasing their slots back to the pool.
     pub fn clear_all(&self) {
         let mut lru = self.lru.lock().unwrap();

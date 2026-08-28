@@ -44,7 +44,7 @@ impl FrameScheduler {
             let track_id = store.track_id_at(ac.store_index);
             tracks
                 .get(track_id)
-                .map_or(true, |t| !matches!(t.kind, TrackKind::Audio { .. }))
+                .is_none_or(|t| !matches!(t.kind, TrackKind::Audio { .. }))
         });
 
         // Step 3 — Build islands
@@ -94,7 +94,7 @@ impl FrameScheduler {
             let track_id = store.track_id_at(ac.store_index);
             tracks
                 .get(track_id)
-                .map_or(true, |t| !matches!(t.kind, TrackKind::Audio { .. }))
+                .is_none_or(|t| !matches!(t.kind, TrackKind::Audio { .. }))
         });
 
         let islands = build_islands(store, source_reg, &active, pts);
@@ -150,7 +150,7 @@ impl FrameScheduler {
             } else if is_vfr {
                 let stream_pts = project_tb.rescale_pts(clip.source_pts, time_base);
                 let stream_frame_duration =
-                    time_base.den as i64 * fps.den as i64 / (time_base.num as i64 * fps.num as i64);
+                    time_base.den * fps.den / (time_base.num * fps.num);
                 let quantized_stream_pts = if stream_frame_duration > 0 {
                     (stream_pts / stream_frame_duration) * stream_frame_duration
                 } else {
@@ -158,7 +158,7 @@ impl FrameScheduler {
                 };
                 time_base.rescale_pts(quantized_stream_pts, project_tb)
             } else {
-                let frame_duration = 90_000 * (fps.den as i64) / (fps.num as i64);
+                let frame_duration = 90_000 * fps.den / fps.num;
                 (clip.source_pts / frame_duration) * frame_duration
             };
 
@@ -263,7 +263,7 @@ impl FrameScheduler {
             } else if is_vfr {
                 let stream_pts = project_tb.rescale_pts(clip.source_pts, time_base);
                 let stream_frame_duration =
-                    time_base.den as i64 * fps.den as i64 / (time_base.num as i64 * fps.num as i64);
+                    time_base.den * fps.den / (time_base.num * fps.num);
                 let quantized_stream_pts = if stream_frame_duration > 0 {
                     (stream_pts / stream_frame_duration) * stream_frame_duration
                 } else {
@@ -271,7 +271,7 @@ impl FrameScheduler {
                 };
                 time_base.rescale_pts(quantized_stream_pts, project_tb)
             } else {
-                let frame_duration = 90_000 * (fps.den as i64) / (fps.num as i64);
+                let frame_duration = 90_000 * fps.den / fps.num;
                 (clip.source_pts / frame_duration) * frame_duration
             };
 

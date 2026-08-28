@@ -83,7 +83,7 @@ mod tests {
         let mut list = MarkerList::new();
         let m1 = list.add(10_000, "Intro".into(), [1.0, 0.0, 0.0, 1.0], None);
         let m2 = list.add(50_000, "Verse".into(), [0.0, 1.0, 0.0, 1.0], Some(10_000));
-        let m3 = list.add(100_000, "Outro".into(), [0.0, 0.0, 1.0, 1.0], None);
+        let _m3 = list.add(100_000, "Outro".into(), [0.0, 0.0, 1.0, 1.0], None);
 
         assert_eq!(list.all().len(), 3);
         assert_eq!(list.nearest(12_000).unwrap().id, m1);

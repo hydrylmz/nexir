@@ -26,7 +26,7 @@ pub fn measure_text(
 
     let stroke_pad = if has_stroke { stroke_width.ceil() as i32 } else { 0 };
     let bg_pad = if background_active {
-        let min_bg_pad = (font_size * 0.10).ceil() as f32;
+        let min_bg_pad = (font_size * 0.10).ceil();
         bg_padding.max(min_bg_pad).ceil() as i32
     } else {
         0
@@ -63,7 +63,7 @@ pub fn rasterize_text(
 
     let stroke_pad = if stroke_color.is_some() { stroke_width.ceil() as i32 } else { 0 };
     let bg_pad = if background_color.is_some() {
-        let min_bg_pad = (font_size * 0.10).ceil() as f32;
+        let min_bg_pad = (font_size * 0.10).ceil();
         bg_padding.max(min_bg_pad).ceil() as i32
     } else {
         0

@@ -21,8 +21,6 @@ pub struct AudioMuxEncoder {
     enc_frame:   *mut AVFrame,
     packet:      *mut AVPacket,
     frame_size:  usize,
-    enc_tb:      AVRational,
-    frame_count: i64,
 }
 
 unsafe impl Send for AudioMuxEncoder {}
@@ -77,7 +75,7 @@ impl AudioMuxEncoder {
 
             av_frame_set_nb_samples(enc_frame, frame_size as i32);
             av_frame_set_format(enc_frame, AV_SAMPLE_FMT_FLTP);
-            av_frame_set_ch_layout(enc_frame, AV_CH_LAYOUT_STEREO as u64);
+            av_frame_set_ch_layout(enc_frame, AV_CH_LAYOUT_STEREO);
             av_frame_set_sample_rate(enc_frame, 48000);
             av_frame_get_buffer(enc_frame, 0);
 
@@ -88,8 +86,6 @@ impl AudioMuxEncoder {
                 enc_frame,
                 packet,
                 frame_size: frame_size as usize,
-                enc_tb,
-                frame_count: 0,
             })
         }
     }

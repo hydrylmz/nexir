@@ -95,11 +95,15 @@ impl Muxer {
         }
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn write_packet(
         &self,
         pkt:      *mut AVPacket,
         is_video: bool,
     ) -> Result<(), MuxError> {
+        // SAFETY: callers pass AVPacket pointers produced by the active encoder.
+        // This wrapper only stamps stream/timebase metadata before handing the
+        // packet back to FFmpeg's muxer.
         let mut inner = self.inner.lock().unwrap();
         if inner.finalised {
             return Err(MuxError::Write("Cannot write to finalized muxer".into()));

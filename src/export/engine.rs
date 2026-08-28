@@ -256,10 +256,8 @@ impl ExportEngine {
 
                 match result {
                     Ok(Ok(())) => {
-                        if is_gpu {
-                            if !prog_tx_dispatch.control().is_cancelled() {
-                                prog_tx_dispatch.report(total_frames_count, ExportPhase::Done);
-                            }
+                        if is_gpu && !prog_tx_dispatch.control().is_cancelled() {
+                            prog_tx_dispatch.report(total_frames_count, ExportPhase::Done);
                         }
                     }
                     Ok(Err(e)) => {
@@ -610,7 +608,7 @@ impl ExportEngine {
                         }
 
                         // How many output samples swr will produce
-                        let out_max = (nb as i64 * 48_000 as i64 / in_sample_rate as i64 + 32) as usize;
+                        let out_max = (nb as i64 * 48_000_i64 / in_sample_rate as i64 + 32) as usize;
                         if swr_left.len() < out_max {
                             swr_left.resize(out_max, 0.0);
                             swr_right.resize(out_max, 0.0);

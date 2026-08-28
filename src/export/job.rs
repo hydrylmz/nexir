@@ -122,11 +122,11 @@ impl ExportJob {
         let duration_pts = self.pts_out - self.pts_in;
         let numer = duration_pts as u64 * self.frame_rate.num as u64;
         let denom = self.project_tb.den as u64 * self.frame_rate.den as u64;
-        ((numer + denom - 1) / denom) as usize
+        numer.div_ceil(denom) as usize
     }
 
     pub fn frame_pts(&self, n: usize) -> i64 {
-        let frame_dur = self.project_tb.den as i64 / self.frame_rate.num as i64;
+        let frame_dur = self.project_tb.den / self.frame_rate.num;
         self.pts_in + n as i64 * frame_dur
     }
 

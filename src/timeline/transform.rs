@@ -535,6 +535,8 @@ impl std::fmt::Display for ParamError {
 /// Parameters for all built-in GPU effects applied to a clip.
 #[derive(Copy, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClipEffects {
+    #[serde(default)]
+    pub color_enabled: bool,
     pub brightness: f32,
     pub contrast: f32,
     pub saturation: f32,
@@ -562,6 +564,7 @@ pub struct ClipEffects {
 impl Default for ClipEffects {
     fn default() -> Self {
         Self {
+            color_enabled: false,
             brightness: 0.0,
             contrast: 1.0,
             saturation: 1.0,

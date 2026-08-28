@@ -26,7 +26,7 @@ pub enum VideoRotation {
 
 impl VideoRotation {
     pub fn from_degrees(deg: i32) -> Self {
-        match ((deg % 360) + 360) % 360 {
+        match deg.rem_euclid(360) {
             90 => VideoRotation::Rotate90,
             180 => VideoRotation::Rotate180,
             270 => VideoRotation::Rotate270,
@@ -505,6 +505,10 @@ impl SourceRegistry {
         self.ids.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
     pub fn path_registered(&self, path: &std::path::Path) -> bool {
         self.paths.iter().any(|p| p.as_ref() == path)
     }
@@ -520,6 +524,34 @@ impl SourceRegistry {
     /// pipeline to prime the prefetch queue before a render segment starts.
     pub fn all_source_ids(&self) -> Vec<SourceId> {
         self.ids.clone()
+    }
+
+    /// Replace the file path for `id` with `new_path`, reset its status to
+    /// `Available`, and return `Ok(())`.  All clips that reference `id` are
+    /// unaffected because they store the `SourceId`, not the path directly.
+    ///
+    /// Returns `Err(SourceError::NotFound)` if `id` is not registered.
+    pub fn relink(&mut self, id: SourceId, new_path: PathBuf) -> Result<(), SourceError> {
+        let idx = self
+            .ids
+            .iter()
+            .position(|&x| x == id)
+            .ok_or(SourceError::NotFound(id))?;
+        self.paths[idx] = std::sync::Arc::new(new_path);
+        self.statuses[idx] = MediaStatus::Available;
+        log::info!("[source] relinked {:?} -> {:?}", id, self.paths[idx]);
+        Ok(())
+    }
+
+    /// Return all `(SourceId, path)` pairs whose file does not exist on disk.
+    /// Callers should use this to populate a relink / missing-media dialog.
+    pub fn offline_sources(&self) -> Vec<(SourceId, PathBuf)> {
+        self.ids
+            .iter()
+            .zip(self.paths.iter())
+            .filter(|(_, path)| !path.exists())
+            .map(|(&id, path)| (id, (**path).clone()))
+            .collect()
     }
 }
 
@@ -603,5 +635,24 @@ mod tests {
         assert!(PixelFormat::Yuv420p12.is_10bit());
         assert!(PixelFormat::Yuv444p12.is_10bit());
         assert_eq!(PixelFormat::Yuv420p12.bytes_per_sample(), 2);
+    }
+
+    #[test]
+    fn test_source_relink_and_offline() {
+        let mut registry = SourceRegistry::new();
+        let non_existent = PathBuf::from("C:\\definitely_does_not_exist_12345.mp4");
+        let id = registry.register(non_existent.clone(), None, None);
+
+        let offline = registry.offline_sources();
+        assert_eq!(offline.len(), 1);
+        assert_eq!(offline[0].0, id);
+        assert_eq!(offline[0].1, non_existent);
+
+        let new_path = PathBuf::from("C:\\relinked_path.mp4");
+        assert!(registry.relink(id, new_path.clone()).is_ok());
+        assert_eq!(registry.path(id).unwrap().as_ref(), &new_path);
+        assert_eq!(registry.media_status(id), MediaStatus::Available);
+
+        assert!(registry.relink(SourceId(999), new_path).is_err());
     }
 }

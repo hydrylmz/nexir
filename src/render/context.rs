@@ -22,7 +22,7 @@ impl RenderContext {
 
     /// Check if a resource was allocated (safe alternative to get()).
     pub fn contains(&self, id: ResourceId) -> bool {
-        self.resources.get(id.0 as usize).map_or(false, |opt| opt.is_some())
+        self.resources.get(id.0 as usize).is_some_and(|opt| opt.is_some())
     }
 
     /// Try to get a resolved resource

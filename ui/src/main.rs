@@ -7,6 +7,7 @@ use winit::window::WindowBuilder;
 
 mod app;
 mod audio_mixer;
+mod autosave;
 mod history;
 mod image_still;
 pub mod layout;

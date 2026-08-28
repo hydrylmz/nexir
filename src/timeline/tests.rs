@@ -41,7 +41,7 @@ mod tests {
 
     #[test]
     fn transform_identity_matrix() {
-        let m = ClipTransform::identity().to_matrix(100.0, 100.0, 1920.0, 1080.0);
+        let _m = ClipTransform::identity().to_matrix(100.0, 100.0, 1920.0, 1080.0);
         // We no longer test for an identity matrix here because to_matrix now converts all the way to NDC.
     }
 
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_move_clip_ripple() {
-        use crate::timeline::mutation::{insert_clip_ripple, move_clip_ripple};
+        use crate::timeline::mutation::move_clip_ripple;
         let mut store = TimelineStore::new();
 
         let p1 = ClipInsertParams {
@@ -1037,6 +1037,32 @@ mod tests {
         assert_eq!(store.pts_in_at(1), 1500);
         assert_eq!(store.pts_out_at(1), 2000);
         assert_eq!(store.source_in_at(1), 1000); // 500 + (1500 - 1000)
+    }
+
+    #[test]
+    fn test_split_clip_with_speed() {
+        let mut store = TimelineStore::new();
+        let p = ClipInsertParams {
+            track_id: TrackId(0),
+            source_id: SourceId(0),
+            kind: crate::timeline::store::ClipKind::Video,
+            pts_in: 0,
+            pts_out: 2000,
+            source_in: 100,
+            speed: 2.0,
+            ..Default::default()
+        };
+        let clip_id = insert_clip(&mut store, p).unwrap();
+
+        let _new_clip_id = split_clip(&mut store, clip_id, 1000).unwrap();
+        assert_eq!(store.pts_in_at(0), 0);
+        assert_eq!(store.pts_out_at(0), 1000);
+        assert_eq!(store.source_in_at(0), 100);
+
+        assert_eq!(store.pts_in_at(1), 1000);
+        assert_eq!(store.pts_out_at(1), 2000);
+        // delta is 1000 timeline pts, at 2.0x speed -> 2000 source pts
+        assert_eq!(store.source_in_at(1), 2100);
     }
 
     #[test]

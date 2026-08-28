@@ -1,7 +1,5 @@
 // src/io/slot_pool.rs
 
-use std::sync::Mutex;
-
 use crate::render::device::GpuDevice;
 
 /// Opaque handle to one staging buffer slot in the pool.
@@ -24,13 +22,12 @@ struct SlotTier {
 
 impl SlotTier {
     /// Pre-allocate `count` staging buffers of `raw_size` bytes each.
-    pub fn new(device: &GpuDevice, raw_size: u64, count: u16, tier: u8) -> Self {
+    pub fn new(_device: &GpuDevice, raw_size: u64, count: u16, _tier: u8) -> Self {
         let slot_size = raw_size; // No padding needed for Vec<u8>
 
         let mut buffers = Vec::with_capacity(count as usize);
         for _ in 0..count {
-            let mut vec = Vec::with_capacity(slot_size as usize);
-            vec.resize(slot_size as usize, 0);
+            let vec = vec![0; slot_size as usize];
             buffers.push(std::sync::Mutex::new(vec));
         }
 

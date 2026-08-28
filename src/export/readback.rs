@@ -86,7 +86,7 @@ impl FrameReadback {
         
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |v| {
-            if let Err(_) = tx.send(v) {
+            if tx.send(v).is_err() {
                 log::warn!("[readback] map_async channel closed before result was delivered");
             }
         });
@@ -95,7 +95,7 @@ impl FrameReadback {
         // pending work (which would include the *next* frame's render commands).
         device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
         
-        if let Err(_) = rx.recv().map_err(|e| e.to_string())? {
+        if rx.recv().map_err(|e| e.to_string())?.is_err() {
             return Err("Failed to map buffer".to_string());
         }
 
@@ -143,12 +143,12 @@ impl FrameReadback {
         let slice = self.buffers[slot].slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |v| {
-            if let Err(_) = tx.send(v) {
+            if tx.send(v).is_err() {
                 log::warn!("[readback] map_strip_unmap channel closed before result was delivered");
             }
         });
         device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
-        if let Err(_) = rx.recv().map_err(|e| e.to_string())? {
+        if rx.recv().map_err(|e| e.to_string())?.is_err() {
             return Err("Failed to map buffer".to_string());
         }
         let view = slice.get_mapped_range();

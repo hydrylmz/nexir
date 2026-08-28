@@ -45,7 +45,7 @@ impl InteropCapability {
                 fn FreeLibrary(h_lib_module: *mut std::ffi::c_void) -> i32;
             }
 
-            let h = unsafe { LoadLibraryA(b"cuda.dll\0".as_ptr()) };
+            let h = unsafe { LoadLibraryA(c"cuda.dll".as_ptr().cast()) };
             if h.is_null() {
                 log::warn!("InteropCapability::probe rejected: cuda.dll not found (CUDA Toolkit not installed)");
                 return Self::none();

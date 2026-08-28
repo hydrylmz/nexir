@@ -36,7 +36,10 @@ impl Packet {
         self.inner as *const _
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn from_raw(src: *mut AVPacket) -> Self {
+        // SAFETY: `src` is expected to come from FFmpeg. This constructor
+        // immediately clones the packet into an owned AVPacket via av_packet_ref.
         unsafe {
             let inner = crate::io::ffi::avutil::av_packet_alloc();
             extern "C" { pub fn av_packet_ref(dst: *mut AVPacket, src: *const AVPacket) -> std::ffi::c_int; }
@@ -259,7 +262,7 @@ impl Demuxer {
     /// Returns the stream-timebase PTS that was actually seeked to.
     pub fn seek(&mut self, pts: i64, project_tb: Rational) -> Result<i64, DemuxError> {
         let stream_info = self.video_stream.as_ref()
-            .or_else(|| self.audio_stream.as_ref())
+            .or(self.audio_stream.as_ref())
             .ok_or(DemuxError::NoVideoStream)?;
         let stream_idx  = stream_info.index as i32;
         let stream_tb   = stream_info.time_base;

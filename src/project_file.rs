@@ -196,6 +196,69 @@ impl ProjectFile {
 
         Ok(Project::from(pf))
     }
+
+    // ─────────────────────────────────────────────
+    // Autosave path helpers
+    // ─────────────────────────────────────────────
+
+    /// Return the autosave path that corresponds to a saved project path, or
+    /// to a platform-specific fallback location for unsaved ("Untitled") projects.
+    ///
+    /// - Saved project at `C:\foo\bar.nexp`  → `C:\foo\bar.nexp.autosave`
+    /// - Unsaved project                     → `%LOCALAPPDATA%\Nexir\autosave\untitled.nexp.autosave`
+    pub fn autosave_path_for(project_path: Option<&Path>) -> PathBuf {
+        if let Some(p) = project_path {
+            // Append `.autosave` to the full filename: `bar.nexp` → `bar.nexp.autosave`
+            let mut s = p.as_os_str().to_os_string();
+            s.push(".autosave");
+            PathBuf::from(s)
+        } else {
+            // Unsaved project: use a well-known fallback directory.
+            // Prefer %LOCALAPPDATA% on Windows, fall back to %TEMP%.
+            let base = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            base.join("Nexir").join("autosave").join("untitled.nexp.autosave")
+        }
+    }
+
+    /// Delete the autosave file at `autosave_path` if it exists.
+    /// Called after a successful explicit save or a clean project load, so the
+    /// next startup does not falsely offer to recover it.
+    pub fn delete_autosave(autosave_path: &Path) {
+        if autosave_path.exists() {
+            if let Err(e) = std::fs::remove_file(autosave_path) {
+                log::warn!("[autosave] could not delete autosave {:?}: {}", autosave_path, e);
+            } else {
+                log::info!("[autosave] deleted stale autosave {:?}", autosave_path);
+            }
+        }
+    }
+
+    /// Return `Some(autosave_path)` only when an autosave file exists *and*
+    /// is strictly newer than `reference_mtime` (or `reference_mtime` is
+    /// `None`, meaning there is no explicit save to compare against).
+    ///
+    /// `reference_mtime` should be the `std::fs::metadata(project_path).modified()`
+    /// of the explicit `.nexp` file, if one exists.
+    pub fn find_autosave_newer_than(
+        autosave_path: &Path,
+        reference_mtime: Option<std::time::SystemTime>,
+    ) -> Option<PathBuf> {
+        let meta = std::fs::metadata(autosave_path).ok()?;
+        let autosave_mtime = meta.modified().ok()?;
+
+        let is_newer = match reference_mtime {
+            Some(ref_time) => autosave_mtime > ref_time,
+            None => true, // No saved project → any autosave is worth recovering
+        };
+
+        if is_newer {
+            Some(autosave_path.to_path_buf())
+        } else {
+            None
+        }
+    }
 }
 
 // ═════════════════════════════════════════════
@@ -208,3 +271,41 @@ impl SourceRegistry {
         SourceRegistry::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_autosave_path_for_saved_project() {
+        let p = PathBuf::from("C:\\projects\\my_movie.nexp");
+        let auto = ProjectFile::autosave_path_for(Some(&p));
+        assert_eq!(auto, PathBuf::from("C:\\projects\\my_movie.nexp.autosave"));
+    }
+
+    #[test]
+    fn test_autosave_path_for_untitled() {
+        let auto = ProjectFile::autosave_path_for(None);
+        assert!(auto.to_string_lossy().ends_with("untitled.nexp.autosave"));
+    }
+
+    #[test]
+    fn test_autosave_find_and_delete() {
+        let temp_dir = std::env::temp_dir().join("nexir_proj_test");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let autosave_file = temp_dir.join("test_proj.nexp.autosave");
+
+        std::fs::write(&autosave_file, "{}").unwrap();
+        assert!(autosave_file.exists());
+
+        let found = ProjectFile::find_autosave_newer_than(&autosave_file, None);
+        assert_eq!(found, Some(autosave_file.clone()));
+
+        ProjectFile::delete_autosave(&autosave_file);
+        assert!(!autosave_file.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}
+

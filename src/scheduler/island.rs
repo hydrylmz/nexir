@@ -39,7 +39,7 @@ pub fn build_islands(
     store:          &TimelineStore,
     source_reg:     &SourceRegistry,
     active_indices: &[ActiveClip],
-    query_pts:      i64,
+    _query_pts:     i64,
 ) -> Vec<Island> {
     let mut island_map: HashMap<TrackId, Island> = HashMap::new();
 
@@ -48,10 +48,8 @@ pub fn build_islands(
         
         let track_id   = store.track_id_at(idx);
         let source_id  = store.source_id_at(idx);
-        let pts_in     = store.pts_in_at(idx);
-        let source_in  = store.source_in_at(idx);
         let source_pts = active.source_pts;
-        let transform  = store.transform_at(idx).clone();
+        let transform  = *store.transform_at(idx);
         let opacity    = store.opacity_at(idx);
         let blend_mode = store.blend_mode_at(idx);
         let crop       = *store.crop_at(idx);

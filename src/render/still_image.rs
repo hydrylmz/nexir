@@ -17,7 +17,7 @@ use crate::render::context::RenderContext;
 use crate::render::device::GpuDevice;
 use crate::render::frame_state::FrameState;
 use crate::render::graph::RenderNode;
-use crate::render::resource::{ResourceBuilder, ResourceDescriptor, ResourceId, ResolutionSource};
+use crate::render::resource::{ResourceBuilder, ResourceId};
 
 fn round_up_256(n: u32) -> u32 {
     (n + 255) & !255

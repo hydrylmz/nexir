@@ -364,10 +364,10 @@ impl VideoEncoder {
             let g = half::f16::from_le_bytes([src[2], src[3]]).to_f32();
             let b = half::f16::from_le_bytes([src[4], src[5]]).to_f32();
             let a = half::f16::from_le_bytes([src[6], src[7]]).to_f32();
-            dst[0] = (r * 255.0 + 0.5).min(255.0).max(0.0) as u8;
-            dst[1] = (g * 255.0 + 0.5).min(255.0).max(0.0) as u8;
-            dst[2] = (b * 255.0 + 0.5).min(255.0).max(0.0) as u8;
-            dst[3] = (a * 255.0 + 0.5).min(255.0).max(0.0) as u8;
+            dst[0] = (r * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            dst[1] = (g * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            dst[2] = (b * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            dst[3] = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
         }
     }
 
