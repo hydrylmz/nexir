@@ -53,10 +53,71 @@ pub struct CudaArray3DDescriptor {
     pub flags:        u32,          // CUDA_ARRAY3D_SURFACE_LDST = 2 — required for read/write access
 }
 
+/// `CUDA_EXTERNAL_MEMORY_BUFFER_DESC_v1` — the buffer sibling of
+/// [`CudaExternalMemoryMipmappedArrayDesc`], used to map imported memory as a
+/// flat `CUdeviceptr` instead of a `CUarray`.
+///
+/// `reserved[16]` must be zero for the same reason as in
+/// [`CudaExternalMemoryHandleDesc`].
+///
+/// Measured against `nv-codec-headers` `n12.2.72.0`'s `dynlink_cuda.h` with
+/// `offsetof` (probe: `nvchk/extbuf_probe.c layout`):
+///
+///     size 88
+///     offset    0
+///     size      8
+///     flags    16
+///     reserved 20
+#[repr(C)]
+pub struct CudaExternalMemoryBufferDesc {
+    /// Byte offset into the imported allocation where the mapping starts.
+    pub offset: u64,
+    /// Bytes to map.  May be SMALLER than the size given to
+    /// `cuImportExternalMemory` — D3D12 pads a committed resource up to its
+    /// heap alignment (61440 → 65536 for the NV12 case), and the import wants
+    /// the padded `GetResourceAllocationInfo` size while this wants the logical
+    /// one.  Verified with exactly that pair — and separately verified that a
+    /// LOGICAL-sized import also works on this driver, so the asymmetry is a
+    /// correctness choice, not a hard requirement (see `external_buffer.rs`).
+    pub size:   u64,
+    pub flags:  u32,
+    pub reserved: [u32; 16],
+}
+
+/// The three external-memory descriptors, checked against the `offsetof`/`sizeof`
+/// the vendor header produces under MinGW gcc (`nvchk/extbuf_probe.c layout`).
+/// A short struct here makes the driver write past the allocation.
+const _: () = {
+    assert!(std::mem::size_of::<CudaExternalMemoryHandleDesc>() == 104);
+    assert!(std::mem::size_of::<CudaExternalMemoryBufferDesc>() == 88);
+    assert!(std::mem::size_of::<CudaExternalMemoryMipmappedArrayDesc>() == 120);
+};
+
 pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD:        u32 = 1;
 pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32:      u32 = 2;
-pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE:    u32 = 4;
+/// A D3D12 *heap* handle.
+///
+/// This is the value the D3D12 import paths in this crate used to pass while
+/// calling it `..._D3D12_RESOURCE`, and it works — see the note on
+/// [`CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE`].  Kept named correctly so
+/// the mistake cannot be made again from the constant list.
+pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP:        u32 = 4;
+/// A D3D12 *resource* handle, i.e. what `ID3D12Device::CreateSharedHandle` on an
+/// `ID3D12Resource` returns — which is what every import in this crate passes.
+///
+/// The header says 4 is `D3D12_HEAP` and 5 is `D3D12_RESOURCE`; this crate said
+/// 4 was `D3D12_RESOURCE` and shipped it.  Measured (`nvchk/extbuf_probe.c`, RTX
+/// 3050, driver API 12.2): the driver accepts a resource NT handle under BOTH
+/// values, for both a committed TEXTURE2D imported as a mipmapped array and a
+/// committed BUFFER imported as a device pointer, and in all four combinations
+/// the full allocation round-trips byte-identically through
+/// `cuMemcpy2D`/`cuMemcpyHtoD`+`DtoH`.  So the old value was not producing wrong
+/// behaviour — it was a wrong NAME on a lenient driver, which is exactly the
+/// kind of thing that stops being harmless on the next driver.  The imports now
+/// pass 5, the value the header defines for the handle they actually hold.
+pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE:    u32 = 5;
 pub const CUDA_EXTERNAL_MEMORY_DEDICATED:                  u32 = 1;
+
 // CUarray_format values.  CUDA validates the (format, num_channels) pair against
 // the imported allocation's footprint, so these must describe the same bytes per
 // pixel as the D3D12/Vulkan format being imported — see
@@ -85,6 +146,20 @@ unsafe extern "C" {
         level_array: *mut CUarray,
         mipmap:      CUmipmappedArray,
         level:       u32,
+    ) -> CUresult;
+
+    /// Map imported memory as a flat device pointer.
+    ///
+    /// The returned `CUdeviceptr` is released with `cuMemFree_v2` — NOT with a
+    /// dedicated "unmap" call, and not by `cuDestroyExternalMemory` alone.
+    /// Calling `cuMemFree` on memory CUDA did not allocate looks wrong; it is
+    /// what the driver documents and what it accepts (measured:
+    /// `nvchk/extbuf_probe.c buf`, both handle types — `CUDA_SUCCESS`, followed
+    /// by a clean `cuDestroyExternalMemory`, no access violation).
+    pub fn cuExternalMemoryGetMappedBuffer(
+        dev_ptr: *mut super::cuda_driver::CUdeviceptr,
+        ext_mem: CUexternalMemory,
+        desc:    *const CudaExternalMemoryBufferDesc,
     ) -> CUresult;
 
     pub fn cuMipmappedArrayDestroy(mipmap: CUmipmappedArray) -> CUresult;

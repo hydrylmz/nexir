@@ -38,6 +38,25 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Free a device allocation.
+    ///
+    /// Also the documented release for a pointer obtained from
+    /// `cuExternalMemoryGetMappedBuffer`, where CUDA never allocated the memory
+    /// in the first place — see the note on that function.
+    pub fn cuMemFree_v2(dev_ptr: CUdeviceptr) -> CUresult;
+
+    pub fn cuMemcpyHtoD_v2(
+        dst:        CUdeviceptr,
+        src:        *const std::ffi::c_void,
+        byte_count: usize,
+    ) -> CUresult;
+
+    pub fn cuMemcpyDtoH_v2(
+        dst:        *mut std::ffi::c_void,
+        src:        CUdeviceptr,
+        byte_count: usize,
+    ) -> CUresult;
+
     pub fn cuGetErrorString(error: CUresult, str_ptr: *mut *const std::ffi::c_char) -> CUresult;
 }
 

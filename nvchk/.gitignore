@@ -1,0 +1,13 @@
+# Build products and probe output.  The probes are SOURCE artefacts: the .c files
+# and the two scripts are what the measurements cite, and everything below is
+# regenerable from them with ./fetch_headers.sh && ./build_probes.sh.
+#
+# ffnvcodec/ in particular is third-party vendor source (~900 KB) that is not
+# ours to redistribute; fetch_headers.sh pins it by tag AND by commit hash, which
+# is a stronger provenance claim than a copy in our tree would be.
+ffnvcodec/
+.hdrwork/
+*.exe
+*.h264
+*.raw
+*.txt

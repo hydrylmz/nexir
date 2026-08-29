@@ -656,7 +656,7 @@ pub enum VideoEncoderBackend {
     /// Used when CUDA interop is unavailable, OR the job's codec is not H.264/HEVC
     /// (NVENC in Phase 7 scope only covers H.264/HEVC; ProRes/VP9 always use this path).
     FfmpegCpu(VideoEncoder),
-    /// Phase 7 path: zero-copy CUDA/NVENC — RTT texture → ABGR10 repack → NVENC.
+    /// Phase 7 path: zero-copy CUDA/NVENC — RTT texture → NV12 convert → NVENC.
     /// `param_enc` is a minimal libx264 context opened solely to provide
     /// `AVCodecContext` parameters for `Muxer::open` stream header setup.
     /// It performs no actual encoding.
@@ -708,18 +708,23 @@ impl VideoEncoderBackend {
         }
 
         if capability.is_available() && nvenc_eligible {
-            // P1.7 — the zero-copy path feeds NVENC RGB and lets the driver pick
-            // the RGB→YUV matrix, which is BT.601. `Muxer::open` tags the stream
-            // BT.709. See `ExportJob::nvenc_zero_copy_is_colour_safe` for the full
-            // reasoning and for what it would take to lift this.
+            // P1.9 — the zero-copy path now converts RGB→YUV in our own shader
+            // (`Nv12EncodeNode`) and hands NVENC NV12, so the driver applies no
+            // matrix of its own and the stream's tags describe the samples. The
+            // gate that remains covers 10-bit and full-range output, whose
+            // signalling lives in the NV_ENC_CONFIG VUI union this code will not
+            // write at guessed offsets. See
+            // `ExportJob::nvenc_zero_copy_is_colour_safe`.
             if !job.nvenc_zero_copy_is_colour_safe() {
                 log::info!(
-                    "[export] output is tagged {:?} but the zero-copy NVENC path \
-                     would have the driver convert RGB with BT.601 — using the \
-                     FFmpeg encoder path (h264_nvenc/hevc_nvenc if available) so \
-                     the samples match the tags. The encode stays on the GPU; only \
-                     the zero-copy readback is given up.",
-                    job.output_color.matrix
+                    "[export] output is {:?} {}-bit {:?} — the zero-copy NVENC path \
+                     cannot signal that (its NV12 shader is 8-bit, and the range flag \
+                     lives in the VUI union), so using the FFmpeg encoder path \
+                     (h264_nvenc/hevc_nvenc if available). The encode stays on the \
+                     GPU; only the zero-copy readback is given up.",
+                    job.output_color.matrix,
+                    job.output_color.bit_depth,
+                    job.output_color.effective_range()
                 );
                 return Ok(Self::FfmpegCpu(VideoEncoder::open(job)?));
             }

@@ -11,7 +11,6 @@ use crate::interop::cuda_context::CudaContext;
 use crate::io::ffi::avutil::AVRational;
 use crate::render::compute::ComputePipelineCache;
 use crate::render::device::GpuDevice;
-use crate::render::resource::ResourceId;
 use crate::render::shader::registry::ShaderRegistry;
 use crate::scheduler::frame_scheduler::FrameScheduler;
 use crate::timeline::source::SourceRegistry;
@@ -113,15 +112,21 @@ impl ExportEngine {
         let mut video_enc_opt = Some(video_enc);
 
         let backend = if is_gpu {
-            let repack = crate::interop::encode_interop::Abgr10RepackNode::new(
+            // RGB → NV12 in our own shader.  Built from the JOB's output colour
+            // description, which is the whole point: NVENC receives YUV that
+            // already carries this matrix and performs no conversion of its own,
+            // so `Muxer::open`'s tags are authoritative by construction rather
+            // than a claim about what the driver happened to do.
+            let nv12 = crate::interop::nv12_encode::Nv12EncodeNode::new(
                 &self.device,
-                ResourceId::FINAL_COLOR,
-                ResourceId::FINAL_COLOR,
+                self.job.output_color,
+                self.job.width,
+                self.job.height,
             );
             crate::export::renderer::ExportBackend::GpuNvenc {
                 video_enc: video_enc_opt.take().unwrap(),
                 muxer: Arc::clone(&muxer),
-                repack,
+                nv12,
             }
         } else {
             let readback = crate::export::readback::FrameReadback::new(

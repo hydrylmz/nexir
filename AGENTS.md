@@ -17,7 +17,13 @@ cargo run -p ui               # launch the desktop app
 ## Build Dependencies (Windows)
 
 - **FFmpeg dev libs** at `C:/ffmpeg/` (set `VE_FFMPEG_LIB_DIR` to override)
-- **CUDA 12.0 SDK** at `C:/Program Files/NVIDIA Corporation/CUDA/v12.0/lib/x64/`
+- **CUDA driver** — `cuda.dll` on the DLL search path (`target/debug/` holds a copy;
+  the consumer NVIDIA driver installs it as `nvcuda.dll`, which is NOT the name the
+  delay-load resolver looks for). The CUDA **Toolkit** is not required: `build.rs`
+  generates the import library from `build/cuda.def` with `lib.exe`, so **adding a
+  CUDA function to `src/interop/ffi/cuda_*.rs` means adding a line to
+  `build/cuda.def`** or the link fails with `unresolved external symbol __imp_<name>`.
+  Use the `_v2` name the driver actually exports (`cuMemFree_v2`, not `cuMemFree`).
 - `.cargo/config.toml` sets `/DELAYLOAD:cuda.dll` and `/DELAYLOAD:nvEncodeAPI64.dll` — required for NVENC export
 
 ## Architecture
@@ -58,6 +64,9 @@ FFmpeg struct fields accessed via C wrapper functions in `src/shim.c`. The Rust 
 
 `build.rs` links: `avformat`, `avcodec`, `avutil`, `swscale`, `swresample`, `cuda`, `nvidia-encode`.
 
+### Native FFI provenance — `nvchk/`
+Every "measured"/"verified" claim in `src/interop/` cites a standalone C probe in `nvchk/`, which is outside the Cargo build and not run by `cargo test`. Build them with `cd nvchk && ./fetch_headers.sh && ./build_probes.sh` (plain gcc, dynamic `LoadLibraryA` of `nvcuda.dll`/`nvEncodeAPI64.dll`, deliberately independent of `build.rs` and the delay-load config). Only `.c`/`.py`/`.sh` are committed; the vendor headers are pinned by tag *and* commit hash by `fetch_headers.sh` rather than vendored. **Adding a hard-coded struct offset, size, `_VER` word or enumerant to `src/interop/ffi/` means adding it to a probe** — an unfalsifiable layout comment is what turned one out-of-scope pitch measurement into a process kill. See `nvchk/README.md`.
+
 ### WGSL Shaders
 Compiled at startup via `ShaderRegistry::compile_all()`. Shaders live in `src/render/shader/*.wgsl` and are included at compile time (`include_str!`). Hot-reload supported per-shader.
 
@@ -80,9 +89,18 @@ Hardcoded dark theme in `NexirApp::new()`. No theme switching. Window size: 1280
 
 3. **`GpuDevice` is `!Send` on some backends** — always wrap in `Arc` for cross-thread sharing. The `surface_format` field uses `Mutex` for interior mutability.
 
-4. **Test GPU requirement**: Integration tests (`src/tests/`) create a headless wgpu device. They will fail in environments without a GPU/driver (most CI runners).
+4. **Test GPU requirement**: Integration tests (`src/tests/`) create a headless wgpu device. They will fail in environments without a GPU/driver (most CI runners). Tests needing **CUDA** as well (`tests::shared_buffer`, the NVENC half of `tests::export_validation`) must hold `tests::cuda_lock()` for their whole body: `CudaContext` wraps the device's *primary* context, so every instance in the process is one `CUcontext`, and `cuCtxPushCurrent` requires it to be floating. Without the lock they pass alone and fail in the suite, with a `left: 0x0` assertion or silently-zero readbacks.
 
 5. **Export pipeline**: The render graph is compiled per-frame from the current scheduler output. The `ExportEngine` reuses `FrameScheduler` and the same `RenderGraphCompiler` path as the preview pipeline.
+
+6. **Zero-copy NVENC input is NV12 in a shared buffer, and `pitch` is load-bearing.** `ExportBackend::GpuNvenc` runs `Nv12EncodeNode` (`src/interop/nv12_encode.rs`) to convert RGBA16Float → NV12 straight into the `SharedBuffer` NVENC reads, registered as `CUDADEVICEPTR` + `NV_ENC_BUFFER_FORMAT_NV12`. Three coupled invariants:
+   - **One pitch, one source.** `EncodeInterop::pitch()` (= `Nv12EncodeNode::aligned_pitch(width)`, 256-byte rounding) feeds `NV_ENC_REGISTER_RESOURCE::pitch`, every `NV_ENC_PIC_PARAMS::inputPitch`, *and* the shader's push constants. Never recompute it at a call site — the chroma plane sits at `pitch * height`, so a stride disagreement is a hue shift or a sheared frame, never an error return. `pitch = 0` on a two-plane NV12 registration **kills the process** inside `nvEncEncodePicture` (the old "the driver ignores pitch" note was measured on a packed single-plane ABGR10 array and does not generalise).
+   - **The shader owns the matrix, so the gate is about bit depth and range.** `ExportJob::nvenc_zero_copy_is_colour_safe` is `bit_depth <= 8 && effective_range() == Limited`. Matrix is irrelevant now that we convert; 10-bit (needs P010 + `profileGUID`/`pixelBitDepthMinus8`) and full range (needs `video_full_range_flag`) both live in NV_ENC_CONFIG's per-codec VUI union, which the FFI refuses to write, so they route to FFmpeg.
+   - **`Nv12EncodeNode`'s WGSL push-constant struct nests `RgbToYuv` and must include its trailing padding.** Dropping `_colour_pad` shifts `pitch`/`chroma_plane_offset` by 8 bytes; the shader then reads pitch 0 and every row overwrites row 0.
+
+7. **`nvenc_export_matches_pattern` is tagged BT.709 on purpose.** BT.601 is what the NVENC driver applies unprompted, so a BT.601 job cannot distinguish "our shader ran" from "the driver guessed right". Verified to have teeth: forcing `ColorInfo::bt601()` into `Nv12EncodeNode::new` fails the test with red decoding `[255, 24, 0]`. Run it with `NEXIR_REQUIRE_NVENC=1` so a missing-hardware skip becomes a failure.
+
+8. **`Abgr10RepackNode` is off the export path.** It survives only as the tree's one 10-bit packing (a future P010/HDR reuse) with its own passing test. If it stops earning that, delete it *and* `src/tests/abgr10_repack.rs` together rather than leaving a second unexercised encode path.
 
 ## Style Notes
 

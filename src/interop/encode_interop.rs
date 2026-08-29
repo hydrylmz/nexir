@@ -1,9 +1,42 @@
 // src/interop/encode_interop.rs
 // Replaces Phase 6's FrameReadback CPU round-trip with a direct NVENC encode path.
-// The RTT texture's CUDA array is registered with NVENC, and encoding is entirely GPU-side.
+// A shared D3D12 buffer holding NV12 is registered with NVENC as a CUdeviceptr,
+// and encoding is entirely GPU-side.
+//
+// P1.9 (step 3) — WHAT CHANGED AND WHY.  This used to hand NVENC packed RGB
+// (`Abgr10RepackNode` → NV_ENC_BUFFER_FORMAT_ABGR10 on a CUarray) and let the
+// DRIVER convert RGB→YUV.  The driver applies BT.601 and there is no supported
+// way to tell it otherwise: selecting the matrix means writing
+// NV_ENC_CONFIG's per-codec VUI union, i.e. guessed struct offsets.  Meanwhile
+// `Muxer::open` tags the stream from `job.output_color`, BT.709 for every normal
+// export — so samples and tags disagreed (red decoding as `[255, 25, 0]`) and
+// `ExportJob::nvenc_zero_copy_is_colour_safe` had to route every non-BT.601 job
+// away from zero-copy entirely.
+//
+// Now `Nv12EncodeNode` performs the conversion in our own shader, writing NV12
+// into a `SharedBuffer` that NVENC reads directly.  The encoder performs no
+// matrix conversion at all, so our tags are authoritative by construction and the
+// gate opens for every matrix.
+//
+// THE THREE MEASURED FACTS THIS FILE DEPENDS ON (RTX 3050, NVENC API 12.2,
+// headers n12.2.72.0; probes `nvchk/d3d12_buf_probe.c`, `nvchk/nv12_probe.c`):
+//
+//   * A D3D12 shared BUFFER imported via `cuExternalMemoryGetMappedBuffer` and
+//     registered as NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR with
+//     `bufferFormat = NV12` encodes and decodes to the right pixels.
+//   * The chroma plane is read at `pitch * height`, NOT `width * height`.
+//     Verified with pitch 320 on a 256-wide frame, with the inter-row padding
+//     filled 0xAA so a misread would have decoded as garbage.
+//   * `pitch` is NOT ignored for this resource type.  It was for the old packed
+//     single-plane ABGR10 CUarray — {0, W, W*4} all produced byte-identical
+//     bitstreams — and generalising that measurement to the two-plane case is
+//     what a `pitch = 0` NV12 registration turns into: a process kill inside
+//     `nvEncEncodePicture` with no error return.  Both `pitch` here and
+//     `NV_ENC_PIC_PARAMS::inputPitch` carry the real stride.
 
 use crate::interop::cuda_context::{CudaContext, CudaError};
-use crate::interop::external_texture::SharedTexture;
+use crate::interop::external_buffer::SharedBuffer;
+use crate::interop::nv12_encode::Nv12EncodeNode;
 use crate::interop::ffi::nvenc::*;
 use crate::interop::ffi::cuda_driver::{cuCtxPushCurrent, cuCtxPopCurrent, CUcontext};
 use crate::render::device::GpuDevice;
@@ -16,6 +49,20 @@ use std::sync::Arc;
 /// ABGR10 packs: packed = (a2 << 30) | (b10 << 20) | (g10 << 10) | r10
 /// where each 10-bit channel = round(clamp(f32, 0.0, 1.0) * 1023.0) as u32,
 /// and the 2-bit alpha is fixed at 0b11 (fully opaque).
+///
+/// **No longer on the export path.**  Handing NVENC packed RGB meant the DRIVER
+/// performed the RGB→YUV conversion, always with BT.601 and with no supported way
+/// to say otherwise, so every BT.709 job had to be routed away from zero-copy to
+/// avoid shipping a file whose samples and tags disagreed.  `Nv12EncodeNode`
+/// (`src/interop/nv12_encode.rs`) now does the conversion in our own shader and
+/// NVENC receives NV12, which is what let `nvenc_zero_copy_is_colour_safe` open
+/// up for every matrix.
+///
+/// Kept because it is still the only 10-bit-per-channel packing in the tree and
+/// `src/tests/abgr10_repack.rs` still proves its arithmetic — a future P010 HDR
+/// path is the obvious reuse.  It is NOT dead-code-allowed on a guess: if it ends
+/// up genuinely unused, delete it and its test together rather than leaving a
+/// second encode path that nothing exercises.
 pub struct Abgr10RepackNode {
     pub in_rgba:       crate::render::resource::ResourceId,
     pub out_abgr10:    crate::render::resource::ResourceId,
@@ -253,12 +300,12 @@ pub const NVENC_INFLIGHT_SLOTS: usize = 4;
 /// One pipeline slot: everything one in-flight frame needs, owned per-slot so
 /// two frames never share a resource.
 struct EncodeSlot {
-    /// Shared allocation: the ABGR10 texture (R32Uint packed, written by
-    /// `Abgr10RepackNode`) together with its CUDA import.  A single
+    /// Shared allocation: the NV12 buffer (written by `Nv12EncodeNode`'s two
+    /// compute passes) together with its CUDA import.  A single
     /// `D3D12_HEAP_FLAG_SHARED` resource seen from both sides — see
-    /// [`SharedTexture`].
-    shared:     SharedTexture,
-    /// NVENC registered resource handle for `shared`'s CUDA array.
+    /// [`SharedBuffer`].
+    shared:     SharedBuffer,
+    /// NVENC registered resource handle for `shared`'s CUDA device pointer.
     registered: *mut std::ffi::c_void,
     /// Pre-allocated bitstream output buffer for this slot.
     bitstream:  *mut std::ffi::c_void,
@@ -267,7 +314,7 @@ struct EncodeSlot {
 }
 
 /// Holds the NVENC session and its [`NVENC_INFLIGHT_SLOTS`] interop-imported
-/// ABGR10 textures.
+/// NV12 buffers.
 pub struct EncodeInterop {
     session:               NvEncodeSession,
     /// The pipeline slots, indexed by the `slot` argument of
@@ -276,6 +323,12 @@ pub struct EncodeInterop {
     funcs:                 NvencFunctions,
     width:                 u32,
     height:                u32,
+    /// Row stride of both NV12 planes, in bytes: what the shader was told to
+    /// write, what the registration declared, and what every
+    /// `NV_ENC_PIC_PARAMS::inputPitch` carries.  One field so the three can never
+    /// disagree — a chroma plane written at one stride and read at another is the
+    /// failure mode this whole step exists to avoid.
+    pitch:                 u32,
     /// The NVENC API major version we probed successfully; used to construct
     /// per-struct version fields for encode-time calls.
     api_version:           u32,
@@ -325,8 +378,8 @@ pub struct EncodeInterop {
     poisoned:              bool,
     // -----------------------------------------------------------------------
     // KEEP THIS FIELD LAST.  Rust drops struct fields in declaration order, and
-    // everything above it — the NVENC session and both `SharedTexture`s with
-    // their CUDA imports — is only valid while this context lives.
+    // everything above it — the NVENC session and every `SharedBuffer` with its
+    // CUDA import — is only valid while this context lives.
     // -----------------------------------------------------------------------
     /// A share of the CUDA primary context this session was opened against.
     ///
@@ -343,9 +396,9 @@ pub struct EncodeInterop {
     ///    primary context makes even `nvEncOpenEncodeSessionEx` fail with
     ///    NV_ENC_ERR_UNSUPPORTED_DEVICE (2).
     /// 2. **Drop order.**  Declared second (right after `session`) it dropped
-    ///    *before* the `SharedTexture`s, so `cuMipmappedArrayDestroy` /
+    ///    *before* the shared allocations, so `cuMemFree` /
     ///    `cuDestroyExternalMemory` ran against a dead context and the crash
-    ///    simply moved from frame 0 to end-of-teardown.  `ExternalTexture` now
+    ///    simply moved from frame 0 to end-of-teardown.  `ExternalBuffer` now
     ///    holds its own `Arc` as well, so correctness no longer *depends* on this
     ///    position — but keeping it last is still the honest expression of the
     ///    invariant, and costs nothing.
@@ -430,11 +483,11 @@ const NV_ENC_CODEC_HEVC_GUID: [u8; 16] = [
 // as the fallback when P4 is rejected.
 
 impl EncodeInterop {
-    /// Open an NVENC session against the shared CUDA context and register the
-    /// ABGR10 interop texture as NVENC's input resource.
+    /// Open an NVENC session against the shared CUDA context and register one
+    /// NV12 interop buffer per pipeline slot as NVENC's input resource.
     ///
     /// `codec` controls whether to initialise an H.264 or HEVC session;
-    /// both codecs use the same ABGR10 input format and P4 preset.
+    /// both codecs use the same NV12 input format and P4 preset.
     ///
     /// Takes the context by `Arc` and keeps a clone: the NVENC session is only
     /// valid while the CUDA primary context it was opened against is alive (see
@@ -885,40 +938,46 @@ impl EncodeInterop {
             )
         };
 
-        // Step 4 — Allocate the pipeline's ABGR10 interop textures (R32Uint packed),
-        // register each imported CUarray with NVENC, and give each slot its own
-        // bitstream buffer.
+        // Step 4 — Allocate the pipeline's NV12 interop buffers, register each
+        // imported CUdeviceptr with NVENC, and give each slot its own bitstream
+        // buffer.
         //
-        // These are NOT plain `device.create_texture` allocations: CUDA can only
+        // These are NOT plain `device.create_buffer` allocations: CUDA can only
         // import memory that was allocated with export-compatible flags, so
-        // `SharedTexture::new` creates the D3D12 resource itself with
-        // `D3D12_HEAP_FLAG_SHARED` and then hands it to wgpu.  The old code path
-        // created an ordinary wgpu texture and tried to export it afterwards,
-        // which is impossible and failed at `cuImportExternalMemory` with
-        // "invalid argument".
+        // `SharedBuffer::new` creates the D3D12 resource itself with
+        // `D3D12_HEAP_FLAG_SHARED` and then hands it to wgpu.  Substituting a
+        // plain `create_buffer` here fails `cuImportExternalMemory` outright — and
+        // when the test suite forced exactly that substitution, five tests failed
+        // including the NV12 readback reading back the 0xAA pre-fill.
         //
-        // `NvEncRegisterResource::pitch` is left at 0 deliberately.  For
-        // NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY the driver derives the stride from
-        // the CUDA array descriptor and ignores this field: P1.5 registered the
-        // same imported D3D12 R32Uint array with pitch ∈ {0, width, width*4} and
-        // all three registrations succeeded and encoded byte-identical
-        // bitstreams (standalone C probe against the vendor header, RTX 3050,
-        // driver API 12.2).
+        // `NvEncRegisterResource::pitch` CARRIES THE REAL STRIDE and must not be
+        // 0.  The earlier note here said the driver ignores this field, which was
+        // measured on the packed single-plane ABGR10 CUarray this path used to
+        // register: pitch ∈ {0, width, width*4} all encoded byte-identical
+        // bitstreams.  That result does NOT generalise to a two-plane NV12
+        // resource — with `pitch = 0` a standalone probe had
+        // `nvEncEncodePicture` kill the process outright, no error return
+        // (`nvchk/nv12_probe.c` rung B0).  For CUDADEVICEPTR the header documents
+        // pitch as the row stride in bytes, "must be a multiple of 4", and the
+        // chroma plane is then read at `pitch * height`.
         //
-        // NOTE: that result covers THIS struct only.  NV_ENC_PIC_PARAMS::inputPitch
-        // is a separate field with its own documented meaning (row stride in
-        // bytes) — see `encode_frame`, which passes width*4 there.  The two were
-        // conflated in an earlier note.
-        const ABGR10_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::STORAGE_BINDING
-            .union(wgpu::TextureUsages::COPY_SRC);
+        // `NV_ENC_PIC_PARAMS::inputPitch` is a separate field carrying the same
+        // number — see `encode_frame`.  Both come from `self.pitch` so they cannot
+        // drift apart.
+        let pitch = Nv12EncodeNode::aligned_pitch(job.width);
+        let nv12_size = Nv12EncodeNode::buffer_size(job.height, pitch);
 
-        // Labels are `&'static str` in SharedTexture::new, so they cannot be
+        // STORAGE only: the compute passes write it and NVENC reads it through
+        // CUDA.  Nothing copies it, which is the entire point.
+        const NV12_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE;
+
+        // Labels are `&'static str` in SharedBuffer::new, so they cannot be
         // formatted per slot; a fixed table keeps the per-slot naming.
         const SLOT_LABELS: [&str; NVENC_INFLIGHT_SLOTS] = [
-            "EncodeInterop ABGR10 slot-0",
-            "EncodeInterop ABGR10 slot-1",
-            "EncodeInterop ABGR10 slot-2",
-            "EncodeInterop ABGR10 slot-3",
+            "EncodeInterop NV12 slot-0",
+            "EncodeInterop NV12 slot-1",
+            "EncodeInterop NV12 slot-2",
+            "EncodeInterop NV12 slot-3",
         ];
 
         let register_resource_ver = nv_enc_register_resource_ver(probed_api_version);
@@ -926,19 +985,24 @@ impl EncodeInterop {
 
         let mut slots: Vec<EncodeSlot> = Vec::with_capacity(NVENC_INFLIGHT_SLOTS);
 
+        log::info!(
+            "[export] NVENC NV12 zero-copy input: {}x{}, pitch {} bytes, \
+             {} bytes/slot, chroma plane at {} (pitch * height)",
+            job.width, job.height, pitch, nv12_size, pitch * job.height
+        );
+
         // Any failure part-way through must not leak the bitstream buffers and
         // registered resources already handed out; destroying the encoder does
         // reclaim them, so unwinding is just "destroy what we built, then the
-        // session".  `slots` drops its SharedTextures on the way out.
+        // session".  `slots` drops its SharedBuffers on the way out.
         for slot_idx in 0..NVENC_INFLIGHT_SLOTS {
-            let shared = match SharedTexture::new(
+            let shared = match SharedBuffer::new(
                 Arc::clone(&cuda_ctx_arc), device, transport,
                 SLOT_LABELS[slot_idx],
-                job.width, job.height,
-                wgpu::TextureFormat::R32Uint,
-                ABGR10_USAGE,
+                nv12_size,
+                NV12_USAGE,
             ) {
-                Ok(t) => t,
+                Ok(b) => b,
                 Err(e) => {
                     drop(slots);
                     unsafe { (funcs.destroy_encoder)(session) };
@@ -948,21 +1012,25 @@ impl EncodeInterop {
 
             let mut register = NvEncRegisterResource {
                 version:              register_resource_ver,
-                resource_type:        NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
+                resource_type:        NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
                 width:                job.width,
                 height:               job.height,
-                pitch:                0,
-                resource_to_register: shared.external.cuda_array() as *mut _,
+                pitch,
+                // A CUdeviceptr is a 64-bit handle, not a pointer to a pointer:
+                // NVENC wants the VALUE in `resourceToRegister`, which is what
+                // the C probe passed as `(void *)(uintptr_t)dptr`.
+                resource_to_register: shared.external.device_ptr() as *mut _,
                 registered_resource:  std::ptr::null_mut(),
-                buffer_format:        NV_ENC_BUFFER_FORMAT_ABGR10,
-                buffer_usage:         0,
+                buffer_format:        NV_ENC_BUFFER_FORMAT_NV12,
+                buffer_usage:         NV_ENC_BUFFER_USAGE_INPUT_IMAGE,
                 p_input_fence_point:  std::ptr::null_mut(),
                 ..Default::default()
             };
             let ret = unsafe { (funcs.register_resource)(session, &mut register) };
             if ret != NV_ENC_SUCCESS {
                 log::error!(
-                    "[export] nvEncRegisterResource failed for slot {slot_idx}: {} ({ret})",
+                    "[export] nvEncRegisterResource(CUDADEVICEPTR, NV12, pitch={pitch}) \
+                     failed for slot {slot_idx}: {} ({ret})",
                     nvenc_status_str(ret)
                 );
                 drop(shared);
@@ -1001,6 +1069,7 @@ impl EncodeInterop {
             funcs,
             width: job.width,
             height: job.height,
+            pitch,
             api_version: probed_api_version,
             eos_event: events[NVENC_INFLIGHT_SLOTS],
             is_async,
@@ -1021,9 +1090,22 @@ impl EncodeInterop {
         self.slots.len()
     }
 
-    /// Return the ABGR10 wgpu texture for the given pipeline slot.
-    pub fn abgr10_texture_for_slot(&self, slot: usize) -> &wgpu::Texture {
-        &self.slots[slot % self.slots.len()].shared.texture
+    /// Return the NV12 wgpu buffer for the given pipeline slot.
+    ///
+    /// This is the buffer `Nv12EncodeNode::record` must be given as its
+    /// destination, at [`Self::pitch`].
+    pub fn nv12_buffer_for_slot(&self, slot: usize) -> &wgpu::Buffer {
+        &self.slots[slot % self.slots.len()].shared.buffer
+    }
+
+    /// Row stride, in bytes, of both NV12 planes in every slot's buffer.
+    ///
+    /// The caller MUST pass this to `Nv12EncodeNode::record`.  Writing at a
+    /// different stride than the registration declared puts the chroma plane
+    /// somewhere NVENC does not read it, and the failure is a hue shift or a
+    /// sheared image, not an error.
+    pub fn pitch(&self) -> u32 {
+        self.pitch
     }
 
     /// Return the NVENC registered resource handle for the given pipeline slot.
@@ -1240,10 +1322,11 @@ impl EncodeInterop {
 
     /// Submit one frame to NVENC **without waiting for it to finish**.
     ///
-    /// The ABGR10 texture for `slot` must already have been written by
-    /// `Abgr10RepackNode` and its GPU submission must have completed (the caller
-    /// does `poll(WaitForSubmissionIndex)` first), and the slot must have been
-    /// freed with [`Self::reclaim_slot`] before that GPU work was recorded.
+    /// The NV12 buffer for `slot` must already have been written by
+    /// `Nv12EncodeNode` at [`Self::pitch`] and its GPU submission must have
+    /// completed (the caller does `poll(WaitForSubmissionIndex)` first), and the
+    /// slot must have been freed with [`Self::reclaim_slot`] before that GPU work
+    /// was recorded.
     ///
     /// P1.1: this returns as soon as the driver has accepted the picture.  Any
     /// packets it hands back are ones that became available on the way — either
@@ -1290,7 +1373,7 @@ impl EncodeInterop {
             input_resource:      std::ptr::null_mut(),
             registered_resource: self.registered_resource_for_slot(slot),
             mapped_resource:     std::ptr::null_mut(),
-            mapped_buffer_fmt:   NV_ENC_BUFFER_FORMAT_ABGR10,
+            mapped_buffer_fmt:   NV_ENC_BUFFER_FORMAT_NV12,
             reserved1:           [0u32; 251],
             reserved2:           [std::ptr::null_mut(); 63],
         };
@@ -1319,22 +1402,19 @@ impl EncodeInterop {
         } else {
             std::ptr::null_mut()
         };
-        // `input_pitch` is the input buffer's row stride in BYTES, which for the
-        // ABGR10 packing (one 32-bit word per pixel) is `width * 4`.  The header
-        // adds "if pitch value is not known, set this to inputWidth", which is
-        // what this used to pass.
+        // `input_pitch` is the input buffer's row stride in BYTES.  It carries the
+        // same number as the registration's `pitch` — see `open`, and note that
+        // the header's "if pitch value is not known, set this to inputWidth"
+        // escape hatch is NOT usable here: for a two-plane NV12 layout the stride
+        // is what places the chroma plane, and getting it wrong is silent bad
+        // colour rather than an error.
         //
-        // P1.5 measured which of the two the driver actually uses for
-        // NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY: neither.  A standalone C probe
-        // against the vendor header submitted the same imported D3D12 R32Uint
-        // array with inputPitch ∈ {width, width*4, 0} and every one produced a
-        // byte-identical 107-byte bitstream, because for a CUarray input the
-        // driver reads the stride from the array descriptor.  `width * 4` is
-        // passed anyway: it is the documented meaning of the field, so it is the
-        // value that stays correct if a future path feeds NVENC a pitched device
-        // pointer instead of an array.
-        const ABGR10_BYTES_PER_PX: u32 = 4;
-        let input_pitch = self.width * ABGR10_BYTES_PER_PX;
+        // P1.5 measured that for the OLD packed ABGR10 CUarray input the driver
+        // ignored this field entirely — inputPitch ∈ {width, width*4, 0} all
+        // produced byte-identical bitstreams, because a CUarray carries its own
+        // descriptor.  That measurement does not transfer to a CUdeviceptr NV12
+        // input, which is why this is `self.pitch` and not a guess.
+        let input_pitch = self.pitch;
         let mut pic_params = NvEncPicParams {
             version:          pic_ver,
             input_width:      self.width,
@@ -1347,7 +1427,7 @@ impl EncodeInterop {
             input_buffer:     mapped_buffer,
             output_bitstream: bitstream_buffer,
             completion_event,
-            buffer_fmt:       NV_ENC_BUFFER_FORMAT_ABGR10,
+            buffer_fmt:       NV_ENC_BUFFER_FORMAT_NV12,
             picture_struct:   NV_ENC_PIC_STRUCT_FRAME,
             picture_type:     0,
             ..Default::default()

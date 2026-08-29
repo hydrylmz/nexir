@@ -7,7 +7,7 @@ use crate::export::progress::{ExportPhase, ProgressSender};
 use crate::export::queue::{EncoderQueue, QueueItem};
 use crate::export::readback::FrameReadback;
 use crate::export::video_encoder::VideoEncoderBackend;
-use crate::interop::encode_interop::Abgr10RepackNode;
+use crate::interop::nv12_encode::Nv12EncodeNode;
 use crate::render::compute::ComputePipelineCache;
 use crate::render::device::GpuDevice;
 use crate::render::frame_state::FrameState;
@@ -38,7 +38,13 @@ pub enum ExportBackend {
     GpuNvenc {
         video_enc: VideoEncoderBackend,
         muxer: Arc<Muxer>,
-        repack: Abgr10RepackNode,
+        /// RGB → NV12 conversion, writing straight into the NVENC input buffer.
+        ///
+        /// Replaced `Abgr10RepackNode` in P1.9 step 3: converting here rather than
+        /// handing NVENC packed RGB is what removes the driver's BT.601-only
+        /// RGB→YUV step, and therefore what lets a BT.709 job use zero-copy at all
+        /// (see `ExportJob::nvenc_zero_copy_is_colour_safe`).
+        nv12: Nv12EncodeNode,
     },
 }
 
@@ -906,18 +912,19 @@ impl ExportRenderer {
 
                 let mut encoder = self.device.begin_frame();
                 let rtt_id    = ResourceId::FINAL_COLOR;
-                let width     = self.job.width;
-                let height    = self.job.height;
                 let device_ref = &self.device;
 
                 let graph = self.cached_graph.as_mut().unwrap();
 
-                if let ExportBackend::GpuNvenc { video_enc, repack, .. } = &mut self.backend {
+                if let ExportBackend::GpuNvenc { video_enc, nv12, .. } = &mut self.backend {
                     let interop = video_enc.nvenc_interop()
                         .expect("nvenc_interop: invariant — GpuNvenc arm");
-                    let abgr10_texture = interop.abgr10_texture_for_slot(slot);
-                    let abgr10_view =
-                        abgr10_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    // The pitch comes from the encoder, not from a second
+                    // computation here: the shader must write at exactly the
+                    // stride the NVENC registration declared, or the chroma plane
+                    // lands where the driver does not read it.
+                    let pitch = interop.pitch();
+                    let nv12_buffer = interop.nv12_buffer_for_slot(slot);
 
                     graph.execute_with_callback(
                         &mut encoder,
@@ -928,7 +935,7 @@ impl ExportRenderer {
                                 let in_view = ctx.get(rtt_id).texture.create_view(
                                     &wgpu::TextureViewDescriptor::default(),
                                 );
-                                repack.record(enc, device_ref, &in_view, &abgr10_view, width, height);
+                                nv12.record(enc, device_ref, &in_view, nv12_buffer, pitch);
                             } else {
                                 log::error!(
                                     "[export] frame {frame_idx}: FINAL_COLOR missing from RenderContext!"

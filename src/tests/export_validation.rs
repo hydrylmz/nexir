@@ -476,11 +476,19 @@ mod export_validation {
         .clone()
     }
 
-    /// Serialises the exports.  Two concurrent NVENC sessions plus two headless
-    /// wgpu devices on one GPU is a resource fight, not a test.
+    /// Serialises the exports against each other AND against every other test
+    /// that makes the CUDA context current.
+    ///
+    /// Two concurrent NVENC sessions plus two headless wgpu devices on one GPU is
+    /// a resource fight, not a test — and beyond that, `CudaContext::with_context`
+    /// pushes the shared primary context, which the driver only allows one thread
+    /// at a time.  Delegates to `super::cuda_lock` so this module and
+    /// `tests::shared_buffer` share ONE lock; a second private mutex here would
+    /// serialise these tests against each other while still racing that module.
     fn export_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        // `super` here is `tests::export_validation` (the file), not `tests` — the
+        // tests in this tree live one module deeper than the file they are in.
+        crate::tests::cuda_lock()
     }
 
     /// Run an export to completion and return the terminal phase.
@@ -842,13 +850,25 @@ mod export_validation {
     /// Set `NEXIR_REQUIRE_NVENC=1` to turn the remaining skip into a failure too
     /// (for CI on a machine that is supposed to have the hardware).
     ///
-    /// The job is tagged BT.601 on purpose. The zero-copy path hands NVENC RGB and
-    /// the driver converts it with BT.601, so `ExportJob::nvenc_zero_copy_is_colour_safe`
-    /// only lets a BT.601 job through — a BT.709 job is routed to the FFmpeg
-    /// encoder precisely so its samples cannot disagree with its tags. Asking for
-    /// BT.601 here is therefore what makes this test exercise the zero-copy path at
-    /// all, and `assert_container_color` plus the pixel checks then verify the
-    /// driver's own conversion against the matrix the file declares.
+    /// ## The job is BT.709, and that is the assertion
+    ///
+    /// This test used to tag the job **BT.601** — not as a colour preference but
+    /// because it had no choice: the zero-copy path handed NVENC packed RGB, the
+    /// driver converted it with BT.601, and
+    /// `ExportJob::nvenc_zero_copy_is_colour_safe` therefore routed every
+    /// non-BT.601 job to the FFmpeg encoder. A BT.601 job was the only one that
+    /// reached the GPU encoder at all.
+    ///
+    /// Since P1.9 step 3 `Nv12EncodeNode` performs the conversion in our own
+    /// shader, so BT.709 is both allowed and the interesting case — it is the
+    /// **negative control for the whole step**. BT.601 would have passed either
+    /// way: it is what the driver does unprompted, so a green BT.601 test cannot
+    /// distinguish "our shader applied the requested matrix" from "the driver
+    /// guessed and the guess happened to match". BT.709 can only pass if our
+    /// shader ran. If this code regressed to letting the driver convert, red
+    /// (which the stream now declares BT.709) would decode as `[255, 24, 0]`
+    /// instead of `[255, 0, 0]` — a delta of 24, outside `TOLERANCE`, so
+    /// `assert_frame_matches_pattern` fails with the patch named.
     #[test]
     fn nvenc_export_matches_pattern() {
         init_logging();
@@ -862,14 +882,20 @@ mod export_validation {
 
         let duration_pts = 10 * (TB.den / FPS.num);
         let harness = build_harness(&png, duration_pts);
-        let mut job = make_job(mp4.clone(), duration_pts);
-        job.output_color = crate::timeline::source::ColorInfo::bt601();
+        // BT.709 limited, 8-bit — `make_job`'s default, and deliberately the
+        // matrix the driver would NOT have applied on its own.
+        let job = make_job(mp4.clone(), duration_pts);
+        assert_eq!(
+            job.output_color.matrix,
+            crate::timeline::source::MatrixCoefficients::Bt709,
+            "this test's whole point is a matrix the NVENC driver would not pick \
+             for itself; a BT.601 job here would prove nothing"
+        );
         assert!(
             job.nvenc_zero_copy_is_colour_safe(),
             "this test only means something if the job is eligible for the \
              zero-copy path"
         );
-        let job = job;
 
         let require_nvenc = std::env::var("NEXIR_REQUIRE_NVENC")
             .map(|v| v != "0" && !v.is_empty())

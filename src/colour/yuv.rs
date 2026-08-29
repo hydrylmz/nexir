@@ -194,6 +194,164 @@ impl YuvConversion {
     }
 }
 
+/// The RGB→YUV direction, for the encode path.
+///
+/// P1.9 — this exists so the zero-copy NVENC export can hand the encoder NV12
+/// that *we* converted, instead of packed RGB that the DRIVER converts. The
+/// driver applies BT.601 with no way to tell it otherwise (writing
+/// NV_ENC_CONFIG's per-codec VUI union means guessed offsets), so a BT.709 job
+/// taking that path produced a file whose samples and tags disagreed — red
+/// decoding as `[255, 25, 0]`. `ExportJob::nvenc_zero_copy_is_colour_safe`
+/// currently routes every non-BT.601 job away from zero-copy for that reason.
+/// Once the conversion happens here, our tags are authoritative by construction
+/// and the gate can open for every matrix.
+///
+/// This is the exact inverse of [`YuvConversion`], and deliberately shares its
+/// `(Kr, Kb)` derivation via [`luma_coefficients`] rather than transcribing a
+/// second set of matrices: two independently-written matrices are two things to
+/// keep in step, and the round-trip test below only means something if the pair
+/// is a true inverse.
+///
+/// Layout matches `struct RgbToYuvParams` in the NV12 encode shader — 80 bytes,
+/// same as `YuvConversion`, with the matrix stored as three padded `vec4`s
+/// because WGSL aligns `vec3<f32>` to 16 bytes inside a struct.
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct RgbToYuv {
+    /// Row 0 of the RGB→YCbCr matrix: `[Kr, Kg, Kb, pad]`, producing Y.
+    pub row_y:  [f32; 4],
+    /// Row 1: produces Cb, centred on zero.
+    pub row_cb: [f32; 4],
+    /// Row 2: produces Cr, centred on zero.
+    pub row_cr: [f32; 4],
+    /// Multiplies Y before `luma_offset` is added
+    /// (`219 << (n-8) / max` limited, 1.0 full).
+    pub luma_scale:    f32,
+    /// Added to the scaled luma (`16 << (n-8) / max` limited, 0 full).
+    pub luma_offset:   f32,
+    /// Multiplies each zero-centred chroma value
+    /// (`224 << (n-8) / max` limited, 1.0 full).
+    pub chroma_scale:  f32,
+    /// Added to scaled chroma to move it off zero (`128 << (n-8) / max`).
+    pub chroma_offset: f32,
+    pub width:  u32,
+    pub height: u32,
+    pub _pad:   [u32; 2],
+}
+
+/// Same 80 bytes as [`YuvConversion`], and for the same reasons: a multiple of
+/// 16 for WGSL's vec4 alignment, and inside the 128-byte push-constant limit the
+/// device is created with.
+const _: () = assert!(std::mem::size_of::<RgbToYuv>() == 80);
+
+impl RgbToYuv {
+    /// Build the forward conversion for an output colour description.
+    ///
+    /// `width`/`height` size the shader's bounds check and feed `ColorInfo`'s
+    /// resolution heuristics, exactly as in [`YuvConversion::new`].
+    ///
+    /// Unlike the decode direction there is no `is_semi_planar` argument: this
+    /// produces normalised samples in `[0, 1]`, and how they are packed into
+    /// bytes (NV12) or MSB-aligned 16-bit words (P010) is the caller's business.
+    pub fn new(color: ColorInfo, width: u32, height: u32) -> Self {
+        let (kr, kb) = luma_coefficients(color.effective_matrix(width, height));
+        let kg = 1.0 - kr - kb;
+        // Same degenerate-coefficient guard as the inverse; unreachable from the
+        // published table, cheap insurance against a future bad entry.
+        let kg = if kg.abs() < 1e-6 { 1.0 } else { kg };
+
+        // Cb = (B - Y) / (2(1-Kb)),  Cr = (R - Y) / (2(1-Kr)), expanded so each
+        // is one dot product against RGB.
+        let cb_den = 2.0 * (1.0 - kb);
+        let cr_den = 2.0 * (1.0 - kr);
+
+        let depth = if color.bit_depth == 0 { 8 } else { color.bit_depth } as u32;
+        let max_code = ((1u32 << depth) - 1) as f32;
+        let scale_to_depth = (1u32 << (depth - 8)) as f32;
+
+        // Exact inverse of YuvConversion's (offset, scale) pair: it computes
+        // `(sample - offset) * scale`, so this computes `value / scale + offset`.
+        let (luma_scale, luma_offset, chroma_scale, chroma_offset) =
+            match color.effective_range() {
+                ColorRange::Full => (
+                    1.0,
+                    0.0,
+                    1.0,
+                    (128.0 * scale_to_depth) / max_code,
+                ),
+                ColorRange::Limited | ColorRange::Unknown => (
+                    (219.0 * scale_to_depth) / max_code,
+                    (16.0 * scale_to_depth) / max_code,
+                    (224.0 * scale_to_depth) / max_code,
+                    (128.0 * scale_to_depth) / max_code,
+                ),
+            };
+
+        Self {
+            row_y:  [kr, kg, kb, 0.0],
+            row_cb: [-kr / cb_den, -kg / cb_den, (1.0 - kb) / cb_den, 0.0],
+            row_cr: [(1.0 - kr) / cr_den, -kg / cr_den, -kb / cr_den, 0.0],
+            luma_scale,
+            luma_offset,
+            chroma_scale,
+            chroma_offset,
+            width,
+            height,
+            _pad: [0; 2],
+        }
+    }
+
+    /// Apply this conversion on the CPU, exactly as the shader does.
+    ///
+    /// Input is non-linear R'G'B' as the render graph produces it; output is
+    /// `[y, cb, cr]` as normalised samples in `[0, 1]`, i.e. `code / max_code`.
+    ///
+    /// **RGB is clamped to `[0, 1]` before the matrix, not after.**  That ordering
+    /// is deliberate and matters twice over:
+    ///
+    ///  * Clamping Y/Cb/Cr independently afterwards would move the result off the
+    ///    gamut boundary and **shift the hue** — the three components are not
+    ///    independent, so saturating one without the others is a colour error, not
+    ///    a clip.  Clamping the input keeps an out-of-range colour on the boundary
+    ///    it was heading for.
+    ///  * With the input in `[0, 1]`, limited-range output lands inside
+    ///    16…235 `<< (n-8)` **by construction**, so no legal-range enforcement is
+    ///    needed on the way out and super-white cannot occupy the reserved codes.
+    ///
+    /// It also matches what `ABGR10_REPACK_WGSL` already does with its input, so
+    /// both encode shaders treat out-of-range values the same way.
+    ///
+    /// Tone mapping runs earlier in the graph, so in practice the clamp is a
+    /// no-op; it is here so an HDR value that slipped through degrades to a
+    /// saturated colour rather than a wrapped byte.
+    pub fn apply(&self, r: f32, g: f32, b: f32) -> [f32; 3] {
+        let r = r.clamp(0.0, 1.0);
+        let g = g.clamp(0.0, 1.0);
+        let b = b.clamp(0.0, 1.0);
+
+        let y  = self.row_y[0]  * r + self.row_y[1]  * g + self.row_y[2]  * b;
+        let cb = self.row_cb[0] * r + self.row_cb[1] * g + self.row_cb[2] * b;
+        let cr = self.row_cr[0] * r + self.row_cr[1] * g + self.row_cr[2] * b;
+
+        [
+            y  * self.luma_scale   + self.luma_offset,
+            cb * self.chroma_scale + self.chroma_offset,
+            cr * self.chroma_scale + self.chroma_offset,
+        ]
+    }
+
+    /// [`Self::apply`] quantised to 8-bit codes, which is what an NV12 plane
+    /// holds.  Rounds half-up, matching the shader's `+ 0.5` truncation.
+    pub fn apply_u8(&self, r: f32, g: f32, b: f32) -> [u8; 3] {
+        let s = self.apply(r, g, b);
+        [
+            (s[0] * 255.0 + 0.5) as u8,
+            (s[1] * 255.0 + 0.5) as u8,
+            (s[2] * 255.0 + 0.5) as u8,
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +646,267 @@ mod tests {
         );
         assert_eq!(c.sample_scale, 1.0);
         assert_rgb(c.apply(s8(235), s8(128), s8(128)), [1.0; 3], 1e-3, "depth 0 white");
+    }
+
+    // ── RGB → YUV (the encode direction) ─────────────────────────────────────
+
+    /// The published BT.709 forward coefficients, from ITU-R BT.709-6 §3.2:
+    ///
+    ///     Y  = 0.2126 R + 0.7152 G + 0.0722 B
+    ///     Cb = (B - Y) / 1.8556
+    ///     Cr = (R - Y) / 1.5748
+    ///
+    /// Written out as literals rather than derived, so this disagrees with
+    /// `RgbToYuv` if the derivation is wrong.
+    #[test]
+    fn forward_matrix_matches_the_published_bt709_coefficients() {
+        let c = RgbToYuv::new(
+            info(MatrixCoefficients::Bt709, ColorRange::Full, 8), HD_W, HD_H,
+        );
+
+        assert!((c.row_y[0] - 0.2126).abs() < 1e-4, "Kr: {}", c.row_y[0]);
+        assert!((c.row_y[1] - 0.7152).abs() < 1e-4, "Kg: {}", c.row_y[1]);
+        assert!((c.row_y[2] - 0.0722).abs() < 1e-4, "Kb: {}", c.row_y[2]);
+
+        // Cb row: [-Kr/1.8556, -Kg/1.8556, (1-Kb)/1.8556]
+        assert!((c.row_cb[0] + 0.114572).abs() < 1e-4, "R→Cb: {}", c.row_cb[0]);
+        assert!((c.row_cb[1] + 0.385428).abs() < 1e-4, "G→Cb: {}", c.row_cb[1]);
+        assert!((c.row_cb[2] - 0.5).abs()      < 1e-4, "B→Cb: {}", c.row_cb[2]);
+
+        // Cr row: [(1-Kr)/1.5748, -Kg/1.5748, -Kb/1.5748]
+        assert!((c.row_cr[0] - 0.5).abs()      < 1e-4, "R→Cr: {}", c.row_cr[0]);
+        assert!((c.row_cr[1] + 0.454153).abs() < 1e-4, "G→Cr: {}", c.row_cr[1]);
+        assert!((c.row_cr[2] + 0.045847).abs() < 1e-4, "B→Cr: {}", c.row_cr[2]);
+    }
+
+    /// Hardcoded 8-bit BT.709 limited-range codes for the primaries.
+    ///
+    /// These are NOT derived from anything in this module: they are the values a
+    /// standalone C probe computed and fed to NVENC, whose output decoded back to
+    /// exactly them (`nvchk/nv12_probe.c`, verified against the decoded NV12).
+    /// So they cross-check this code against a separate implementation *and*
+    /// against what the hardware agreed the pattern was.
+    #[test]
+    fn primaries_quantise_to_the_known_8bit_bt709_limited_codes() {
+        let c = RgbToYuv::new(
+            info(MatrixCoefficients::Bt709, ColorRange::Limited, 8), HD_W, HD_H,
+        );
+
+        // (label, rgb, expected Y/U/V)
+        let cases: [(&str, [f32; 3], [u8; 3]); 4] = [
+            ("red",   [1.0, 0.0, 0.0], [63,  102, 240]),
+            ("green", [0.0, 1.0, 0.0], [173, 42,  26]),
+            ("blue",  [0.0, 0.0, 1.0], [32,  240, 118]),
+            ("white", [1.0, 1.0, 1.0], [235, 128, 128]),
+        ];
+
+        for (label, rgb, want) in cases {
+            let got = c.apply_u8(rgb[0], rgb[1], rgb[2]);
+            assert_eq!(
+                got, want,
+                "{label}: RGB{rgb:?} encoded to Y/U/V {got:?}, expected {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn limited_range_maps_black_and_white_to_16_and_235() {
+        let c = RgbToYuv::new(
+            info(MatrixCoefficients::Bt709, ColorRange::Limited, 8), HD_W, HD_H,
+        );
+        assert_eq!(c.apply_u8(0.0, 0.0, 0.0)[0], 16,  "limited black luma");
+        assert_eq!(c.apply_u8(1.0, 1.0, 1.0)[0], 235, "limited white luma");
+        // Neutral input must land exactly on the chroma midpoint.
+        assert_eq!(c.apply_u8(0.5, 0.5, 0.5)[1], 128, "grey Cb");
+        assert_eq!(c.apply_u8(0.5, 0.5, 0.5)[2], 128, "grey Cr");
+    }
+
+    #[test]
+    fn full_range_maps_black_and_white_to_0_and_255() {
+        let c = RgbToYuv::new(
+            info(MatrixCoefficients::Bt709, ColorRange::Full, 8), HD_W, HD_H,
+        );
+        assert_eq!(c.apply_u8(0.0, 0.0, 0.0)[0], 0,   "full black luma");
+        assert_eq!(c.apply_u8(1.0, 1.0, 1.0)[0], 255, "full white luma");
+    }
+
+    /// The assertion that makes the pair trustworthy: encoding then decoding must
+    /// return the original RGB, for every matrix, both ranges, and depths 8/10/12.
+    ///
+    /// A transposed row, a swapped Cb/Cr column, or a range formula that is not a
+    /// true inverse all survive the individual checks above for at least one
+    /// case; none of them survive this.
+    #[test]
+    fn rgb_to_yuv_round_trips_through_yuv_to_rgb() {
+        let colours: [[f32; 3]; 9] = [
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.5, 0.5, 0.5],
+            [0.25, 0.75, 0.5],
+            [0.9, 0.1, 0.35],
+            [0.05, 0.6, 0.95],
+        ];
+
+        for matrix in [
+            MatrixCoefficients::Bt601,
+            MatrixCoefficients::Bt709,
+            MatrixCoefficients::Bt2020,
+        ] {
+            for range in [ColorRange::Limited, ColorRange::Full] {
+                for depth in [8u8, 10, 12] {
+                    let ci = info(matrix, range, depth);
+                    let fwd = RgbToYuv::new(ci, HD_W, HD_H);
+                    // The inverse reads raw texture samples, so tell it the data
+                    // is planar (LSB-aligned) and hand it `code / 65535` for
+                    // depths above 8 — which is what `sample_scale` undoes.
+                    let inv = YuvConversion::new(ci, HD_W, HD_H, false);
+                    let max_code = ((1u32 << depth) - 1) as f32;
+
+                    for rgb in colours {
+                        let yuv = fwd.apply(rgb[0], rgb[1], rgb[2]);
+                        // Normalised sample -> code -> the raw sample the shader
+                        // would read out of a 16-bit planar texture.
+                        let to_raw = |s: f32| {
+                            let code = (s * max_code).round();
+                            if depth <= 8 { code / 255.0 } else { code / 65535.0 }
+                        };
+                        let back = inv.apply(to_raw(yuv[0]), to_raw(yuv[1]), to_raw(yuv[2]));
+
+                        // Tolerance DERIVED from the quantisation, not guessed.
+                        //
+                        // The only lossy step is rounding each of Y/Cb/Cr to an
+                        // integer code, so the error budget is at most half a code
+                        // step on each, propagated through the inverse matrix:
+                        //
+                        //   one luma   code  -> luma_scale/max_code   in RGB
+                        //   one chroma code  -> chroma_scale/max_code, times that
+                        //                       channel's Cb/Cr coefficient
+                        //
+                        // 2.0 bounds the largest coefficient in any of the three
+                        // matrices (BT.2020's Cb→B is 1.8814), and both chroma
+                        // components can err in the same direction, hence 2 * 0.5.
+                        let luma_step   = inv.luma_scale   / max_code;
+                        let chroma_step = inv.chroma_scale / max_code;
+                        let tol = 0.5 * luma_step + chroma_step * 2.0 + 1e-5;
+                        for i in 0..3 {
+                            assert!(
+                                (back[i] - rgb[i]).abs() <= tol,
+                                "{matrix:?}/{range:?}/{depth}-bit: channel {i} \
+                                 round-tripped {rgb:?} -> {yuv:?} -> {back:?} \
+                                 (tolerance {tol:.2e}, derived from one code step \
+                                 at this depth and range)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_matrices_are_measurably_different() {
+        // If `RgbToYuv` ignored ColorInfo and always used BT.709, every test
+        // above except this one would still pass.
+        let rgb = [0.8f32, 0.3, 0.15];
+        let enc = |m| {
+            RgbToYuv::new(info(m, ColorRange::Limited, 8), HD_W, HD_H)
+                .apply_u8(rgb[0], rgb[1], rgb[2])
+        };
+        let bt601  = enc(MatrixCoefficients::Bt601);
+        let bt709  = enc(MatrixCoefficients::Bt709);
+        let bt2020 = enc(MatrixCoefficients::Bt2020);
+
+        assert!(
+            bt601[0].abs_diff(bt709[0]) > 2,
+            "BT.601 and BT.709 luma must differ: {bt601:?} vs {bt709:?}"
+        );
+        assert!(
+            bt709[0].abs_diff(bt2020[0]) > 2,
+            "BT.709 and BT.2020 luma must differ: {bt709:?} vs {bt2020:?}"
+        );
+    }
+
+    /// The bug this whole change exists to fix, pinned as an assertion.
+    ///
+    /// Encoding BT.709 red with the BT.601 matrix — which is what the NVENC
+    /// driver does to RGB input — and then decoding it as BT.709 (what the file's
+    /// tags say) must visibly corrupt the colour. The reported symptom was red
+    /// arriving as `[255, 25, 0]`: green leaking in.
+    #[test]
+    fn mismatched_encode_and_decode_matrices_corrupt_the_colour() {
+        let ci_709 = info(MatrixCoefficients::Bt709, ColorRange::Limited, 8);
+        let ci_601 = info(MatrixCoefficients::Bt601, ColorRange::Limited, 8);
+
+        // Encoded with 601 (the driver), decoded as 709 (the tags).
+        let encoded = RgbToYuv::new(ci_601, HD_W, HD_H).apply(1.0, 0.0, 0.0);
+        let decoded = YuvConversion::new(ci_709, HD_W, HD_H, false)
+            .apply(encoded[0], encoded[1], encoded[2]);
+
+        let green_leak = decoded[1];
+        assert!(
+            green_leak > 0.02,
+            "a 601-encode/709-decode mismatch must leak visible green into pure \
+             red, got {decoded:?} — if this is ~0 the two matrices are no longer \
+             distinguishable and this test has stopped testing anything"
+        );
+
+        // And the matching pair must NOT corrupt it, which is the whole point of
+        // doing the conversion ourselves.
+        let matched_enc = RgbToYuv::new(ci_709, HD_W, HD_H).apply(1.0, 0.0, 0.0);
+        let matched_dec = YuvConversion::new(ci_709, HD_W, HD_H, false)
+            .apply(matched_enc[0], matched_enc[1], matched_enc[2]);
+        assert_rgb(matched_dec, [1.0, 0.0, 0.0], 6e-3, "709 encode + 709 decode");
+    }
+
+    #[test]
+    fn out_of_range_input_is_clamped_not_wrapped() {
+        // Tone mapping runs earlier in the graph, so anything reaching the encode
+        // shader should already be in [0,1] — but an HDR value that slipped
+        // through must saturate, not wrap around to black.
+        //
+        // The clamp is applied to RGB *before* the matrix (see `apply`), so
+        // super-white becomes white: luma 235, chroma neutral.  Clamping Y/Cb/Cr
+        // afterwards instead would let super-white reach 255, occupying codes
+        // limited range reserves, and would shift hue for a colour that was out of
+        // range in only one channel.
+        let c = RgbToYuv::new(
+            info(MatrixCoefficients::Bt709, ColorRange::Limited, 8), HD_W, HD_H,
+        );
+        assert_eq!(
+            c.apply_u8(4.0, 4.0, 4.0), [235, 128, 128],
+            "super-white must clamp to legal white, not exceed 235"
+        );
+        assert_eq!(
+            c.apply_u8(-2.0, -2.0, -2.0), [16, 128, 128],
+            "sub-black must clamp to legal black, not fall below 16"
+        );
+
+        // A colour out of range in ONE channel keeps its hue direction: red
+        // saturates to exactly the same codes as legal pure red rather than
+        // drifting, which is what a post-matrix clamp would do.
+        assert_eq!(
+            c.apply_u8(3.0, 0.0, 0.0), c.apply_u8(1.0, 0.0, 0.0),
+            "clamping must happen in RGB, so over-bright red matches pure red"
+        );
+
+        // And every output stays inside the limited-range legal box.
+        for rgb in [[4.0f32, -1.0, 0.5], [-3.0, 9.0, 2.0], [1.5, 1.5, -0.2]] {
+            let [y, u, v] = c.apply_u8(rgb[0], rgb[1], rgb[2]);
+            assert!((16..=235).contains(&y), "luma {y} out of 16..=235 for {rgb:?}");
+            assert!((16..=240).contains(&u), "Cb {u} out of 16..=240 for {rgb:?}");
+            assert!((16..=240).contains(&v), "Cr {v} out of 16..=240 for {rgb:?}");
+        }
+    }
+
+    #[test]
+    fn forward_conversion_handles_zero_bit_depth() {
+        // Same defensive case as the inverse: no divide-by-zero, no black frame.
+        let c = RgbToYuv::new(
+            info(MatrixCoefficients::Bt709, ColorRange::Limited, 0), HD_W, HD_H,
+        );
+        assert_eq!(c.apply_u8(1.0, 1.0, 1.0)[0], 235, "depth 0 white luma");
     }
 }

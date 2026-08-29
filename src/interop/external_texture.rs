@@ -346,12 +346,14 @@ impl Drop for ExternalTexture {
     }
 }
 
-/// D3D12 allocation of a shared, CUDA-importable texture.
+/// D3D12 allocation of a shared, CUDA-importable texture or buffer.
 ///
 /// Kept in its own module so the winapi/d3d12 imports do not leak into the
-/// cross-platform part of this file.
+/// cross-platform part of this file.  `pub(crate)` because
+/// [`crate::interop::external_buffer`] allocates through the same escape hatch,
+/// and there is no reason to keep two copies of the `as_hal` dance.
 #[cfg(target_os = "windows")]
-mod d3d12_shared {
+pub(crate) mod d3d12_shared {
     use super::CudaError;
     use crate::render::device::GpuDevice;
     use winapi::shared::dxgiformat;

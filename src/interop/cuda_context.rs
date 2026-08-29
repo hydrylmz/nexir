@@ -12,6 +12,7 @@ pub enum CudaError {
     StreamCreate(String),
     Import(String),
     MapArray(String),
+    MapBuffer(String),
 }
 
 pub struct CudaContext {
@@ -59,12 +60,45 @@ impl CudaContext {
 
     /// Run `f` with this context current on the calling thread, then restore
     /// the previous context. Each OS thread has its own independent context stack.
+    ///
+    /// NOT concurrency-safe, and the CUDA driver is the reason: `cuCtxPushCurrent`
+    /// requires the context to be *floating* — not current to any thread — so two
+    /// threads cannot hold the same context current at once.  The second thread's
+    /// push fails with `CUDA_ERROR_INVALID_CONTEXT`, and because the push is
+    /// silently ignored, the following `cuCtxPopCurrent` pops whatever was
+    /// underneath (usually nothing) and every driver call inside `f` runs against
+    /// the wrong context.
+    ///
+    /// The failure is loud in debug builds (the assertion below) and silent in
+    /// release, which is the worse half.  Callers that can run concurrently must
+    /// serialise themselves; `src/tests/export_validation.rs` and
+    /// `src/tests/shared_buffer.rs` both do, with a process-wide mutex.
+    ///
+    /// The push status is logged rather than returned because every existing
+    /// caller's signature is `-> R`; a bare `debug_assert` on the pop was the only
+    /// signal before, and it named neither the call nor the reason.
     pub fn with_context<R>(&self, f: impl FnOnce(CUstream) -> R) -> R {
-        unsafe { cuCtxPushCurrent(self.ctx) };
+        let push = unsafe { cuCtxPushCurrent(self.ctx) };
+        if push != CUDA_SUCCESS {
+            log::error!(
+                "[interop] cuCtxPushCurrent failed: {} ({push}) — the context is \
+                 probably current on another thread ({} requires a floating \
+                 context); every CUDA call in this closure will run against the \
+                 wrong context",
+                cu_err_to_string(push),
+                "cuCtxPushCurrent",
+            );
+        }
         let result = f(self.stream);
         let mut popped: CUcontext = std::ptr::null_mut();
         unsafe { cuCtxPopCurrent(&mut popped) };
-        debug_assert_eq!(popped, self.ctx, "CUDA context stack corrupted by closure");
+        debug_assert_eq!(
+            popped, self.ctx,
+            "CUDA context stack corrupted: cuCtxPopCurrent returned {popped:?} rather \
+             than this context. cuCtxPushCurrent returned {push} ({}). Two threads \
+             calling with_context on one CudaContext do this — serialise them.",
+            cu_err_to_string(push)
+        );
         result
     }
 

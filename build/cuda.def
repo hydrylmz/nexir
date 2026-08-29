@@ -1,0 +1,58 @@
+; build/cuda.def — the CUDA driver symbols this crate imports.
+;
+; WHY THIS FILE EXISTS.  There is no import library for the CUDA driver in a
+; consumer NVIDIA driver install: the runtime ships as `nvcuda.dll` in System32
+; and the CUDA Toolkit (which does ship `cuda.lib`) is not installed on every
+; build machine.  What this project links against is a hand-made import stub —
+; `C:/ffmpeg/lib/cuda.lib`, generated from a `.def` that lived only on one
+; developer's disk and listed exactly the twenty symbols the crate used at the
+; time.  Adding a twenty-first FFI declaration therefore failed at LINK, with
+; `unresolved external symbol __imp_cuExternalMemoryGetMappedBuffer`, for a
+; reason nothing in the repository explained.
+;
+; So the list moved in here and `build.rs` regenerates the import library from it
+; on every Windows build (`lib.exe /DEF`), into OUT_DIR, which precedes
+; `C:/ffmpeg/lib` on the linker's search path.  Adding an `extern "C"` fn to
+; `src/interop/ffi/cuda_*.rs` now means adding one line here, and the error you
+; get for forgetting names the symbol.
+;
+; NOTE the `_v2` suffixes.  The driver exports the ABI-versioned name and
+; `cuda.h` `#define`s the plain name onto it; there is no `cuMemFree` export at
+; all, only `cuMemFree_v2`.  Declare the versioned name in Rust too, as
+; `src/interop/ffi/cuda_driver.rs` does.
+;
+; The delay-load flags in `.cargo/config.toml` mean a missing `cuda.dll` is a
+; recoverable runtime condition rather than a load-time process kill; see
+; `InteropCapability::probe`, which LoadLibraryA-probes before the first call.
+LIBRARY cuda.dll
+
+EXPORTS
+; --- init / device / context / stream (cuda_driver.rs) ---
+cuInit
+cuDriverGetVersion
+cuDeviceGetCount
+cuDeviceGet
+cuDeviceGetAttribute
+cuDevicePrimaryCtxRetain
+cuDevicePrimaryCtxRelease
+cuCtxPushCurrent
+cuCtxPopCurrent
+cuStreamCreate
+cuStreamDestroy
+cuStreamSynchronize
+cuGetErrorString
+
+; --- memory (cuda_driver.rs) ---
+cuMemFree_v2
+cuMemcpyHtoD_v2
+cuMemcpyDtoH_v2
+cuMemcpyDtoDAsync_v2
+cuMemcpy2DAsync_v2
+
+; --- external memory interop (cuda_gl_vk_interop.rs) ---
+cuImportExternalMemory
+cuDestroyExternalMemory
+cuExternalMemoryGetMappedMipmappedArray
+cuExternalMemoryGetMappedBuffer
+cuMipmappedArrayGetLevel
+cuMipmappedArrayDestroy

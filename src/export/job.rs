@@ -317,31 +317,44 @@ impl ExportJob {
 
     /// Whether the zero-copy NVENC path can describe this job's colour correctly.
     ///
-    /// `Abgr10RepackNode` hands NVENC **RGB** (`NV_ENC_BUFFER_FORMAT_ABGR10`), so
-    /// the RGB→YUV conversion happens inside the driver, not in our shader. With
-    /// no VUI configured the driver applies BT.601 — while `Muxer::open` tags the
-    /// stream from `output_color`, which is BT.709 for every normal export. The
-    /// result is a file whose samples and tags disagree: red decodes as
+    /// **P1.9 — this is now true for every SDR matrix, and that is a change from
+    /// the previous behaviour**, so the reasoning both ways is worth keeping.
+    ///
+    /// It used to return `matrix == Bt601` only. `Abgr10RepackNode` handed NVENC
+    /// packed **RGB** (`NV_ENC_BUFFER_FORMAT_ABGR10`), so the RGB→YUV conversion
+    /// happened inside the driver, which applies BT.601 and offers no supported way
+    /// to say otherwise: selecting the matrix means writing
+    /// `NV_ENC_CONFIG_{H264,HEVC}_VUI_PARAMETERS` inside NV_ENC_CONFIG's per-codec
+    /// union — the guessed-offset territory `interop/ffi/nvenc.rs` refuses to enter
+    /// without vendor headers, and which `preset_cfg_version_matches` does not
+    /// validate. Meanwhile `Muxer::open` tags the stream from `output_color`. The
+    /// result was a file whose samples and tags disagreed: red decoding as
     /// `[255, 25, 0]` instead of `[255, 0, 0]`, a hue error small enough to be
-    /// mistaken for codec loss.
+    /// mistaken for codec loss. So every non-BT.601 job was routed to the FFmpeg
+    /// encoder, where libavcodec's nvenc wrapper writes the VUI properly.
     ///
-    /// Selecting the matrix would mean writing
-    /// `NV_ENC_CONFIG_{H264,HEVC}_VUI_PARAMETERS`, which lives inside
-    /// NV_ENC_CONFIG's per-codec union — the guessed-offset territory
-    /// `interop/ffi/nvenc.rs` deliberately refuses to enter without vendor
-    /// headers, and which `preset_cfg_version_matches` does not validate.
+    /// `Nv12EncodeNode` removed the disagreement at its root. The conversion now
+    /// happens in our own compute shader, from `RgbToYuv::new(output_color, ..)`,
+    /// and NVENC receives NV12 it does not reinterpret. Whatever matrix the job
+    /// asks for is the matrix in the samples, so the tags are authoritative by
+    /// construction and there is nothing left for this gate to protect against on
+    /// the matrix axis.
     ///
-    /// So the gate is narrow and honest: zero-copy is only safe when the job's own
-    /// matrix already matches what the driver will apply. Anything else takes the
-    /// FFmpeg path, where libavcodec's nvenc wrapper writes the VUI properly. That
-    /// keeps the encode on the GPU and gives up only the zero-copy readback.
+    /// What it still refuses:
     ///
-    /// To restore zero-copy for BT.709, the fix is to convert RGB→YUV in our own
-    /// repack shader and feed NVENC NV12/P010 — then the driver performs no matrix
-    /// conversion at all and our tags are authoritative by construction.
+    ///  * **10-bit output.** The NV12 shader writes 8-bit codes. A 10-bit job needs
+    ///    P010 plus a Main10 session (`profileGUID` + `pixelBitDepthMinus8`, both
+    ///    inside that same per-codec union), so it stays on the FFmpeg path — the
+    ///    same conclusion `VideoEncoderBackend::select` reaches for `is_hdr()`,
+    ///    asserted here as well because `bit_depth >= 10` does not imply HDR.
+    ///  * **Full-range output.** `RgbToYuv` produces full-range codes correctly,
+    ///    but the range flag reaches the decoder only through the VUI
+    ///    `video_full_range_flag`, which is in the union this code will not write.
+    ///    The container tag alone is advisory and players disagree about it, so a
+    ///    full-range job would again risk samples and signalling disagreeing.
     pub fn nvenc_zero_copy_is_colour_safe(&self) -> bool {
-        // The driver's default for RGB input, per the H.264/HEVC VUI defaults.
-        self.output_color.matrix == MatrixCoefficients::Bt601
+        self.output_color.bit_depth <= 8
+            && self.output_color.effective_range() == ColorRange::Limited
     }
 
     pub fn validate(&self) -> Result<(), JobError> {

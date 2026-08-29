@@ -217,9 +217,45 @@ impl Default for NvEncRegisterResource {
 /// NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY — verified 0x2.
 pub const NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY: u32 = 0x0000_0002;
 
+/// NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR — verified 0x1.
+///
+/// The resource type for a flat `CUdeviceptr`, which is what
+/// `cuExternalMemoryGetMappedBuffer` returns for an imported D3D12 buffer.  This
+/// is the type the NV12 zero-copy path registers (see
+/// `crate::interop::external_buffer`), and unlike CUDAARRAY it takes the row
+/// stride from `NV_ENC_REGISTER_RESOURCE::pitch` rather than from an array
+/// descriptor the driver can read for itself.
+///
+/// NOTE the numeric collision below: this is `1` in `NV_ENC_INPUT_RESOURCE_TYPE`
+/// and [`NV_ENC_BUFFER_FORMAT_NV12`] is also `1`, in the unrelated
+/// `NV_ENC_BUFFER_FORMAT` enum.  They are not interchangeable and neither is a
+/// duplicate of the other.
+pub const NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR: u32 = 0x0000_0001;
+
+/// NV_ENC_BUFFER_FORMAT_NV12 — verified 0x1.
+///
+/// Two planes in one allocation: full-resolution 8-bit luma, then interleaved
+/// (Cb, Cr) at half resolution in both axes.  For a CUDADEVICEPTR input the
+/// chroma plane is read at **`pitch * height`**, not `width * height` — measured
+/// with pitch 320 on a 256-wide frame, inter-row padding filled `0xAA` so a
+/// misread would have decoded as garbage rather than passing quietly
+/// (`nvchk/d3d12_buf_probe.c`, RTX 3050, driver API 12.2).
+pub const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x0000_0001;
+
+/// NV_ENC_INPUT_IMAGE — `NV_ENC_REGISTER_RESOURCE::bufferUsage` for a surface
+/// NVENC will read as an input picture.  Verified 0x0, i.e. the same value a
+/// zeroed struct already carries; passed explicitly so the field is not silently
+/// relying on `Default`.
+pub const NV_ENC_BUFFER_USAGE_INPUT_IMAGE: u32 = 0x0000_0000;
+
 /// NV_ENC_BUFFER_FORMAT_ABGR10 — 10-bit packed A2B10G10R10, word-ordered with R
 /// in the low 10 bits, then G, then B, alpha in the top 2 bits.  That matches the
 /// packing `Abgr10RepackNode` produces (see `src/interop/encode_interop.rs:15`).
+///
+/// No longer used by the export path: since P1.9 the zero-copy encoder feeds
+/// NVENC NV12 that `Nv12EncodeNode` converted, so the driver performs no RGB→YUV
+/// conversion of its own and the output's colour tags are authoritative by
+/// construction.  Kept because `Abgr10RepackNode` and its test still exist.
 pub const NV_ENC_BUFFER_FORMAT_ABGR10: u32 = 0x2000_0000;
 
 /// NV_ENC_BUFFER_FORMAT_ABGR — 8-bit packed A8B8G8R8, same channel order.
