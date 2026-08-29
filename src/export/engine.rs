@@ -76,7 +76,7 @@ impl ExportEngine {
             let backend = VideoEncoderBackend::select(
                 &self.job,
                 &self.capability,
-                self.cuda_ctx.as_ref().map(|c| c.as_ref()),
+                self.cuda_ctx.as_ref(),
                 &self.device,
             )
             .map_err(ExportError::EncoderOpen)?;

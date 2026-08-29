@@ -81,6 +81,13 @@ pub struct ActiveClipAudioInfo {
     pub speed: f32,
     pub pitch: f32,
     pub source_pts: i64,
+    /// Timeline PTS this clip's playback was armed at.
+    ///
+    /// Written when the mixer is handed a clip (see `app.rs` where
+    /// `ActiveClipAudioInfo` is built) and carried for parity with
+    /// `audio_mixer::ClipAudio::timeline_pts`, which the decoder's seek pair
+    /// consumes.  Nothing in the UI reads it back, hence the allow.
+    #[allow(dead_code)]
     pub timeline_pts: i64,
     pub source_in_pts: i64,
     pub source_out_pts: i64,
@@ -148,6 +155,15 @@ pub struct NexirApp {
 pub struct AppResponse {
     pub consumed: bool,
 }
+
+/// What [`NexirApp::compile_export_graph`] hands back: the compiled graph, the
+/// node objects it borrows (which must outlive it), and the id of the texture
+/// holding the final colour output.
+type CompiledExportGraph = (
+    nexir::render::graph::CompiledGraph,
+    Vec<Box<dyn nexir::render::graph::RenderNode>>,
+    ResourceId,
+);
 
 impl NexirApp {
     pub fn new(device: Arc<GpuDevice>, window: &Window) -> Self {
@@ -395,10 +411,12 @@ impl NexirApp {
                     || (cmd && i.modifiers.shift && i.key_pressed(egui::Key::Z)),
             )
         });
-        if undo_pressed && self.history.undo(&mut self.project) {
-            self.timeline.clear_interaction();
-            self.timeline.selected_clip = None;
-        } else if redo_pressed && self.history.redo(&mut self.project) {
+        // Undo and redo clear the same interaction state, so one branch covers
+        // both; `||` short-circuits, which is what keeps redo from running when
+        // undo already consumed the keypress.
+        if (undo_pressed && self.history.undo(&mut self.project))
+            || (redo_pressed && self.history.redo(&mut self.project))
+        {
             self.timeline.clear_interaction();
             self.timeline.selected_clip = None;
         }
@@ -599,8 +617,8 @@ impl NexirApp {
         }
 
         // Eyedropper: if a pick was requested and we have a preview texture, do a GPU readback.
-        if let Some(uv) = vp_result.eyedropper_pick {
-            if let Some(ref tex) = self.preview.texture {
+        if let Some(uv) = vp_result.eyedropper_pick
+            && let Some(ref tex) = self.preview.texture {
                 let w = tex.width();
                 let h = tex.height();
                 let px = (uv.x * w as f32) as u32;
@@ -655,7 +673,6 @@ impl NexirApp {
                 self.inspector.eyedropper_active = false;
                 self.egui_ctx.request_repaint();
             }
-        }
 
         let mouse_released = self.egui_ctx.input(|i| i.pointer.any_released());
         if mouse_released {
@@ -678,8 +695,7 @@ impl NexirApp {
         if playhead_pts != self.last_playhead || just_started_playing {
             let pts_delta = playhead_pts - self.last_playhead;
             let force_seek = just_started_playing
-                || pts_delta < 0
-                || pts_delta > 180_000
+                || !(0..=180_000).contains(&pts_delta)
                 || !self.timeline.playing;
             self.last_playhead = playhead_pts;
 
@@ -846,8 +862,8 @@ impl NexirApp {
         }
 
         // ── Export progress polling ──────────────────────────────────────────
-        if let Some(ref progress_rx) = self.export_progress {
-            if let Some(update) = progress_rx.try_recv() {
+        if let Some(ref progress_rx) = self.export_progress
+            && let Some(update) = progress_rx.try_recv() {
                 let pct = if update.total_frames > 0 {
                     update.frames_done as f64 / update.total_frames as f64 * 100.0
                 } else {
@@ -867,7 +883,6 @@ impl NexirApp {
                     self.export_status = Some(format!("Export failed: {}", err));
                 }
             }
-        }
 
         // ── Export progress UI ───────────────────────────────────────────────
         if let Some(ref status) = self.export_status.clone() {
@@ -880,16 +895,14 @@ impl NexirApp {
                     ui.label(status);
                     if is_active {
                         ui.add(egui::ProgressBar::new(self.export_progress_pct).show_percentage());
-                    } else {
-                        if ui.button("Close").clicked() {
-                            self.export_status = None;
-                        }
+                    } else if ui.button("Close").clicked() {
+                        self.export_status = None;
                     }
                 });
         }
         // ── Export settings panel ────────────────────────────────────────────
-        if self.export_settings_open {
-            if let Some(ref path) = self.export_pending_path.clone() {
+        if self.export_settings_open
+            && let Some(ref path) = self.export_pending_path.clone() {
                 let do_export = crate::layout::export_settings::draw(
                     &self.egui_ctx,
                     &mut self.export_settings_open,
@@ -901,13 +914,12 @@ impl NexirApp {
                     self.start_export();
                 }
             }
-        }
 
         // ── Crash recovery modal ─────────────────────────────────────────────
         // Shown on the first frame after startup (or project open) when a stale
         // autosave was detected.  Blocks all other interaction via modal window.
-        if let Some(info) = self.pending_recovery.clone() {
-            if let Some(action) = recovery_dialog::draw(&self.egui_ctx, &info) {
+        if let Some(info) = self.pending_recovery.clone()
+            && let Some(action) = recovery_dialog::draw(&self.egui_ctx, &info) {
                 match action {
                     RecoveryAction::Restore => {
                         match ProjectFile::load(&info.autosave_path) {
@@ -939,7 +951,6 @@ impl NexirApp {
                 }
                 self.pending_recovery = None;
             }
-        }
 
         // ── Missing media / relink dialog ────────────────────────────────────
         relink_dialog::draw(
@@ -1143,7 +1154,7 @@ impl NexirApp {
 
         if let Some(path) = file {
             // Ensure the path ends with .nexp
-            let path = if path.extension().map_or(true, |ext| ext != "nexp") {
+            let path = if path.extension().is_none_or(|ext| ext != "nexp") {
                 path.with_extension("nexp")
             } else {
                 path
@@ -1172,14 +1183,7 @@ impl NexirApp {
         frame: &nexir::render::frame_state::FrameState,
         canvas_width: u32,
         canvas_height: u32,
-    ) -> Result<
-        (
-            nexir::render::graph::CompiledGraph,
-            Vec<Box<dyn nexir::render::graph::RenderNode>>,
-            ResourceId,
-        ),
-        nexir::render::graph::GraphError,
-    > {
+    ) -> Result<CompiledExportGraph, nexir::render::graph::GraphError> {
         let mut compiler = RenderGraphCompiler::new();
         let mut id_counter = 2; // 0=FINAL_COLOR, 1=SCREEN
 
@@ -1236,21 +1240,25 @@ impl NexirApp {
                     let y_id = ResourceId::next(&mut id_counter);
                     let uv_id = ResourceId::next(&mut id_counter);
 
-                    let color_info = self
-                        .project
-                        .sources
-                        .read()
-                        .unwrap()
-                        .video_info(clip.source_id)
-                        .map(|vi| vi.color_info)
-                        .unwrap_or_default();
+                    // P1.6 — layout and colour come from the DECODED frame in this
+                    // clip's slot, not from the source registry: the decoder may
+                    // have converted the frame, and its metadata is what describes
+                    // the bytes actually sitting in the pool buffer.
+                    let layout     = clip.frame_meta.layout;
+                    let color_info = clip.frame_meta.color;
 
-                    let mut upload_node =
-                        YuvUploadNode::new_with_depth(device, 0, clip.clip_width, clip.clip_height, y_id, uv_id, color_info.bit_depth);
+                    let upload_node = YuvUploadNode::new_with_layout(
+                        device, 0, clip.clip_width, clip.clip_height, y_id, uv_id, layout,
+                    );
 
                     // Upload YUV data from the slot pool into staging buffers
                     self.io_layer.pool.with_buffer_read(slot_id, |data| {
-                        upload_node.upload_frame(data, clip.is_nv12, clip.clip_width, clip.clip_height);
+                        upload_node.upload_frame(
+                            data,
+                            layout.semi_planar,
+                            clip.clip_width,
+                            clip.clip_height,
+                        );
                     });
 
                     compiler.add_node(Box::new(upload_node));
@@ -1259,7 +1267,7 @@ impl NexirApp {
                     let rgba_id = ResourceId::next(&mut id_counter);
 
                     compiler.add_node(Box::new(
-                        nexir::render::nodes::yuv_to_rgb::YuvToRgbNode::new(
+                        nexir::render::nodes::yuv_to_rgb::YuvToRgbNode::new_with_layout(
                             device,
                             &self.shaders,
                             &self.compute_cache,
@@ -1269,30 +1277,31 @@ impl NexirApp {
                             clip.clip_width,
                             clip.clip_height,
                             color_info,
+                            layout.semi_planar,
                         ),
                     ));
 
-                    // Insert tone-mapping for HDR clips targeting SDR viewport
+                    // Insert tone-mapping for HDR clips targeting the SDR viewport.
+                    //
+                    // The preview is always SDR — there is no HDR swapchain — so
+                    // this stays a one-way HDR→SDR map, unlike the export path
+                    // which now converts in whichever direction the job needs.
                     let final_rgba_id = if color_info.is_hdr() {
                         use nexir::render::nodes::tonemap::{
                             ToneMapNode, InputTransferFn, GamutConversion, ToneMapPushConstants,
                             ToneMapMode,
                         };
-                        use nexir::timeline::source::TransferFunction;
 
                         let tonemapped_id = ResourceId::next(&mut id_counter);
-                        let trc = match color_info.transfer_fn {
-                            TransferFunction::Pq  => InputTransferFn::Pq,
-                            TransferFunction::Hlg => InputTransferFn::Hlg,
-                            _                     => InputTransferFn::Linear,
-                        };
-                        let gamut = if color_info.effective_primaries(
-                            clip.clip_width, clip.clip_height
-                        ) == nexir::timeline::source::ColorPrimaries::Bt2020 {
-                            GamutConversion::Bt2020ToBt709
-                        } else {
-                            GamutConversion::None
-                        };
+                        // `from_color_info` rather than a local match: a BT.2020
+                        // 10-bit clip with a plain BT.2020 (non-PQ) curve is
+                        // `is_hdr()` too, and treating its display-encoded samples
+                        // as linear light made it come out washed out.
+                        let trc = InputTransferFn::from_color_info(&color_info);
+                        let gamut = GamutConversion::between(
+                            color_info.effective_primaries(clip.clip_width, clip.clip_height),
+                            nexir::timeline::source::ColorPrimaries::Bt709,
+                        );
                         let tm_params = ToneMapPushConstants::for_sdr_preview(
                             trc,
                             gamut,
@@ -1495,7 +1504,7 @@ impl NexirApp {
 
         // Ensure the path extension matches the container format from export_settings.
         let ext = self.export_settings.container.format_name();
-        let path = if path.extension().map_or(true, |e| e != ext) {
+        let path = if path.extension().is_none_or(|e| e != ext) {
             path.with_extension(ext)
         } else {
             path
@@ -1511,7 +1520,7 @@ impl NexirApp {
         let width = self.project.settings.width;
         let height = self.project.settings.height;
 
-        let job = ExportJob {
+        let mut job = ExportJob {
             output_path: path,
             container: self.export_settings.container,
             video_codec: self.export_settings.video_codec,
@@ -1526,7 +1535,30 @@ impl NexirApp {
             project_tb,
             render_threads: num_cpus::get().max(2) / 2,
             cpu_preset: self.export_settings.cpu_preset,
+            // SDR default: the export renderer tone-maps every HDR clip down to
+            // Rec.709 before the encoder sees it, so that is what the output is
+            // tagged as.  `set_hdr10` below overrides both halves when the user
+            // asked for an HDR export.
+            output_color: nexir::timeline::source::ColorInfo::bt709(),
+            hdr10: None,
         };
+
+        // P1.7 — HDR10 export.  `set_hdr10` sets the colour description AND the
+        // mastering metadata together, and refuses a codec that cannot carry
+        // 10-bit, so a mis-set panel can never produce a file tagged HDR over SDR
+        // pixels.  The panel already hides the toggle for those codecs; this is the
+        // backstop.
+        if let Some(hdr) = self.export_settings.hdr10() {
+            if let Err(e) = job.set_hdr10(hdr) {
+                log::error!(
+                    "[export] HDR10 was requested but cannot be used for this job \
+                     ({e:?}) — exporting SDR instead"
+                );
+                self.export_status = Some(
+                    "HDR10 is not supported for this codec — exported as SDR".to_string(),
+                );
+            }
+        }
 
         // NOTE (Encode Interop): Prepare CudaContext if hardware interop is available and not forced to CPU.
         // This enables the zero-copy GPU path (wgpu -> CUDA -> NVENC), drastically improving export speed
@@ -1600,8 +1632,8 @@ impl NexirApp {
         let width = viewport_size.x as u32;
         let height = viewport_size.y as u32;
 
-        if width > 0 && height > 0 {
-            if self.preview.width != width || self.preview.height != height {
+        if width > 0 && height > 0
+            && (self.preview.width != width || self.preview.height != height) {
                 let texture = device.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("Preview Texture"),
                     size: wgpu::Extent3d {
@@ -1632,7 +1664,6 @@ impl NexirApp {
                 self.preview.width = width;
                 self.preview.height = height;
             }
-        }
 
         let output = self.egui_ctx.end_frame();
         let clipped_primitives = self
@@ -1663,8 +1694,8 @@ impl NexirApp {
         );
 
         if !frame.clips.is_empty() {
-            if let Some(ref preview_texture) = self.preview.texture {
-                if let Ok((graph, _nodes, rtt_id)) = self.compile_export_graph(
+            if let Some(ref preview_texture) = self.preview.texture
+                && let Ok((graph, _nodes, rtt_id)) = self.compile_export_graph(
                     device,
                     &frame,
                     self.preview.width,
@@ -1710,7 +1741,6 @@ impl NexirApp {
                         pass.draw(0..3, 0..1);
                     });
                 }
-            }
         } else if let Some(ref preview_texture) = self.preview.texture {
             // Clear preview when no frame
             let preview_view = preview_texture.create_view(&wgpu::TextureViewDescriptor::default());

@@ -648,11 +648,9 @@ fn draw_inner(
                                 let clip_id = project.clips.clip_id_at(idx);
                                 if let Some(linked_id) =
                                     crate::layout::timeline::find_linked_clip(project, clip_id)
-                                {
-                                    if let Some(linked_idx) = project.clips.index_of(linked_id) {
+                                    && let Some(linked_idx) = project.clips.index_of(linked_id) {
                                         project.clips.set_speed_at(linked_idx, state.speed);
                                     }
-                                }
                             }
                             ui.end_row();
                         });
@@ -674,11 +672,9 @@ fn draw_inner(
                                 let clip_id = project.clips.clip_id_at(idx);
                                 if let Some(linked_id) =
                                     crate::layout::timeline::find_linked_clip(project, clip_id)
-                                {
-                                    if let Some(linked_idx) = project.clips.index_of(linked_id) {
+                                    && let Some(linked_idx) = project.clips.index_of(linked_id) {
                                         project.clips.set_speed_at(linked_idx, preset);
                                     }
-                                }
                             }
                             let _ = i; // suppress warning
                         }

@@ -51,7 +51,50 @@ impl Muxer {
             if v_stream.is_null() {
                 return Err(MuxError::AddStream);
             }
-            avcodec_parameters_from_context(avstream_get_codecpar_mut(v_stream), video_encoder.codec_ctx());
+            let v_par = avstream_get_codecpar_mut(v_stream);
+            avcodec_parameters_from_context(v_par, video_encoder.codec_ctx());
+            // P1.7 — restate the colour description on the stream itself.
+            //
+            // On the FFmpeg CPU path `avcodec_parameters_from_context` has already
+            // copied these from the live encoder context, so this is a no-op. On the
+            // NVENC path the context is `param_enc` — a parameter-only libx264
+            // context that never sees a frame — and the bitstream comes from NVENC,
+            // so the container element is the only place the colour description can
+            // land. Writing it unconditionally keeps the two paths byte-identical in
+            // the `colr` box / Matroska colour element.
+            let color = &job.output_color;
+            avcodecpar_set_color_space(v_par, color.av_color_space());
+            avcodecpar_set_color_range(v_par, color.av_color_range());
+            avcodecpar_set_color_trc(v_par, color.av_color_trc());
+            avcodecpar_set_color_primaries(v_par, color.av_color_primaries());
+            avcodecpar_set_chroma_location(v_par, 1); // AVCHROMA_LOC_LEFT
+
+            // P1.7 — HDR10 static metadata on the stream, before write_header.
+            //
+            // This is what produces the mp4 `mdcv` / `clli` boxes (and the
+            // Matroska colour elements).  Needed in ADDITION to the encoder-side
+            // SEI: on the NVENC path the bitstream never passes through
+            // libavcodec, so the container is the only place the grade can be
+            // recorded, and container boxes also survive a stream copy that would
+            // drop bitstream SEI.
+            if let Some(hdr) = job.hdr10.as_ref() {
+                let ret = avcodecpar_set_hdr10_metadata(
+                    v_par,
+                    hdr.primaries.as_ptr(),
+                    hdr.white_point.as_ptr(),
+                    hdr.min_luminance,
+                    hdr.max_luminance,
+                    hdr.max_cll,
+                    hdr.max_fall,
+                );
+                if ret < 0 {
+                    log::warn!(
+                        "[muxer] failed to attach HDR10 static metadata to the video \
+                         stream — the container will carry no mdcv/clli boxes"
+                    );
+                }
+            }
+
             avstream_set_time_base(v_stream, video_tb);
             let video_stream_idx = av_stream_get_index(v_stream);
 

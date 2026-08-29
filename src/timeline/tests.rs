@@ -1,4 +1,10 @@
 // src/timeline/tests.rs
+//
+// `timeline::tests::tests` — the inner module keeps test paths consistent with
+// the rest of the suite (see the note in src/tests/mod.rs), so the inception
+// lint is allowed here for the same reason.
+#![allow(clippy::module_inception)]
+
 #[cfg(test)]
 mod tests {
     use crate::project::Project;
@@ -1404,7 +1410,7 @@ mod tests {
         // Feathered crop
         crop.feather = 0.2;
         let mid_alpha = crop.alpha_at(0.2, 0.5); // at the left edge
-        assert!(mid_alpha >= 0.0 && mid_alpha <= 1.0);
+        assert!((0.0..=1.0).contains(&mid_alpha));
 
         // Normalise swapped bounds
         let mut inverted = CropRect { left: 0.9, top: 0.8, right: 0.1, bottom: 0.2, feather: -0.1 };

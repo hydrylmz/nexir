@@ -2,6 +2,7 @@
 
 use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode, ClipEffects};
 use crate::timeline::ids::SourceId;
+use crate::timeline::source::DecodedFrameMeta;
 
 /// One clip's contribution to the current frame.
 #[derive(Clone, Debug)]
@@ -21,8 +22,22 @@ pub struct ClipRenderEntry {
     pub corner_pin:    CornerPin,
     pub matte_mode:    MatteMode,
     pub effects:       ClipEffects,
-    pub is_nv12:       bool,
+    /// Pixel layout and colour metadata of the frame sitting in `texture_slot`,
+    /// as reported by the decoder for those exact pixels.
+    ///
+    /// P1.6 — this replaces a bare `is_nv12: bool`.  The render graph reads bit
+    /// depth, chroma layout, code alignment and every colour property from here
+    /// instead of from the source registry, because the decoder may have converted
+    /// the frame and the container's metadata then describes something else.
+    pub frame_meta:    DecodedFrameMeta,
     pub kind:          crate::timeline::store::ClipKind,
+}
+
+impl ClipRenderEntry {
+    /// Whether the slot holds semi-planar chroma (NV12 / P010).
+    pub fn is_nv12(&self) -> bool {
+        self.frame_meta.layout.semi_planar
+    }
 }
 
 /// Everything the graph needs for one frame.

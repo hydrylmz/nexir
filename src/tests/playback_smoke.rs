@@ -9,6 +9,7 @@ mod playback_smoke {
     use crate::render::device::GpuDevice;
     use crate::timeline::ids::SourceId;
     use crate::timeline::rational::Rational;
+    use crate::timeline::source::DecodedFrameMeta;
 
     #[test]
     fn decode_30_frames_monotonic_pts() {
@@ -26,8 +27,8 @@ mod playback_smoke {
         
         for _ in 0..30 {
             let pkt = demuxer.next_video_packet().unwrap().expect("unexpected EOF");
-            if let Some(res) = decoder.decode_into(&pkt, &mut buf, None).unwrap() {
-                pts_log.push(res.0);
+            if let Some(frame) = decoder.decode_into(&pkt, &mut buf, None).unwrap() {
+                pts_log.push(frame.pts);
             }
         }
 
@@ -50,12 +51,12 @@ mod playback_smoke {
         let mut decoder = Decoder::open(&stream_info, stream_info.codecpar, true).expect("decoder open failed");
 
         let project_tb = Rational::new(1, 90000);
-        let target_pts = 100i64 * project_tb.den as i64 / frame_rate.num as i64;
+        let target_pts = 100i64 * project_tb.den / frame_rate.num as i64;
 
         let stream_pts = demuxer.seek(target_pts, project_tb).unwrap();
         let actual_pts = decoder.seek_to(&mut demuxer, stream_pts).unwrap();
         
-        let frame_period_pts = project_tb.den as i64 / frame_rate.num as i64;
+        let frame_period_pts = project_tb.den / frame_rate.num as i64;
         
         // Assert we landed exactly at the target, or within one frame period if the file has weird timestamps
         assert!(actual_pts <= target_pts + frame_period_pts,
@@ -103,7 +104,7 @@ mod playback_smoke {
         // Insert 4 frames
         for i in 0..4 {
             let slot = pool.acquire(req_size).unwrap();
-            cache.insert(source_id, i * 1000, slot, true);
+            cache.insert(source_id, i * 1000, slot, DecodedFrameMeta::default());
         }
 
         assert_eq!(cache.len(), 4);
@@ -112,7 +113,7 @@ mod playback_smoke {
         
         // Insert 5th frame
         let slot5 = pool.acquire(req_size).unwrap();
-        cache.insert(source_id, 4000, slot5, true);
+        cache.insert(source_id, 4000, slot5, DecodedFrameMeta::default());
 
         assert_eq!(cache.len(), 4);
         

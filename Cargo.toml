@@ -30,8 +30,18 @@ image = "0.24"
 imageproc = "0.23.0"
 rusttype = "0.9.3"
 
+# Windows-only: the D3D12 escape hatch used by src/interop/external_texture.rs.
+# Both are pinned to exactly what wgpu-hal 0.19 links, so the ID3D12Resource /
+# ID3D12Device pointers handed across the boundary are the same COM types.
+[target.'cfg(windows)'.dependencies]
+d3d12 = "0.19.0"
+winapi = { version = "0.3", features = ["d3d12", "d3dcommon", "dxgiformat", "handleapi", "winerror", "winnt", "unknwnbase"] }
+
 [dev-dependencies]
 pollster = "0.3"
+# Lets tests surface the engine's own log::info lines (notably which encoder
+# backend ExportEngine selected) under RUST_LOG=info.
+env_logger = "0.11"
 
 [[bin]]
 name = "bench"

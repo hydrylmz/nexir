@@ -61,8 +61,10 @@ mod interop_correctness {
             None => return,
         };
 
-        let cuda_ctx = crate::interop::cuda_context::CudaContext::new(&capability)
-            .expect("failed to create CudaContext");
+        let cuda_ctx = std::sync::Arc::new(
+            crate::interop::cuda_context::CudaContext::new(&capability)
+                .expect("failed to create CudaContext"),
+        );
 
         // Step 2 — Decode 10 frames via Phase 4 CPU path (interop: None).
         let cpu_frames = {
@@ -101,7 +103,7 @@ mod interop_correctness {
                 .expect("failed to open decoder (interop path)");
 
             let target = crate::interop::decode_interop::DecodeInteropTarget::new(
-                &cuda_ctx, &device, capability.transport, width, height,
+                std::sync::Arc::clone(&cuda_ctx), &device, capability.transport, width, height,
             ).expect("failed to create DecodeInteropTarget");
 
             // For the interop path, instead of reading back into a CPU buffer,
@@ -132,7 +134,7 @@ mod interop_correctness {
                         );
                         encoder.copy_texture_to_buffer(
                             wgpu::ImageCopyTexture {
-                                texture: &target.y_texture,
+                                texture: target.y_texture(),
                                 mip_level: 0,
                                 origin: wgpu::Origin3d::ZERO,
                                 aspect: wgpu::TextureAspect::All,

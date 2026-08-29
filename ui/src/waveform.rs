@@ -59,8 +59,7 @@ impl WaveformCache {
 
 fn generate_waveform(path: &Path) -> Result<Waveform, String> {
     use nexir::audio::ffi::avresample::{
-        AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_FLTP, swr_alloc_set_opts, swr_convert, swr_free,
-        swr_get_delay, swr_init,
+        AV_SAMPLE_FMT_FLTP, swr_alloc_set_opts, swr_convert, swr_free, swr_init,
     };
     use nexir::io::decoder::Decoder;
     use nexir::io::demuxer::Demuxer;
@@ -75,11 +74,11 @@ fn generate_waveform(path: &Path) -> Result<Waveform, String> {
         .audio_stream()
         .cloned()
         .ok_or_else(|| "no audio stream".to_string())?;
-    let stream_tb = audio_stream.time_base;
+    let _stream_tb = audio_stream.time_base;
     let decoder = Decoder::open(&audio_stream, audio_stream.codecpar, false)
         .map_err(|e| format!("{:?}", e))?;
 
-    let (in_ch_layout, in_sample_fmt, mut in_sample_rate) = unsafe {
+    let (in_ch_layout, in_sample_fmt, in_sample_rate) = unsafe {
         let ctx = decoder.ctx();
         let sr = avcodec_ctx_get_sample_rate(ctx);
         let mut cl = avcodec_ctx_get_channel_layout(ctx);
@@ -166,9 +165,9 @@ fn generate_waveform(path: &Path) -> Result<Waveform, String> {
                             nb as i32,
                         );
                         if converted > 0 {
-                            for i in 0..(converted as usize) {
-                                all_samples.push(mono_buf[i].abs());
-                            }
+                            all_samples.extend(
+                                mono_buf[..converted as usize].iter().map(|s| s.abs()),
+                            );
                         }
                     }
                 }

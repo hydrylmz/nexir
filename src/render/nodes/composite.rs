@@ -354,8 +354,16 @@ impl RenderNode for CompositeNode {
         // Explicitly inject usages required by external consumers of the graph's final output:
         // - UI preview uses it as a TextureBinding (Sampled)
         // - FFmpeg CPU export copies it to a staging buffer (CopySrc)
+        // - the zero-copy NVENC export binds it as a read-only storage texture in
+        //   Abgr10RepackNode (`texture_storage_2d<rgba16float, read>`), which needs
+        //   STORAGE_BINDING.  Without it `Device::create_bind_group` fails at the
+        //   first exported frame with "Texture usage ... does not contain required
+        //   usage TextureUsages(STORAGE_BINDING)" — and because the graph is
+        //   compiled per-frame inside the dispatch thread, that surfaces as a
+        //   wgpu-fatal panic rather than a clean error.
         builder.read(self.out_color, crate::render::resource::TextureAccess::Sampled);
         builder.read(self.out_color, crate::render::resource::TextureAccess::CopySrc);
+        builder.read(self.out_color, crate::render::resource::TextureAccess::StorageRead);
     }
 
     fn record(

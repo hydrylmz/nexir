@@ -3,7 +3,7 @@
 // Copies NVDEC CUdeviceptr output directly into wgpu textures, staying on-GPU the whole way.
 
 use crate::interop::cuda_context::{CudaContext, CudaError};
-use crate::interop::external_texture::ExternalTexture;
+use crate::interop::external_texture::SharedTexture;
 use crate::interop::ffi::cuda_gl_vk_interop::{CudaMemcpy2D, cuMemcpy2DAsync_v2};
 use crate::interop::ffi::cuda_driver::{CUdeviceptr, CUDA_SUCCESS, cuStreamSynchronize};
 use crate::render::device::GpuDevice;
@@ -12,60 +12,60 @@ use crate::io::ffi::avutil::{AVFrame, av_frame_get_data, av_frame_get_linesize};
 /// A wgpu texture pair (Y plane, UV plane) whose memory is also CUDA-accessible,
 /// ready to receive an NVDEC frame directly without any CPU involvement.
 pub struct DecodeInteropTarget {
-    pub y_texture:   wgpu::Texture,
-    pub uv_texture:  wgpu::Texture,
-    y_external:      ExternalTexture,
-    uv_external:     ExternalTexture,
+    y_slot:  SharedTexture,
+    uv_slot: SharedTexture,
 }
 
 impl DecodeInteropTarget {
-    /// Allocate a Y/UV texture pair using wgpu's `create_texture_from_hal` escape hatch
-    /// with export-compatible memory flags, then import both into CUDA.
+    /// Allocate an export-compatible Y/UV texture pair and import both into CUDA.
+    ///
+    /// The allocations are created as shared D3D12 resources by
+    /// [`SharedTexture::new`] — an ordinary `device.create_texture` cannot be
+    /// imported by CUDA at all, since the export flag has to be set at allocation
+    /// time.
+    ///
+    /// Takes the context by `Arc` because each `SharedTexture` keeps a share of
+    /// it: a CUDA import must not outlive the context it was made against.
     pub fn new(
-        cuda_ctx:  &CudaContext,
+        cuda_ctx:  std::sync::Arc<CudaContext>,
         device:    &GpuDevice,
         transport: crate::interop::capability::InteropTransport,
         width:     u32,
         height:    u32,
     ) -> Result<Self, CudaError> {
-        // Step 1 — Create export-compatible Y and UV textures.
-        // Y plane: R8Unorm, full resolution.
-        // UV plane: Rg8Unorm, half resolution (NV12 layout).
-        // These match Phase 2/3's YuvUploadNode formats exactly — no shader changes needed.
-        let y_desc = wgpu::TextureDescriptor {
-            label: Some("DecodeInterop Y Plane"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::STORAGE_BINDING,
-            view_formats: &[],
-        };
-        let uv_desc = wgpu::TextureDescriptor {
-            label: Some("DecodeInterop UV Plane"),
-            size: wgpu::Extent3d { width: width / 2, height: height / 2, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rg8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::STORAGE_BINDING,
-            view_formats: &[],
-        };
+        // Y plane: R8Unorm, full resolution.  UV plane: Rg8Unorm, half resolution
+        // (NV12 layout).  These match Phase 2/3's YuvUploadNode formats exactly,
+        // so no shader changes are needed.
+        const PLANE_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::TEXTURE_BINDING
+            .union(wgpu::TextureUsages::COPY_DST)
+            .union(wgpu::TextureUsages::STORAGE_BINDING);
 
-        // Step 2 — Create textures via the device.
-        // Note: For true zero-copy interop, these would need to be created via
-        // Device::create_texture_from_hal with export-compatible allocation flags.
-        // The standard create_texture is used here as a fallback that still works for
-        // the CUDA copy path (cuMemcpy2DAsync), just not the true zero-copy import path.
-        let y_texture  = device.device.create_texture(&y_desc);
-        let uv_texture = device.device.create_texture(&uv_desc);
+        let y_slot = SharedTexture::new(
+            std::sync::Arc::clone(&cuda_ctx), device, transport,
+            "DecodeInterop Y Plane",
+            width, height,
+            wgpu::TextureFormat::R8Unorm,
+            PLANE_USAGE,
+        )?;
+        let uv_slot = SharedTexture::new(
+            std::sync::Arc::clone(&cuda_ctx), device, transport,
+            "DecodeInterop UV Plane",
+            width / 2, height / 2,
+            wgpu::TextureFormat::Rg8Unorm,
+            PLANE_USAGE,
+        )?;
 
-        // Step 3 — Import both into CUDA.
-        let y_external  = ExternalTexture::import(cuda_ctx, device, &y_texture,  transport, width, height)?;
-        let uv_external = ExternalTexture::import(cuda_ctx, device, &uv_texture, transport, width / 2, height / 2)?;
+        Ok(Self { y_slot, uv_slot })
+    }
 
-        Ok(Self { y_texture, uv_texture, y_external, uv_external })
+    /// The wgpu view of the luma plane, for binding in the render graph.
+    pub fn y_texture(&self) -> &wgpu::Texture {
+        &self.y_slot.texture
+    }
+
+    /// The wgpu view of the interleaved chroma plane.
+    pub fn uv_texture(&self) -> &wgpu::Texture {
+        &self.uv_slot.texture
     }
 
     /// Copy an NVDEC-decoded frame directly into this target's Y/UV textures.
@@ -91,8 +91,8 @@ impl DecodeInteropTarget {
             (y_ptr as CUdeviceptr, uv_ptr as CUdeviceptr, pitch)
         };
 
-        let y_array  = self.y_external.cuda_array();
-        let uv_array = self.uv_external.cuda_array();
+        let y_array  = self.y_slot.external.cuda_array();
+        let uv_array = self.uv_slot.external.cuda_array();
 
         // Step 2 — Issue device-to-array copies for each plane via cuMemcpy2DAsync.
         // This is a GPU-side copy (device memory → CUDA array), with zero CPU/PCIe involvement.

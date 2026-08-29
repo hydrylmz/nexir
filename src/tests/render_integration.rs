@@ -100,21 +100,21 @@ mod render_integration {
 
         device.queue.write_texture(
             wgpu::ImageCopyTexture { texture: &red_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            &vec![255, 0, 0, 255].repeat((W * H) as usize),
+            &[255, 0, 0, 255].repeat((W * H) as usize),
             wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(W * 4), rows_per_image: Some(H) },
             wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
         );
 
         device.queue.write_texture(
             wgpu::ImageCopyTexture { texture: &green_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            &vec![0, 255, 0, 128].repeat((W * H) as usize),
+            &[0, 255, 0, 128].repeat((W * H) as usize),
             wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(W * 4), rows_per_image: Some(H) },
             wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
         );
 
         let mut frame = FrameState::test_empty(W, H);
-        frame.clips.push(ClipRenderEntry { source_id: SourceId(0), texture_slot: 0, layer_order: 0, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 1.0, blend_mode: crate::timeline::transform::BlendMode::Normal, crop: crate::timeline::transform::CropRect::full(), corner_pin: crate::timeline::transform::CornerPin::identity(), matte_mode: crate::timeline::transform::MatteMode::None, effects: Default::default(), is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
-        frame.clips.push(ClipRenderEntry { source_id: SourceId(1), texture_slot: 1, layer_order: 1, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 0.5, blend_mode: crate::timeline::transform::BlendMode::Normal, crop: crate::timeline::transform::CropRect::full(), corner_pin: crate::timeline::transform::CornerPin::identity(), matte_mode: crate::timeline::transform::MatteMode::None, effects: Default::default(), is_nv12: false, kind: crate::timeline::store::ClipKind::Video });
+        frame.clips.push(ClipRenderEntry { source_id: SourceId(0), texture_slot: 0, layer_order: 0, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 1.0, blend_mode: crate::timeline::transform::BlendMode::Normal, crop: crate::timeline::transform::CropRect::full(), corner_pin: crate::timeline::transform::CornerPin::identity(), matte_mode: crate::timeline::transform::MatteMode::None, effects: Default::default(), frame_meta: Default::default(), kind: crate::timeline::store::ClipKind::Video });
+        frame.clips.push(ClipRenderEntry { source_id: SourceId(1), texture_slot: 1, layer_order: 1, clip_width: W, clip_height: H, transform: ClipTransform::identity(), opacity: 0.5, blend_mode: crate::timeline::transform::BlendMode::Normal, crop: crate::timeline::transform::CropRect::full(), corner_pin: crate::timeline::transform::CornerPin::identity(), matte_mode: crate::timeline::transform::MatteMode::None, effects: Default::default(), frame_meta: Default::default(), kind: crate::timeline::store::ClipKind::Video });
         frame.sort_clips();
 
         let mut compiler = RenderGraphCompiler::new();
@@ -165,7 +165,7 @@ mod render_integration {
         // dst.g = 0.5 + 0 * (1 - 0.25) = 0.50 -> 128
         assert!((r as i32 - 191).abs() <= 4, "red channel wrong: {}", r);
         assert!((g as i32 - 128).abs() <= 4, "green channel wrong: {}", g);
-        assert!((b as i32 - 0).abs() <= 4, "blue channel wrong: {}", b);
+        assert!((b as i32).abs() <= 4, "blue channel wrong: {}", b);
     }
 
     struct NodeA;

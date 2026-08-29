@@ -6,7 +6,7 @@ use crate::timeline::ids::SourceId;
 use crate::timeline::rational::Rational;
 use crate::io::demuxer::Demuxer;
 use crate::io::decoder::Decoder;
-use crate::io::slot_pool::{FrameSlotPool, FrameSlotId};
+use crate::io::slot_pool::FrameSlotPool;
 use crate::io::frame_cache::FrameCache;
 use crate::io::prefetch::PrefetchRequest;
 use crate::timeline::source::SourceRegistry;
@@ -67,7 +67,7 @@ impl IoLayer {
         &self,
         source_id: SourceId,
         pts:       i64,
-    ) -> Option<(FrameSlotId, bool)> {
+    ) -> Option<crate::io::frame_cache::CachedFrame> {
         if let Some(slot) = self.cache.touch(source_id, pts) {
             return Some(slot);
         }
@@ -85,7 +85,7 @@ impl IoLayer {
         &self,
         source_id: SourceId,
         pts:       i64,
-    ) -> Option<(FrameSlotId, bool)> {
+    ) -> Option<crate::io::frame_cache::CachedFrame> {
         if let Some(slot) = self.cache.touch(source_id, pts) {
             return Some(slot);
         }
@@ -154,7 +154,10 @@ impl IoLayer {
         }
         let slot = slot?;
 
-        let mut final_is_nv12 = false;
+        // Metadata of the frame that actually landed in the slot.  Defaults to
+        // 8-bit BT.709 only as a placeholder; `decoded_anything` gates whether it
+        // is ever used, so an undecoded slot never reaches the cache.
+        let mut final_meta = crate::timeline::source::DecodedFrameMeta::default();
         let mut decoded_anything = false;
         let _decoded_pts = {
             let mut dec = decoder_arc.lock().unwrap();
@@ -169,11 +172,11 @@ impl IoLayer {
                         None    => break,
                     };
                     let pkt_pts = pkt.pts;
-                    if let Some((frame_pts, is_nv12, _w, _h)) = dec.decode_into(&pkt, mapped, None).ok().flatten() {
-                        let eff_pts = if frame_pts == 0 { pkt_pts } else { frame_pts };
+                    if let Some(frame) = dec.decode_into(&pkt, mapped, None).ok().flatten() {
+                        let eff_pts = if frame.pts == 0 { pkt_pts } else { frame.pts };
                         if eff_pts >= target_stream_pts {
                             found_pts = eff_pts;
-                            final_is_nv12 = is_nv12;
+                            final_meta = frame.meta;
                             decoded_anything = true;
                             break;
                         }
@@ -197,8 +200,8 @@ impl IoLayer {
         // Update sequential tracking using requested pts
         self.last_decoded_pts.insert(source_id, pts);
 
-        self.cache.insert(source_id, pts, slot, final_is_nv12);
-        Some((slot, final_is_nv12))
+        self.cache.insert(source_id, pts, slot, final_meta);
+        Some((slot, final_meta))
     }
 
     fn get_or_open_demuxer(

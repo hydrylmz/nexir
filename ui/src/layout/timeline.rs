@@ -37,8 +37,13 @@ struct ClipDrag {
     orig_idx: usize,
     /// Pixel offset from the clip's left edge to where the user grabbed it.
     grab_offset_px: f32,
-    /// Original track the clip lives on.
-    orig_track: TrackId,
+    // NOTE: no `orig_track` here.  The drop handler needs the clip's original
+    // track to choose between `move_clip` and `move_clip_to_track`, but it reads
+    // it from the store at commit time (`track_id_at`, see the move handler
+    // below) rather than from a value cached at drag-start — the store is the
+    // source of truth, and a cached copy would go stale if anything else moved
+    // the clip mid-drag.  A field written and never read was the dead-code
+    // warning here.
 }
 
 #[derive(Clone, Copy)]
@@ -204,11 +209,11 @@ pub fn draw(
     }
 
     // ── Delete selected clip on Delete key (Shift+Delete for ripple) ──
-    if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
-        if let Some(idx) = state.selected_clip {
+    if ui.input(|i| i.key_pressed(egui::Key::Delete))
+        && let Some(idx) = state.selected_clip {
             let clip_id = project.clips.clip_id_at(idx);
             let track_id = project.clips.track_id_at(idx);
-            let is_audio = project.tracks.get(track_id).map_or(false, |t| {
+            let is_audio = project.tracks.get(track_id).is_some_and(|t| {
                 matches!(t.kind, nexir::timeline::track::TrackKind::Audio { .. })
             });
 
@@ -232,12 +237,11 @@ pub fn draw(
             }
             state.selected_clip = None;
         }
-    }
 
     // ── Ctrl+K to split selected clip at playhead ────────────────────
     let ctrl_k = ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::K));
-    if ctrl_k {
-        if let Some(idx) = state.selected_clip {
+    if ctrl_k
+        && let Some(idx) = state.selected_clip {
             let clip_id = project.clips.clip_id_at(idx);
             let pts_in = project.clips.pts_in_at(idx);
             let pts_out = project.clips.pts_out_at(idx);
@@ -260,7 +264,6 @@ pub fn draw(
                 state.selected_clip = None;
             }
         }
-    }
 
     // ── Pending track property mutations (collected while iterating immutably) ──
     enum TrackMutation {
@@ -329,25 +332,21 @@ pub fn draw(
             .add_enabled(has_selection, egui::Button::new("🗑 Delete"))
             .on_hover_text("Delete selected clip (Delete)")
             .clicked()
-        {
-            if let Some(idx) = state.selected_clip {
+            && let Some(idx) = state.selected_clip {
                 let clip_id = project.clips.clip_id_at(idx);
                 pending_clip_actions.push(ClipAction::Delete(clip_id));
             }
-        }
         if ui
             .add_enabled(has_selection, egui::Button::new("🌊 Ripple Delete"))
             .on_hover_text("Ripple delete selected clip and close gap (Shift+Delete)")
             .clicked()
-        {
-            if let Some(idx) = state.selected_clip {
+            && let Some(idx) = state.selected_clip {
                 let clip_id = project.clips.clip_id_at(idx);
                 pending_clip_actions.push(ClipAction::RippleDelete(clip_id));
             }
-        }
 
         ui.separator();
-        let mut snap = state.viewport_snap;
+        let snap = state.viewport_snap;
         if ui
             .add(egui::SelectableLabel::new(snap, "Snap"))
             .on_hover_text("Snap clip to center in preview")
@@ -455,14 +454,13 @@ pub fn draw(
                 .rect_filled(ruler_rect, 0.0, Color32::from_rgb(20, 20, 20));
 
             // Move playhead on click/drag over ruler — but only when not dragging a clip
-            if state.drag.is_none() && (ruler_resp.dragged() || ruler_resp.clicked()) {
-                if let Some(pos) = ui.ctx().pointer_interact_pos() {
+            if state.drag.is_none() && (ruler_resp.dragged() || ruler_resp.clicked())
+                && let Some(pos) = ui.ctx().pointer_interact_pos() {
                     let raw_x = pos.x - ruler_rect.min.x - GUTTER_W;
                     let frame = (raw_x / state.zoom).max(0.0) as i64;
                     state.playhead_frame = frame.min(total_frames);
                     state.playing = false;
                 }
-            }
 
             // Draw tick marks
             let tick_interval: i64 = fps;
@@ -634,7 +632,7 @@ pub fn draw(
 
                 let is_effect_drag = dragging_item
                     .as_ref()
-                    .map_or(false, |item| item.kind == MediaKind::Effect);
+                    .is_some_and(|item| item.kind == MediaKind::Effect);
 
                 // ── Determine lane highlight ──────────────────────────────
                 // Priority: media-pool drag > clip drag > normal
@@ -780,22 +778,22 @@ pub fn draw(
 
                     // ── Resize / Drag Cursor ──
                     let edge_width = 12.0;
-                    if clip_resp.hovered() && !is_being_dragged && !is_being_resized {
-                        if let Some(pos) = clip_resp.hover_pos() {
-                            if pos.x - clip_rect.left() < edge_width {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                            } else if clip_rect.right() - pos.x < edge_width {
+                    if clip_resp.hovered() && !is_being_dragged && !is_being_resized
+                        && let Some(pos) = clip_resp.hover_pos() {
+                            // Either edge shows the same resize cursor.
+                            if pos.x - clip_rect.left() < edge_width
+                                || clip_rect.right() - pos.x < edge_width
+                            {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                             }
                         }
-                    }
 
                     // ── Effect drop on clip ───────────────────────────────
                     let is_effect_hover = is_effect_drag
-                        && pointer_pos.map_or(false, |p| clip_rect.contains(p));
+                        && pointer_pos.is_some_and(|p| clip_rect.contains(p));
 
-                    if is_effect_hover && pointer_released {
-                        if let Some(item) = dragging_item.take() {
+                    if is_effect_hover && pointer_released
+                        && let Some(item) = dragging_item.take() {
                             let mut eff = project.clips.effects_at(idx);
                             let path_str = item.path.to_string_lossy();
                             if path_str.ends_with("blur") {
@@ -814,7 +812,6 @@ pub fn draw(
                             state.selected_clip = Some(idx);
                             clicked_a_clip = true;
                         }
-                    }
 
                     // Drag start
                     if clip_resp.drag_started()
@@ -849,7 +846,6 @@ pub fn draw(
                                 clip_id,
                                 orig_idx: idx,
                                 grab_offset_px,
-                                orig_track: track.id,
                             });
                         }
                         state.selected_clip = Some(idx);
@@ -931,8 +927,8 @@ pub fn draw(
                             waveform_cache.request(source_id, path);
                         }
                         // Draw if available
-                        if let Some(wf) = waveform_cache.get(source_id) {
-                            if !wf.peaks.is_empty() && clip_rect.width() > 4.0 {
+                        if let Some(wf) = waveform_cache.get(source_id)
+                            && !wf.peaks.is_empty() && clip_rect.width() > 4.0 {
                                 let source_in_pts = project.clips.source_in_at(idx);
                                 let clip_dur_pts = pts_out - pts_in;
                                 // 100 Hz peaks, 90 kHz timebase → 900 pts per peak
@@ -972,7 +968,6 @@ pub fn draw(
                                     }
                                 }
                             }
-                        }
                     }
 
                     // Selection border and Resize handles
@@ -1117,7 +1112,7 @@ pub fn draw(
                                 let track_id = project.clips.track_id_at(idx);
                                 project.tracks.get(track_id)
                             })
-                            .map_or(false, |t| {
+                            .is_some_and(|t| {
                                 matches!(t.kind, nexir::timeline::track::TrackKind::Audio { .. })
                             });
 
@@ -1131,7 +1126,7 @@ pub fn draw(
                         if let Some(l_id) = linked_id {
                             let _ = remove_clip(&mut project.clips, l_id);
                         }
-                        if state.drag.as_ref().map_or(false, |d| d.clip_id == id) {
+                        if state.drag.as_ref().is_some_and(|d| d.clip_id == id) {
                             state.drag = None;
                         }
                     }
@@ -1143,7 +1138,7 @@ pub fn draw(
                                 let track_id = project.clips.track_id_at(idx);
                                 project.tracks.get(track_id)
                             })
-                            .map_or(false, |t| {
+                            .is_some_and(|t| {
                                 matches!(t.kind, nexir::timeline::track::TrackKind::Audio { .. })
                             });
 
@@ -1157,7 +1152,7 @@ pub fn draw(
                         if let Some(l_id) = linked_id {
                             let _ = project.ripple_remove_clip(l_id);
                         }
-                        if state.drag.as_ref().map_or(false, |d| d.clip_id == id) {
+                        if state.drag.as_ref().is_some_and(|d| d.clip_id == id) {
                             state.drag = None;
                         }
                     }
@@ -1259,12 +1254,11 @@ pub fn draw(
                         }
 
                         let mut is_snapped = false;
-                        if best_snap_diff <= snap_threshold_frames {
-                            if let Some(target) = best_snap_target {
+                        if best_snap_diff <= snap_threshold_frames
+                            && let Some(target) = best_snap_target {
                                 new_frame = target.max(0);
                                 is_snapped = true;
                             }
-                        }
 
                         let ghost_x = lane_rect.min.x + new_frame as f32 * state.zoom;
                         let track_h = lane_rect.height();
@@ -1376,11 +1370,10 @@ pub fn draw(
                                 best_snap_target = Some(playhead - duration_frames);
                             }
 
-                            if best_snap_diff <= snap_threshold_frames {
-                                if let Some(target) = best_snap_target {
+                            if best_snap_diff <= snap_threshold_frames
+                                && let Some(target) = best_snap_target {
                                     new_frame = target.max(0);
                                 }
-                            }
 
                             pending_clip_move = Some(PendingClipMove {
                                 clip_id: drag.clip_id,
@@ -1397,8 +1390,8 @@ pub fn draw(
             }
 
             if let Some(ref resize) = state.resize {
-                if let Some(cursor) = pointer_pos {
-                    if let Some(&(_, lane_rect)) = track_lane_rects
+                if let Some(cursor) = pointer_pos
+                    && let Some(&(_, lane_rect)) = track_lane_rects
                         .iter()
                         .find(|(t, _)| *t == project.clips.track_id_at(resize.orig_idx))
                     {
@@ -1441,12 +1434,11 @@ pub fn draw(
                         }
 
                         let mut is_snapped = false;
-                        if best_snap_diff <= snap_threshold_frames {
-                            if let Some(target) = best_snap_target {
+                        if best_snap_diff <= snap_threshold_frames
+                            && let Some(target) = best_snap_target {
                                 cursor_frame = target;
                                 is_snapped = true;
                             }
-                        }
 
                         let mut new_pts_in = resize.orig_pts_in;
                         let mut new_pts_out = resize.orig_pts_out;
@@ -1527,11 +1519,10 @@ pub fn draw(
                             );
                         }
                     }
-                }
 
                 if pointer_released {
-                    if let Some(cursor) = pointer_pos {
-                        if let Some(&(_, lane_rect)) = track_lane_rects
+                    if let Some(cursor) = pointer_pos
+                        && let Some(&(_, lane_rect)) = track_lane_rects
                             .iter()
                             .find(|(t, _)| *t == project.clips.track_id_at(resize.orig_idx))
                         {
@@ -1572,20 +1563,18 @@ pub fn draw(
                                 }
                             }
 
-                            if best_snap_diff <= snap_threshold_frames {
-                                if let Some(target) = best_snap_target {
+                            if best_snap_diff <= snap_threshold_frames
+                                && let Some(target) = best_snap_target {
                                     cursor_frame = target;
                                 }
-                            }
 
                             let new_pts = project.frame_to_pts(cursor_frame);
                             pending_clip_resize = Some(PendingClipResize {
                                 clip_id: resize.clip_id,
-                                edge: resize.edge.clone(),
+                                edge: resize.edge,
                                 new_pts,
                             });
                         }
-                    }
                     state.resize = None;
                 }
                 ui.ctx().request_repaint();
@@ -1651,16 +1640,14 @@ pub fn draw(
                     let mut duration = project.frame_to_pts(fps * 5);
                     {
                         let sources = project.sources.read().unwrap();
-                        if let Ok(v) = sources.video_info(source_id) {
-                            if v.duration_pts > 0 {
+                        if let Ok(v) = sources.video_info(source_id)
+                            && v.duration_pts > 0 {
                                 duration = v.duration_pts;
                             }
-                        }
-                        if let Ok(a) = sources.audio_info(source_id) {
-                            if a.duration_pts > 0 {
+                        if let Ok(a) = sources.audio_info(source_id)
+                            && a.duration_pts > 0 {
                                 duration = a.duration_pts;
                             }
-                        }
                     }
                     let pts_in = project.frame_to_pts(pending_drop.drop_frame);
                     let pts_out = pts_in + duration;
@@ -1714,8 +1701,8 @@ pub fn draw(
             }
 
             // ── Apply pending clip resize ─────────────────────────────────
-            if let Some(rsz) = pending_clip_resize {
-                if let Some(idx) = project.clips.index_of(rsz.clip_id) {
+            if let Some(rsz) = pending_clip_resize
+                && let Some(idx) = project.clips.index_of(rsz.clip_id) {
                     let min_dur = project.frame_to_pts(1);
                     let linked_id = find_linked_clip(project, rsz.clip_id);
                     history.record(project);
@@ -1754,7 +1741,6 @@ pub fn draw(
                         }
                     }
                 }
-            }
 
             // ── Apply pending clip move ───────────────────────────────────
             if let Some(mv) = pending_clip_move {

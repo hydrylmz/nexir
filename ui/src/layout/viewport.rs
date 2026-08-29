@@ -62,6 +62,12 @@ pub struct ViewportDrawResult {
 }
 
 /// Draw the preview viewport, preserving the video's aspect ratio via letter-boxing / pillar-boxing.
+///
+/// The argument count is over clippy's default threshold and stays that way on
+/// purpose: these are the independent pieces of app state one frame of the
+/// viewport needs, and bundling them into a struct would just move the same list
+/// to the call site while adding a type that exists only to satisfy a lint.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     ui: &mut Ui,
     preview_id: Option<egui::TextureId>,
@@ -306,12 +312,12 @@ pub fn draw(
     }
 
     // Hit-testing (only when eyedropper is not active)
-    if !eyedropper_active && response.clicked() && !state.is_interacting_with_clip() {
-        if let Some(pos) = ui.ctx().pointer_interact_pos() {
+    if !eyedropper_active && response.clicked() && !state.is_interacting_with_clip()
+        && let Some(pos) = ui.ctx().pointer_interact_pos() {
             let mut clicked_idx = None;
             for clip in active_clips.iter().rev() {
                 let track_id = project.clips.track_id_at(clip.store_index);
-                let is_video_track = project.tracks.get(track_id).map_or(false, |t| {
+                let is_video_track = project.tracks.get(track_id).is_some_and(|t| {
                     matches!(t.kind, nexir::timeline::track::TrackKind::Video)
                 });
                 if !is_video_track {
@@ -343,7 +349,7 @@ pub fn draw(
                 };
 
                 let transform = project.clips.transform_at(clip.store_index);
-                let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect, canvas_w, canvas_h);
+                let corners = clip_corners_ui(transform, clip_w, clip_h, draw_rect, canvas_w, canvas_h);
                 if is_point_in_quad(pos, &corners) {
                     clicked_idx = Some(clip.store_index);
                     break;
@@ -351,14 +357,13 @@ pub fn draw(
             }
             state.selected_clip = clicked_idx;
         }
-    }
 
     // Selected clip overlay (only interactive when eyedropper is NOT active)
-    if !eyedropper_active {
-        if let Some(idx) = state.selected_clip {
-            if active_clips.iter().any(|c| c.store_index == idx) {
+    if !eyedropper_active
+        && let Some(idx) = state.selected_clip
+            && active_clips.iter().any(|c| c.store_index == idx) {
                 let track_id = project.clips.track_id_at(idx);
-                let is_video_track = project.tracks.get(track_id).map_or(false, |t| {
+                let is_video_track = project.tracks.get(track_id).is_some_and(|t| {
                     matches!(t.kind, nexir::timeline::track::TrackKind::Video)
                 });
                 if is_video_track {
@@ -431,8 +436,8 @@ pub fn draw(
                     egui::Sense::drag(),
                 );
 
-                if move_resp.drag_started() && state.viewport_resize().is_none() && state.viewport_rotate().is_none() {
-                    if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                if move_resp.drag_started() && state.viewport_resize().is_none() && state.viewport_rotate().is_none()
+                    && let Some(pointer) = ui.ctx().pointer_interact_pos() {
                         let started_on_handle =
                             handle_rects.iter().any(|rect| rect.contains(pointer));
                         if !started_on_handle
@@ -444,7 +449,6 @@ pub fn draw(
                             state.start_viewport_move(clip_id, pointer, transform);
                         }
                     }
-                }
 
                 // Resize Handles
                 for (i, (&corner, handle_rect)) in
@@ -453,12 +457,11 @@ pub fn draw(
                     let resize_id = egui::Id::new(("viewport_resize", idx, i));
                     let resp = ui.interact(*handle_rect, resize_id, egui::Sense::drag());
 
-                    if resp.drag_started() {
-                        if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                    if resp.drag_started()
+                        && let Some(pointer) = ui.ctx().pointer_interact_pos() {
                             history.record(project);
                             state.start_viewport_resize(clip_id, i, pointer, transform);
                         }
-                    }
 
                     let color = if resp.hovered() {
                         Color32::WHITE
@@ -475,12 +478,11 @@ pub fn draw(
 
                 // Draw Rotate Handle
                 let rotate_resp = ui.interact(rotate_rect, egui::Id::new(("viewport_rotate", idx)), egui::Sense::drag());
-                if rotate_resp.drag_started() {
-                    if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                if rotate_resp.drag_started()
+                    && let Some(pointer) = ui.ctx().pointer_interact_pos() {
                         history.record(project);
                         state.start_viewport_rotate(clip_id, pointer, transform);
                     }
-                }
                 
                 // Draw connecting line to rotate handle
                 ui.painter().line_segment(
@@ -496,8 +498,8 @@ pub fn draw(
                     egui::Stroke::new(1.0, Color32::BLACK),
                 );
 
-                if let Some(movement) = state.viewport_move() {
-                    if movement.clip_id == clip_id && state.viewport_resize().is_none() {
+                if let Some(movement) = state.viewport_move()
+                    && movement.clip_id == clip_id && state.viewport_resize().is_none() {
                         if let Some(pointer) = ui
                             .ctx()
                             .pointer_interact_pos()
@@ -549,11 +551,10 @@ pub fn draw(
                             state.finish_viewport_move();
                         }
                     }
-                }
 
-                if let Some(resize) = state.viewport_resize() {
-                    if resize.clip_id == clip_id {
-                        if let Some(pointer) = ui
+                if let Some(resize) = state.viewport_resize()
+                    && resize.clip_id == clip_id
+                        && let Some(pointer) = ui
                             .ctx()
                             .pointer_interact_pos()
                             .or_else(|| ui.ctx().pointer_hover_pos())
@@ -594,11 +595,9 @@ pub fn draw(
                                 state.finish_viewport_resize();
                             }
                         }
-                    }
-                }
 
-                if let Some(rotate) = state.viewport_rotate() {
-                    if rotate.clip_id == clip_id {
+                if let Some(rotate) = state.viewport_rotate()
+                    && rotate.clip_id == clip_id {
                         if let Some(pointer) = ui
                             .ctx()
                             .pointer_interact_pos()
@@ -628,7 +627,6 @@ pub fn draw(
                             state.finish_viewport_rotate();
                         }
                     }
-                }
 
                 // Delete Button
                 let del_resp = ui.interact(
@@ -671,8 +669,6 @@ pub fn draw(
                 }
             }
         }
-    }
-}
 
     if state.viewport_resize().is_some() && ui.input(|input| input.pointer.any_released()) {
         state.finish_viewport_resize();

@@ -117,7 +117,7 @@ impl AudioMixer {
 
                     let path_clone = clip.path.clone();
                     let ring_clone = Arc::clone(&clip_ring);
-                    let clock_clone = Arc::clone(&master_clock);
+                    let _clock_clone = Arc::clone(&master_clock);
                     let sd_clone = Arc::clone(&clip_shutdown);
                     let seek_clone = Arc::clone(&clip_seek);
                     let project_tb = nexir::timeline::rational::Rational {

@@ -5,6 +5,7 @@ use crate::render::resource::{ResourceBuilder, ResourceId};
 use crate::render::context::RenderContext;
 use crate::render::frame_state::FrameState;
 use crate::render::device::GpuDevice;
+use crate::timeline::source::FrameLayout;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 fn round_up_256(n: u32) -> u32 {
@@ -17,13 +18,19 @@ fn round_up_256(n: u32) -> u32 {
 /// map_async / poll(Wait) calls) so that this node never holds a lock while
 /// waiting for the GPU.  The `upload_frame` method may be called from any
 /// thread without causing device-wide GPU stalls.
+///
+/// P1.6 — the node is built from the [`FrameLayout`] the DECODER reported for the
+/// frame in the slot, not from the container's advertised pixel format.  Layout
+/// decides the texture formats (8- vs 16-bit), the row strides and whether chroma
+/// arrives interleaved, so a mismatch here shows up as a garbled or near-black
+/// picture rather than as a subtle colour shift.
 pub struct YuvUploadNode {
     pub clip_slot:    u32,
     /// Maximum dimensions the staging buffers were allocated for.
     pub width:        u32,
     pub height:       u32,
-    /// Bit depth per channel (e.g. 8 for 8-bit, 10 for 10-bit).
-    pub bit_depth:    u8,
+    /// Pixel layout of the frames this node uploads.
+    pub layout:       FrameLayout,
     /// Actual dimensions of the most-recently-uploaded frame (may be ≤ max).
     current_width:    AtomicU32,
     current_height:   AtomicU32,
@@ -35,6 +42,8 @@ pub struct YuvUploadNode {
 }
 
 impl YuvUploadNode {
+    /// Build a node for 8-bit planar I420 — the decoder's conversion target for
+    /// anything it cannot pass through.
     pub fn new(
         device:    &GpuDevice,
         clip_slot: u32,
@@ -43,20 +52,24 @@ impl YuvUploadNode {
         out_y:     ResourceId,
         out_uv:    ResourceId,
     ) -> Self {
-        Self::new_with_depth(device, clip_slot, width, height, out_y, out_uv, 8)
+        Self::new_with_layout(device, clip_slot, width, height, out_y, out_uv, FrameLayout::YUV420P8)
     }
 
-    pub fn new_with_depth(
+    /// Build a node for a specific decoded frame layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_layout(
         device:    &GpuDevice,
         clip_slot: u32,
         width:     u32,
         height:    u32,
         out_y:     ResourceId,
         out_uv:    ResourceId,
-        bit_depth: u8,
+        layout:    FrameLayout,
     ) -> Self {
-        let bpp = if bit_depth > 8 { 2u32 } else { 1u32 };
+        let bpp = layout.bytes_per_sample() as u32;
         let y_bytes_per_row  = round_up_256(width * bpp);
+        // Chroma rows hold two interleaved samples per chroma column, so a
+        // half-width chroma plane is the same byte width as the luma plane.
         let uv_bytes_per_row = round_up_256(width * bpp);
 
         let y_size  = y_bytes_per_row as u64 * height as u64;
@@ -81,7 +94,7 @@ impl YuvUploadNode {
             clip_slot,
             width,
             height,
-            bit_depth,
+            layout,
             current_width:  AtomicU32::new(width),
             current_height: AtomicU32::new(height),
             out_y,
@@ -92,12 +105,37 @@ impl YuvUploadNode {
         }
     }
 
+    /// Legacy constructor kept for the benchmark harness: builds a layout from a
+    /// bare bit depth, assuming planar chroma.
+    ///
+    /// Prefer [`Self::new_with_layout`] — for 10-bit data, planar and semi-planar
+    /// differ by a factor of 64 in sample normalisation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_depth(
+        device:    &GpuDevice,
+        clip_slot: u32,
+        width:     u32,
+        height:    u32,
+        out_y:     ResourceId,
+        out_uv:    ResourceId,
+        bit_depth: u8,
+    ) -> Self {
+        Self::new_with_layout(
+            device, clip_slot, width, height, out_y, out_uv,
+            FrameLayout { bit_depth, semi_planar: false, msb_aligned: false },
+        )
+    }
+
     /// Upload a YUV frame into the staging buffers using the wgpu queue's
     /// internal upload ring (**non-blocking, no poll(Wait)**).
+    ///
+    /// `semi_planar` must match the data in `yuv_data`; it is passed per-call
+    /// rather than taken from `self.layout` because the caller reads it off the
+    /// frame it is about to upload, and a mid-timeline format switch is possible.
     pub fn upload_frame(
         &self,
         yuv_data:     &[u8],
-        nv12:         bool,
+        semi_planar:  bool,
         frame_width:  u32,
         frame_height: u32,
     ) {
@@ -105,7 +143,7 @@ impl YuvUploadNode {
         let w = frame_width.min(self.width);
         let h = frame_height.min(self.height);
 
-        let bpp = if self.bit_depth > 8 { 2usize } else { 1usize };
+        let bpp = self.layout.bytes_per_sample();
         let y_size        = (frame_width * frame_height) as usize * bpp;
         let uv_plane_size = ((frame_width / 2) * (frame_height / 2)) as usize * bpp;
 
@@ -135,7 +173,9 @@ impl YuvUploadNode {
         let mut uv_buf = vec![0u8; uv_bytes_per_row * (self.height / 2) as usize];
         let uv_rows    = (h / 2) as usize;
 
-        if nv12 {
+        if semi_planar {
+            // NV12 / P010: one plane, U and V already interleaved, so the rows can
+            // be copied straight across.
             let src_uv_start = y_size;
             let src_uv_len   = (frame_width * (frame_height / 2)) as usize * bpp;
             if yuv_data.len() < src_uv_start + src_uv_len {
@@ -150,10 +190,11 @@ impl YuvUploadNode {
                         .copy_from_slice(&src_uv[src_start..src_start + uv_row_bytes]);
                 }
             }
-        } else if self.bit_depth > 8 {
-            // Planar 10-bit (YUV420P10)
+        } else if bpp == 2 {
+            // Planar 10/12-bit (YUV420P10LE, YUV420P12LE): separate U and V planes
+            // of 16-bit samples, interleaved here into one Rg16Unorm texture.
             if yuv_data.len() < y_size + 2 * uv_plane_size {
-                log::warn!("[upload] slot={} 10-bit YUV UV data too small, skipping UV", self.clip_slot);
+                log::warn!("[upload] slot={} high-depth planar UV data too small, skipping UV", self.clip_slot);
             } else {
                 let u_plane = &yuv_data[y_size..y_size + uv_plane_size];
                 let v_plane = &yuv_data[y_size + uv_plane_size..y_size + 2 * uv_plane_size];
@@ -205,7 +246,9 @@ impl RenderNode for YuvUploadNode {
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
         use crate::render::resource::{ResourceDescriptor, ResolutionSource, TextureAccess};
-        let (y_fmt, uv_fmt) = if self.bit_depth > 8 {
+        // 16-bit textures for any depth above 8.  The shader's `sample_scale`
+        // (see colour::yuv) is what compensates for the resulting normalisation.
+        let (y_fmt, uv_fmt) = if self.layout.is_high_depth() {
             (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm)
         } else {
             (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm)
@@ -234,7 +277,7 @@ impl RenderNode for YuvUploadNode {
         let cw = self.current_width.load(Ordering::Relaxed);
         let ch = self.current_height.load(Ordering::Relaxed);
 
-        let bpp = if self.bit_depth > 8 { 2u32 } else { 1u32 };
+        let bpp = self.layout.bytes_per_sample() as u32;
         let y_res            = ctx.get(self.out_y);
         let y_bytes_per_row  = round_up_256(self.width * bpp);
 

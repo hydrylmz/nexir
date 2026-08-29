@@ -5,6 +5,7 @@
 #include <libavutil/channel_layout.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/mastering_display_metadata.h>
 
 int get_av_pix_fmt_rgbaf16le() {
 #ifdef AV_PIX_FMT_RGBAF16LE
@@ -74,6 +75,12 @@ int av_frame_get_width(AVFrame* f) { return f->width; }
 int av_frame_get_height(AVFrame* f) { return f->height; }
 int64_t av_frame_get_pts(AVFrame* f) { return f->pts; }
 void av_frame_set_pts(AVFrame* f, int64_t pts) { f->pts = pts; }
+/* Frame duration, in the frame's own timebase (the encoder's time_base for
+ * frames handed to avcodec_send_frame).  libavcodec copies it onto the output
+ * AVPacket, and the mp4 muxer needs a non-zero duration on the LAST packet to
+ * size the final `stts` entry — without it the track's mdhd duration stops at
+ * the final frame's PTS and decoders discard that frame (AV_PKT_FLAG_DISCARD). */
+void av_frame_set_duration(AVFrame* f, int64_t duration) { f->duration = duration; }
 int* av_frame_get_linesize(AVFrame* f) { return f->linesize; }
 int av_frame_get_format(AVFrame* f) { return f->format; }
 int av_frame_get_nb_samples(AVFrame* f) { return f->nb_samples; }
@@ -83,6 +90,205 @@ int av_frame_get_color_space(AVFrame* f) { return f->colorspace; }
 int av_frame_get_color_range(AVFrame* f) { return f->color_range; }
 int av_frame_get_color_trc(AVFrame* f) { return f->color_trc; }
 int av_frame_get_color_primaries(AVFrame* f) { return f->color_primaries; }
+
+/* Colour-property setters.
+ *
+ * Needed because av_hwframe_transfer_data copies PIXELS only: the destination
+ * frame keeps its default "unspecified" colour fields, which would send every
+ * hardware-decoded HDR frame down the SDR path.  The decoder copies the
+ * properties across explicitly after the transfer. */
+void av_frame_set_color_space(AVFrame* f, int v) { f->colorspace = (enum AVColorSpace)v; }
+void av_frame_set_color_range(AVFrame* f, int v) { f->color_range = (enum AVColorRange)v; }
+void av_frame_set_color_trc(AVFrame* f, int v) { f->color_trc = (enum AVColorTransferCharacteristic)v; }
+void av_frame_set_color_primaries(AVFrame* f, int v) { f->color_primaries = (enum AVColorPrimaries)v; }
+
+/* Bits per component of a pixel format, from FFmpeg's own descriptor table.
+ * Returns 0 for formats with no descriptor (hardware surfaces), which the caller
+ * treats as "unknown". */
+int av_pix_fmt_bit_depth(int fmt) {
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get((enum AVPixelFormat)fmt);
+    return d ? d->comp[0].depth : 0;
+}
+
+/* Number of planes in a pixel format; 0 when the format has no descriptor. */
+int av_pix_fmt_plane_count(int fmt) {
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get((enum AVPixelFormat)fmt);
+    return d ? av_pix_fmt_count_planes((enum AVPixelFormat)fmt) : 0;
+}
+
+/* Bit shift of component 0 inside its storage word.  P010 stores 10-bit codes
+ * MSB-aligned in 16-bit words and reports shift=6; every planar high-depth
+ * format is LSB-aligned and reports 0.  That distinction is a factor of 64 in
+ * brightness if it is guessed wrong. */
+int av_pix_fmt_component_shift(int fmt) {
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get((enum AVPixelFormat)fmt);
+    return d ? d->comp[0].shift : 0;
+}
+
+/* AVCodecContext colour properties — set on an ENCODER context before
+ * avcodec_open2 so the muxer copies them into the container (mp4 `colr` box,
+ * Matroska colour element).  Without them an HDR export decodes as SDR no
+ * matter what the bitstream contains. */
+void avcodec_ctx_set_color_space(AVCodecContext* ctx, int v) { ctx->colorspace = (enum AVColorSpace)v; }
+void avcodec_ctx_set_color_range(AVCodecContext* ctx, int v) { ctx->color_range = (enum AVColorRange)v; }
+void avcodec_ctx_set_color_trc(AVCodecContext* ctx, int v) { ctx->color_trc = (enum AVColorTransferCharacteristic)v; }
+void avcodec_ctx_set_color_primaries(AVCodecContext* ctx, int v) { ctx->color_primaries = (enum AVColorPrimaries)v; }
+void avcodec_ctx_set_chroma_location(AVCodecContext* ctx, int v) { ctx->chroma_sample_location = (enum AVChromaLocation)v; }
+
+int avcodec_ctx_get_color_space(AVCodecContext* ctx) { return ctx->colorspace; }
+int avcodec_ctx_get_color_range(AVCodecContext* ctx) { return ctx->color_range; }
+int avcodec_ctx_get_color_trc(AVCodecContext* ctx) { return ctx->color_trc; }
+int avcodec_ctx_get_color_primaries(AVCodecContext* ctx) { return ctx->color_primaries; }
+
+/* AVCodecParameters colour properties — written directly on the muxer's stream
+ * so container metadata is correct even when the stream was described by a
+ * parameter-only encoder context (the NVENC path does exactly that). */
+void avcodecpar_set_color_space(AVCodecParameters* par, int v) { par->color_space = (enum AVColorSpace)v; }
+void avcodecpar_set_color_range(AVCodecParameters* par, int v) { par->color_range = (enum AVColorRange)v; }
+void avcodecpar_set_color_trc(AVCodecParameters* par, int v) { par->color_trc = (enum AVColorTransferCharacteristic)v; }
+void avcodecpar_set_color_primaries(AVCodecParameters* par, int v) { par->color_primaries = (enum AVColorPrimaries)v; }
+void avcodecpar_set_chroma_location(AVCodecParameters* par, int v) { par->chroma_location = (enum AVChromaLocation)v; }
+
+/* ── P1.7: HDR10 static metadata ──────────────────────────────────────────────
+ *
+ * SMPTE ST 2086 mastering-display colour volume (MDCV) and CTA-861.3 content
+ * light level (CLL).  Colour PRIMARIES/TRC tags alone tell a display "this is
+ * BT.2020 PQ"; these two tell it what the content was actually graded on, which
+ * is what a real HDR10 file must carry and what `ffprobe -show_frames` reports
+ * as `mastering_display_metadata` / `content_light_level`.
+ *
+ * Units are the ones the standard uses, so the caller passes integers and no
+ * float ever crosses the FFI:
+ *   - chromaticity x/y in increments of 0.00002  (denominator 50000)
+ *   - luminance in increments of 0.0001 cd/m^2   (denominator 10000)
+ *
+ * `prim` is 6 numerators in R.x R.y G.x G.y B.x B.y order; `wp` is 2.
+ *
+ * Two destinations are needed and they are NOT interchangeable:
+ *   1. AVCodecContext::decoded_side_data — read by the ENCODER at
+ *      avcodec_open2 time, which is what makes libx265/x264 emit the SEI
+ *      messages inside the bitstream.
+ *   2. AVCodecParameters::coded_side_data — read by the MUXER, which is what
+ *      writes the mp4 `mdcv`/`clli` boxes (and the Matroska colour elements).
+ * A file with only (1) loses its metadata to any remux; a file with only (2)
+ * loses it to any stream copy into a container that has no such boxes. */
+
+#define NEXIR_MDCV_CHROMA_DEN 50000
+#define NEXIR_MDCV_LUMA_DEN   10000
+
+static void nexir_fill_mdcv(AVMasteringDisplayMetadata* m,
+                            const int* prim, const int* wp,
+                            int min_luminance, int max_luminance) {
+    for (int i = 0; i < 3; i++) {
+        m->display_primaries[i][0].num = prim[i * 2];
+        m->display_primaries[i][0].den = NEXIR_MDCV_CHROMA_DEN;
+        m->display_primaries[i][1].num = prim[i * 2 + 1];
+        m->display_primaries[i][1].den = NEXIR_MDCV_CHROMA_DEN;
+    }
+    m->white_point[0].num = wp[0];
+    m->white_point[0].den = NEXIR_MDCV_CHROMA_DEN;
+    m->white_point[1].num = wp[1];
+    m->white_point[1].den = NEXIR_MDCV_CHROMA_DEN;
+    m->min_luminance.num = min_luminance;
+    m->min_luminance.den = NEXIR_MDCV_LUMA_DEN;
+    m->max_luminance.num = max_luminance;
+    m->max_luminance.den = NEXIR_MDCV_LUMA_DEN;
+    m->has_primaries = 1;
+    m->has_luminance = 1;
+}
+
+/* Attach MDCV + CLL to an encoder context.  Must be called BEFORE
+ * avcodec_open2: libavcodec reads decoded_side_data there and takes ownership
+ * of the array afterwards. Returns 0 on success, -1 on allocation failure. */
+int avcodec_ctx_set_hdr10_metadata(AVCodecContext* ctx,
+                                   const int* prim, const int* wp,
+                                   int min_luminance, int max_luminance,
+                                   unsigned max_cll, unsigned max_fall) {
+    AVFrameSideData* sd = av_frame_side_data_new(
+        &ctx->decoded_side_data, &ctx->nb_decoded_side_data,
+        AV_FRAME_DATA_MASTERING_DISPLAY_METADATA,
+        sizeof(AVMasteringDisplayMetadata),
+        AV_FRAME_SIDE_DATA_FLAG_REPLACE);
+    if (!sd) return -1;
+    nexir_fill_mdcv((AVMasteringDisplayMetadata*)sd->data, prim, wp,
+                    min_luminance, max_luminance);
+
+    AVFrameSideData* cl = av_frame_side_data_new(
+        &ctx->decoded_side_data, &ctx->nb_decoded_side_data,
+        AV_FRAME_DATA_CONTENT_LIGHT_LEVEL,
+        sizeof(AVContentLightMetadata),
+        AV_FRAME_SIDE_DATA_FLAG_REPLACE);
+    if (!cl) return -1;
+    ((AVContentLightMetadata*)cl->data)->MaxCLL  = max_cll;
+    ((AVContentLightMetadata*)cl->data)->MaxFALL = max_fall;
+    return 0;
+}
+
+/* Attach MDCV + CLL to a muxer stream's codec parameters.  Must be called
+ * BEFORE avformat_write_header. Returns 0 on success, -1 on failure. */
+int avcodecpar_set_hdr10_metadata(AVCodecParameters* par,
+                                  const int* prim, const int* wp,
+                                  int min_luminance, int max_luminance,
+                                  unsigned max_cll, unsigned max_fall) {
+    AVPacketSideData* sd = av_packet_side_data_new(
+        &par->coded_side_data, &par->nb_coded_side_data,
+        AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
+        sizeof(AVMasteringDisplayMetadata), 0);
+    if (!sd) return -1;
+    nexir_fill_mdcv((AVMasteringDisplayMetadata*)sd->data, prim, wp,
+                    min_luminance, max_luminance);
+
+    AVPacketSideData* cl = av_packet_side_data_new(
+        &par->coded_side_data, &par->nb_coded_side_data,
+        AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
+        sizeof(AVContentLightMetadata), 0);
+    if (!cl) return -1;
+    ((AVContentLightMetadata*)cl->data)->MaxCLL  = max_cll;
+    ((AVContentLightMetadata*)cl->data)->MaxFALL = max_fall;
+    return 0;
+}
+
+/* Read HDR10 static metadata back off a demuxed stream, for verification.
+ *
+ * `out` receives 8 values:
+ *   [0] has_primaries      [1] has_luminance
+ *   [2] min_luminance num  [3] min_luminance den
+ *   [4] max_luminance num  [5] max_luminance den
+ *   [6] MaxCLL             [7] MaxFALL
+ *
+ * Returns a bitmask: 1 = MDCV present, 2 = CLL present, 0 = neither. */
+int avcodecpar_get_hdr10_metadata(const AVCodecParameters* par, int64_t* out) {
+    int found = 0;
+    for (int i = 0; i < 8; i++) out[i] = 0;
+
+    const AVPacketSideData* sd = av_packet_side_data_get(
+        par->coded_side_data, par->nb_coded_side_data,
+        AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
+    if (sd && sd->size >= sizeof(AVMasteringDisplayMetadata)) {
+        const AVMasteringDisplayMetadata* m =
+            (const AVMasteringDisplayMetadata*)sd->data;
+        out[0] = m->has_primaries;
+        out[1] = m->has_luminance;
+        out[2] = m->min_luminance.num;
+        out[3] = m->min_luminance.den;
+        out[4] = m->max_luminance.num;
+        out[5] = m->max_luminance.den;
+        found |= 1;
+    }
+
+    const AVPacketSideData* cl = av_packet_side_data_get(
+        par->coded_side_data, par->nb_coded_side_data,
+        AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+    if (cl && cl->size >= sizeof(AVContentLightMetadata)) {
+        const AVContentLightMetadata* c = (const AVContentLightMetadata*)cl->data;
+        out[6] = c->MaxCLL;
+        out[7] = c->MaxFALL;
+        found |= 2;
+    }
+
+    return found;
+}
+
 
 SwrContext* swr_alloc_set_opts(SwrContext* s, int64_t out_ch_layout, enum AVSampleFormat out_sample_fmt, int out_sample_rate, int64_t in_ch_layout, enum AVSampleFormat in_sample_fmt, int in_sample_rate, int log_offset, void* log_ctx) {
     AVChannelLayout out_layout;

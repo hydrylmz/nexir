@@ -135,6 +135,23 @@ extern "C" {
     pub fn av_frame_get_color_trc(frame: *const AVFrame) -> std::ffi::c_int;
     pub fn av_frame_get_color_primaries(frame: *const AVFrame) -> std::ffi::c_int;
 
+    /// Colour-property setters.  `av_hwframe_transfer_data` copies pixels only,
+    /// so the decoder copies these across manually — see
+    /// `Decoder::copy_color_props`.
+    pub fn av_frame_set_color_space(frame: *mut AVFrame, v: std::ffi::c_int);
+    pub fn av_frame_set_color_range(frame: *mut AVFrame, v: std::ffi::c_int);
+    pub fn av_frame_set_color_trc(frame: *mut AVFrame, v: std::ffi::c_int);
+    pub fn av_frame_set_color_primaries(frame: *mut AVFrame, v: std::ffi::c_int);
+
+    /// Bits per component of an AVPixelFormat, from FFmpeg's descriptor table.
+    /// 0 when the format has no descriptor (hardware surfaces).
+    pub fn av_pix_fmt_bit_depth(fmt: std::ffi::c_int) -> std::ffi::c_int;
+    /// Number of planes in an AVPixelFormat; 0 when it has no descriptor.
+    pub fn av_pix_fmt_plane_count(fmt: std::ffi::c_int) -> std::ffi::c_int;
+    /// Bit shift of component 0 inside its storage word: 6 for P010 (MSB-aligned
+    /// 10-bit), 0 for LSB-aligned planar formats.
+    pub fn av_pix_fmt_component_shift(fmt: std::ffi::c_int) -> std::ffi::c_int;
+
     pub fn av_frame_set_width(frame: *mut AVFrame, width: std::ffi::c_int);
     pub fn av_frame_set_height(frame: *mut AVFrame, height: std::ffi::c_int);
     pub fn av_frame_set_format(frame: *mut AVFrame, format: std::ffi::c_int);
@@ -188,18 +205,74 @@ unsafe extern "C" {
 pub const AV_NOPTS_VALUE:        i64 = i64::MIN;
 pub const AV_NUM_DATA_POINTERS:  usize = 8;
 
+/// AV_PKT_FLAG_KEY — the packet belongs to a keyframe.  Muxers use it to build
+/// the container's sync-sample table (mp4 `stss`), so a stream written without
+/// it is not seekable even when its bitstream contains IDRs.
+pub const AV_PKT_FLAG_KEY: i32 = 0x0001;
+
 // FFmpeg AVERROR sentinel codes
 pub const AVERROR_EOF:    i32 = -541_478_725; // AVERROR(EOF)
 pub const AVERROR_EAGAIN: i32 = -11;          // EAGAIN / AVERROR(EAGAIN)
 
-// AVPixelFormat values for formats we handle
+// AVPixelFormat values for formats we handle.
+//
+// Verified against the installed FFmpeg headers (C:/ffmpeg/include) with a
+// standalone probe rather than transcribed: the enum is dense and shifts between
+// major versions, and AV_PIX_FMT_CUDA in particular was wrong here (119) for this
+// build, where it is 117.
 pub const AV_PIX_FMT_YUV420P:    i32 = 0;
 pub const AV_PIX_FMT_YUV422P:    i32 = 4;
 pub const AV_PIX_FMT_YUV444P:    i32 = 5;
 pub const AV_PIX_FMT_NV12:       i32 = 23;
-pub const AV_PIX_FMT_CUDA:       i32 = 119;
+/// 10-bit planar 4:2:0, codes LSB-aligned in 16-bit little-endian words.
+pub const AV_PIX_FMT_YUV420P10LE: i32 = 62;
+/// 10-bit planar 4:2:2.
+pub const AV_PIX_FMT_YUV422P10LE: i32 = 64;
+/// 10-bit planar 4:4:4.
+pub const AV_PIX_FMT_YUV444P10LE: i32 = 68;
+/// 12-bit planar 4:2:0.
+pub const AV_PIX_FMT_YUV420P12LE: i32 = 123;
+/// 10-bit semi-planar 4:2:0, codes MSB-aligned (`code << 6`) — NVDEC's HDR output.
+pub const AV_PIX_FMT_P010LE:     i32 = 158;
+/// 16-bit semi-planar 4:2:0.
+pub const AV_PIX_FMT_P016LE:     i32 = 169;
+pub const AV_PIX_FMT_CUDA:       i32 = 117;
 pub const AV_PIX_FMT_VIDEOTOOLBOX: i32 = 140;
 pub const AV_PIX_FMT_NONE:       i32 = -1;
+
+// AVColorRange / AVColorSpace / AVColorTransferCharacteristic / AVColorPrimaries
+// values, as read from an AVFrame by the shim accessors.  Also probed against the
+// installed headers.  `ColorInfo::from_ffmpeg` consumes these raw ints.
+pub const AVCOL_RANGE_UNSPECIFIED: i32 = 0;
+pub const AVCOL_RANGE_MPEG:        i32 = 1; // limited / broadcast
+pub const AVCOL_RANGE_JPEG:        i32 = 2; // full
+pub const AVCOL_SPC_UNSPECIFIED:   i32 = 2;
+pub const AVCOL_TRC_UNSPECIFIED:   i32 = 2;
+pub const AVCOL_PRI_UNSPECIFIED:   i32 = 2;
+
+/// Bit depth and chroma layout of a decoded AVFrame's pixel format.
+///
+/// Returns `None` for a format the render upload path cannot consume directly
+/// (RGB, 4:2:2/4:4:4, hardware surfaces), which is the decoder's signal to run it
+/// through swscale first.
+pub fn frame_layout_for_pix_fmt(
+    fmt: i32,
+) -> Option<crate::timeline::source::FrameLayout> {
+    use crate::timeline::source::FrameLayout;
+    Some(match fmt {
+        AV_PIX_FMT_YUV420P       => FrameLayout::YUV420P8,
+        AV_PIX_FMT_NV12          => FrameLayout::NV12,
+        AV_PIX_FMT_P010LE        => FrameLayout::P010,
+        AV_PIX_FMT_YUV420P10LE   => FrameLayout::YUV420P10,
+        AV_PIX_FMT_YUV420P12LE   => FrameLayout {
+            bit_depth: 12, semi_planar: false, msb_aligned: false,
+        },
+        AV_PIX_FMT_P016LE        => FrameLayout {
+            bit_depth: 16, semi_planar: true, msb_aligned: false,
+        },
+        _ => return None,
+    })
+}
 
 /// Format an AVERROR code as a Rust String for error reporting.
 pub fn av_err_to_string(errnum: i32) -> String {

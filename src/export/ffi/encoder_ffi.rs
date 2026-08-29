@@ -13,6 +13,43 @@ extern "C" {
     pub fn avcodec_ctx_set_pix_fmt(ctx: *mut AVCodecContext, pix_fmt: i32);
     pub fn avcodec_ctx_set_time_base(ctx: *mut AVCodecContext, tb: AVRational);
     pub fn avcodec_ctx_set_gop_size(ctx: *mut AVCodecContext, gop: i32);
+
+    // Colour description, set on the ENCODER context before `avcodec_open2` so
+    // libavcodec writes it into the bitstream (H.264/HEVC VUI) and the muxer
+    // copies it into the container. Without these an HDR export is decoded as
+    // SDR regardless of what the pixels contain.
+    pub fn avcodec_ctx_set_color_space(ctx: *mut AVCodecContext, v: i32);
+    pub fn avcodec_ctx_set_color_range(ctx: *mut AVCodecContext, v: i32);
+    pub fn avcodec_ctx_set_color_trc(ctx: *mut AVCodecContext, v: i32);
+    pub fn avcodec_ctx_set_color_primaries(ctx: *mut AVCodecContext, v: i32);
+    pub fn avcodec_ctx_set_chroma_location(ctx: *mut AVCodecContext, v: i32);
+
+    pub fn avcodec_ctx_get_color_space(ctx: *const AVCodecContext) -> i32;
+    pub fn avcodec_ctx_get_color_range(ctx: *const AVCodecContext) -> i32;
+    pub fn avcodec_ctx_get_color_trc(ctx: *const AVCodecContext) -> i32;
+    pub fn avcodec_ctx_get_color_primaries(ctx: *const AVCodecContext) -> i32;
+
+    /// Attach HDR10 static metadata (SMPTE ST 2086 mastering display + CTA-861.3
+    /// content light level) to an encoder context.
+    ///
+    /// MUST be called before `avcodec_open2`: libavcodec reads
+    /// `AVCodecContext::decoded_side_data` there and that is what makes
+    /// libx265/libx264 emit the corresponding SEI messages into the bitstream.
+    /// Afterwards the array is owned by the encoder.
+    ///
+    /// `prim` is 6 chromaticity numerators over 50000 (`R.x R.y G.x G.y B.x B.y`),
+    /// `wp` is 2 over 50000, luminances are numerators over 10000.
+    /// Returns 0 on success, -1 on allocation failure.
+    pub fn avcodec_ctx_set_hdr10_metadata(
+        ctx:           *mut AVCodecContext,
+        prim:          *const i32,
+        wp:            *const i32,
+        min_luminance: i32,
+        max_luminance: i32,
+        max_cll:       u32,
+        max_fall:      u32,
+    ) -> std::ffi::c_int;
+
     
     pub fn av_opt_set(
         obj:   *mut std::ffi::c_void,
@@ -67,6 +104,13 @@ extern "C" {
     pub fn av_frame_alloc() -> *mut AVFrame;
     pub fn av_frame_free(frame: *mut *mut AVFrame);
     pub fn av_frame_set_pts(frame: *mut AVFrame, pts: i64);
+    /// Set `AVFrame::duration`, in the frame's own timebase.
+    ///
+    /// libavcodec propagates it to the encoded `AVPacket`, and the mp4 muxer
+    /// uses the last packet's duration to close the final `stts` entry.  A zero
+    /// duration there makes the track's `mdhd` duration end exactly at the last
+    /// frame's PTS, and decoders then flag that frame `AV_PKT_FLAG_DISCARD`.
+    pub fn av_frame_set_duration(frame: *mut AVFrame, duration: i64);
     pub fn av_frame_get_buffer(frame: *mut AVFrame, align: std::ffi::c_int) -> std::ffi::c_int;
 }
 

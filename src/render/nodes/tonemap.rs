@@ -19,6 +19,12 @@ pub enum ToneMapMode {
     AcesFilmic,
     /// Reinhard luminance-based mapping.
     Reinhard,
+    /// Leave linear light untouched (no compression, no clamp above 1.0).
+    ///
+    /// This is the mode an HDR *output* needs: the highlights above diffuse white
+    /// are the whole point of the format, and any of the three modes above would
+    /// flatten them before the PQ/HLG encode.
+    Passthrough,
 }
 
 /// Input transfer function of the source content.
@@ -34,24 +40,55 @@ pub enum InputTransferFn {
     Srgb,
 }
 
+impl InputTransferFn {
+    /// Shader selector id.  Shared by the input and output slots — the WGSL uses
+    /// one mapping for both.
+    fn shader_id(self) -> u32 {
+        match self {
+            Self::Linear => 0,
+            Self::Pq     => 1,
+            Self::Hlg    => 2,
+            Self::Srgb   => 3,
+        }
+    }
+
+    /// The transfer function matching a clip's `ColorInfo`.
+    ///
+    /// Everything that is not explicitly PQ or HLG is treated as display-encoded
+    /// SDR, because that is what `yuv_to_rgb.wgsl` leaves in the texture: it
+    /// applies the colour matrix but no EOTF, so the values are still R'G'B' in
+    /// the source's own curve.
+    pub fn from_color_info(color: &crate::timeline::source::ColorInfo) -> Self {
+        use crate::timeline::source::TransferFunction;
+        match color.transfer_fn {
+            TransferFunction::Pq     => Self::Pq,
+            TransferFunction::Hlg    => Self::Hlg,
+            TransferFunction::Linear => Self::Linear,
+            _                        => Self::Srgb,
+        }
+    }
+}
+
 /// Gamut conversion applied before tone mapping.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GamutConversion {
-    /// No gamut conversion — signal is already in BT.709 space.
+    /// No gamut conversion — signal is already in the target's primaries.
     None,
     /// Convert BT.2020 wide-gamut to BT.709 display-referred.
     Bt2020ToBt709,
+    /// Convert BT.709 to BT.2020 — for placing an SDR clip in an HDR timeline.
+    Bt709ToBt2020,
 }
 
-/// Push constants matching struct ToneMapParams in tonemap.wgsl (32 bytes).
+/// Push constants matching struct ToneMapParams in tonemap.wgsl (48 bytes).
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct ToneMapPushConstants {
-    /// Transfer function selector: 0=Linear, 1=PQ, 2=HLG, 3=sRGB.
+    /// Input transfer function selector: 0=Linear, 1=PQ, 2=HLG, 3=sRGB.
     pub transfer_fn:  u32,
-    /// Gamut conversion: 0=None (pass-through), 1=BT.2020->BT.709.
+    /// Gamut conversion: 0=None, 1=BT.2020->BT.709, 2=BT.709->BT.2020.
     pub gamut_conv:   u32,
-    /// Tone-mapping mode: 0=Clamp, 1=ACES, 2=Reinhard, 3=BT.2446a.
+    /// Tone-mapping mode: 0=Clamp, 1=ACES, 2=Reinhard, 3=Passthrough.
     pub tonemap_mode: u32,
     /// Reference peak luminance in nits (e.g. 1000.0 for HDR10, 203.0 for HLG).
     pub peak_nits:    f32,
@@ -61,12 +98,34 @@ pub struct ToneMapPushConstants {
     pub height:       u32,
     /// Exposure gain multiplier (default 1.0).
     pub exposure:     f32,
-    pub _pad:         f32,
+    /// Output transfer function selector, same encoding as `transfer_fn`.
+    ///
+    /// P1.7 — this is what makes the node usable in both directions. It used not
+    /// to exist: the shader always wrote linear light, which the rest of the chain
+    /// then misread as display-encoded.
+    pub output_transfer_fn: u32,
+    /// Luminance that linear 1.0 stands for, in cd/m². 100.0 by convention.
+    pub sdr_reference_nits: f32,
+    pub _pad0:        f32,
+    pub _pad1:        f32,
+    pub _pad2:        f32,
 }
 
-const _: () = assert!(std::mem::size_of::<ToneMapPushConstants>() == 32);
+const _: () = assert!(std::mem::size_of::<ToneMapPushConstants>() == 48);
+
+/// Byte size of the tone-map push-constant block, shared by the pipeline layout
+/// and the dispatch so the two can never disagree.
+pub const TONEMAP_PUSH_CONSTANT_SIZE: u32 = 48;
+
+/// Conventional SDR diffuse-white reference, in cd/m².
+pub const SDR_REFERENCE_NITS: f32 = 100.0;
 
 impl ToneMapPushConstants {
+    /// HDR (or SDR) input -> SDR display-encoded output.
+    ///
+    /// Output is sRGB-encoded, NOT linear: every consumer of a tone-mapped
+    /// texture in this engine (the preview blit, the RGBA16F->RGBA8 conversion in
+    /// the CPU encoder, the ABGR10 repack) treats its input as display-encoded.
     pub fn for_sdr_preview(
         transfer_fn:  InputTransferFn,
         gamut:        GamutConversion,
@@ -75,30 +134,89 @@ impl ToneMapPushConstants {
         width:        u32,
         height:       u32,
     ) -> Self {
-        let trc_id = match transfer_fn {
-            InputTransferFn::Linear => 0,
-            InputTransferFn::Pq     => 1,
-            InputTransferFn::Hlg    => 2,
-            InputTransferFn::Srgb   => 3,
-        };
-        let gamut_id = match gamut {
-            GamutConversion::None          => 0,
-            GamutConversion::Bt2020ToBt709 => 1,
-        };
-        let tonemap_id = match tonemap_mode {
-            ToneMapMode::ClampOnly  => 0,
-            ToneMapMode::AcesFilmic => 1,
-            ToneMapMode::Reinhard   => 2,
-        };
         Self {
-            transfer_fn:  trc_id,
-            gamut_conv:   gamut_id,
-            tonemap_mode: tonemap_id,
+            transfer_fn:  transfer_fn.shader_id(),
+            gamut_conv:   gamut.shader_id(),
+            tonemap_mode: tonemap_mode.shader_id(),
             peak_nits,
             width,
             height,
             exposure: 1.0,
-            _pad: 0.0,
+            output_transfer_fn: InputTransferFn::Srgb.shader_id(),
+            sdr_reference_nits: SDR_REFERENCE_NITS,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        }
+    }
+
+    /// Convert a clip into an HDR **output** curve, preserving its highlights.
+    ///
+    /// P1.7 — this is the HDR export path. Tone mapping is `Passthrough`, so
+    /// nothing is compressed into [0,1]; the pass exists to line the clip's
+    /// transfer function and primaries up with the output's.
+    ///
+    /// Both directions matter for a mixed timeline: an HDR clip going to an HDR
+    /// output is (near) identity, while an SDR Rec.709 clip is decoded, moved to
+    /// BT.2020 primaries and re-encoded to PQ so it sits at its correct diffuse
+    /// brightness in an HDR file instead of being stretched to peak white.
+    pub fn for_hdr_output(
+        input_transfer_fn:  InputTransferFn,
+        gamut:              GamutConversion,
+        output_transfer_fn: InputTransferFn,
+        peak_nits:          f32,
+        width:              u32,
+        height:             u32,
+    ) -> Self {
+        Self {
+            transfer_fn:  input_transfer_fn.shader_id(),
+            gamut_conv:   gamut.shader_id(),
+            tonemap_mode: ToneMapMode::Passthrough.shader_id(),
+            peak_nits,
+            width,
+            height,
+            exposure: 1.0,
+            output_transfer_fn: output_transfer_fn.shader_id(),
+            sdr_reference_nits: SDR_REFERENCE_NITS,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        }
+    }
+}
+
+impl GamutConversion {
+    fn shader_id(self) -> u32 {
+        match self {
+            Self::None          => 0,
+            Self::Bt2020ToBt709 => 1,
+            Self::Bt709ToBt2020 => 2,
+        }
+    }
+
+    /// Pick the conversion that takes `from` primaries to `to` primaries.
+    pub fn between(
+        from: crate::timeline::source::ColorPrimaries,
+        to:   crate::timeline::source::ColorPrimaries,
+    ) -> Self {
+        use crate::timeline::source::ColorPrimaries;
+        match (from, to) {
+            (ColorPrimaries::Bt2020, ColorPrimaries::Bt709)  => Self::Bt2020ToBt709,
+            (ColorPrimaries::Bt709,  ColorPrimaries::Bt2020) => Self::Bt709ToBt2020,
+            // Unknown on either side means "no reliable information", and guessing
+            // a matrix is worse than leaving the primaries alone.
+            _ => Self::None,
+        }
+    }
+}
+
+impl ToneMapMode {
+    fn shader_id(self) -> u32 {
+        match self {
+            Self::ClampOnly   => 0,
+            Self::AcesFilmic  => 1,
+            Self::Reinhard    => 2,
+            Self::Passthrough => 3,
         }
     }
 }
@@ -157,7 +275,7 @@ impl ToneMapNode {
                 bind_group_layouts: &[&bind_group_layout],
                 push_constant_ranges: &[wgpu::PushConstantRange {
                     stages: wgpu::ShaderStages::COMPUTE,
-                    range: 0..32,
+                    range: 0..TONEMAP_PUSH_CONSTANT_SIZE,
                 }],
             },
         );

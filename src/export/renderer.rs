@@ -13,6 +13,11 @@ use crate::render::device::GpuDevice;
 use crate::render::frame_state::FrameState;
 use crate::render::graph::{CompiledGraph, RenderGraphCompiler};
 use crate::render::nodes::composite::CompositeNode;
+use crate::render::nodes::color_correction::{ColorCorrectionNode, ColorCorrectionParams};
+use crate::render::nodes::chroma_key::{ChromaKeyNode, ChromaKeyParams};
+use crate::render::nodes::gaussian_blur::{BlurPassNode, BlurParams};
+use crate::render::nodes::sharpen::{SharpenNode, SharpenParams};
+use crate::render::nodes::vignette::{VignetteNode, VignetteParams};
 use crate::render::nodes::yuv_to_rgb::YuvToRgbNode;
 use crate::render::nodes::yuv_upload::YuvUploadNode;
 use crate::render::nodes::tonemap::{ToneMapNode, ToneMapPushConstants, InputTransferFn, GamutConversion, ToneMapMode};
@@ -20,7 +25,8 @@ use crate::render::resource::ResourceId;
 use crate::render::shader::registry::ShaderRegistry;
 use crate::render::still_image::StillImageCache;
 use crate::scheduler::frame_scheduler::FrameScheduler;
-use crate::timeline::source::{ColorInfo, ColorRange, MatrixCoefficients, TransferFunction, ColorPrimaries, SourceRegistry, is_still_image_path};
+use crate::timeline::source::{DecodedFrameMeta, SourceRegistry, is_still_image_path};
+use crate::timeline::ids::SourceId;
 use crate::timeline::store::TimelineStore;
 use crate::timeline::track::TrackList;
 use std::sync::Arc;
@@ -43,15 +49,24 @@ const MIN_COMPOSITE_SLOTS: u32 = 1;
 /// Describes the set of active clips for a frame.  When this changes between
 /// frames the render graph must be recompiled (different clip dimensions →
 /// different texture sizes → different pipeline bind groups).
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 struct ClipSignature {
+    source_id: SourceId,
     clip_width: u32,
     clip_height: u32,
-    is_nv12: bool,
+    /// Pixel layout and colour of the frame currently in this clip's slot.
+    ///
+    /// P1.6 — the signature keys off the DECODED metadata, not the container's,
+    /// and includes it in full.  Both halves matter: a clip whose colour or bit
+    /// depth changes mid-timeline (a source with per-frame metadata, or a decoder
+    /// that switched to a swscale fallback) needs a recompile, because
+    /// `YuvToRgbNode` bakes the conversion in at construction time.
+    frame_meta: DecodedFrameMeta,
     /// True when this clip is a still image (PNG/JPEG/etc).  Still images use
     /// `StillImageUploadNode` instead of `YuvUploadNode → YuvToRgbNode`, so a
     /// change in this flag must trigger graph recompilation.
     is_still_image: bool,
+    effects: crate::timeline::transform::ClipEffects,
 }
 
 pub struct ExportRenderer {
@@ -129,10 +144,14 @@ impl ExportRenderer {
                     .map(|p| is_still_image_path(p.as_ref()))
                     .unwrap_or(false);
                 ClipSignature {
+                    source_id: c.source_id,
                     clip_width: c.clip_width,
                     clip_height: c.clip_height,
-                    is_nv12: c.is_nv12,
+                    // Straight from the decoder — see the field's comment for why
+                    // this is not read from `sources.video_info()`.
+                    frame_meta: c.frame_meta,
                     is_still_image: is_still,
+                    effects: c.effects,
                 }
             })
             .collect()
@@ -140,10 +159,9 @@ impl ExportRenderer {
 
     /// Compile (or reuse the cached) render graph for the active clips in `frame`.
     ///
-    /// Recompilation happens only when the number of active clips, their
-    /// dimensions, or their still-image flag changes — typically at segment
-    /// boundaries or on the very first frame.  Within a single clip's span the
-    /// graph is reused every frame.
+    /// Recompilation happens when the active clips, their dimensions, their
+    /// still-image flags, or their effect settings change. Within a stable
+    /// clip span the graph is reused every frame.
     ///
     /// Still-image clips (PNG, JPEG, etc.) bypass the YUV pipeline entirely:
     /// a `StillImageUploadNode` copies the pre-decoded Rgba16Float staging
@@ -199,7 +217,20 @@ impl ExportRenderer {
                         compiler.add_node(Box::new(
                             crate::render::still_image::StillImageUploadNode::new(cached, rgba_id),
                         ));
-                        comp_node.input_textures.push(rgba_id);
+                        // A still image is sRGB full-range Rec.709.  For an SDR job
+                        // that needs no transform at all; for an HDR job it needs
+                        // the same 709→2020 + PQ encode any SDR clip gets, or it
+                        // would be read as PQ code values and come out near-black.
+                        let transformed_id = self.add_color_transform(
+                            &mut compiler,
+                            rgba_id,
+                            &crate::timeline::source::ColorInfo::srgb(),
+                            clip.clip_width,
+                            clip.clip_height,
+                            &mut id_counter,
+                        );
+                        let final_id = self.add_effect_chain(&mut compiler, transformed_id, clip, &mut id_counter);
+                        comp_node.input_textures.push(final_id);
                         upload_indices.push(None);
                         continue;
                     } else {
@@ -221,39 +252,30 @@ impl ExportRenderer {
             let y_id  = ResourceId::next(&mut id_counter);
             let uv_id = ResourceId::next(&mut id_counter);
 
-            // Look up the real ColorInfo from the source. Fall back to BT.709/Limited
-            // for any source that doesn't have registered video info.
-            let color_info = {
-                let sources = self.sources.read().unwrap();
-                sources
-                    .video_info(clip.source_id)
-                    .map(|vi| vi.color_info)
-                    .unwrap_or(ColorInfo {
-                        matrix:      MatrixCoefficients::Bt709,
-                        range:       ColorRange::Limited,
-                        transfer_fn: TransferFunction::Bt709,
-                        primaries:   ColorPrimaries::Bt709,
-                        bit_depth:   8,
-                    })
-            };
+            // P1.6 — layout and colour both come from the frame the decoder
+            // actually produced.  Reading them off the source registry instead was
+            // wrong whenever the decoder converted the frame (swscale fallback) or
+            // the stream header disagreed with the frame's own metadata.
+            let layout     = clip_sig.frame_meta.layout;
+            let color_info = clip_sig.frame_meta.color;
 
             // Create YuvUpload with the clip's ACTUAL dimensions so the GPU
             // textures are exactly the right size — no wasted rows, no green fill.
-            let upload_node = YuvUploadNode::new_with_depth(
+            let upload_node = YuvUploadNode::new_with_layout(
                 &self.device,
                 slot as u32,
                 clip.clip_width,
                 clip.clip_height,
                 y_id,
                 uv_id,
-                color_info.bit_depth,
+                layout,
             );
 
             let node_idx = compiler.add_node(Box::new(upload_node));
             upload_indices.push(Some(node_idx));
 
 
-            compiler.add_node(Box::new(YuvToRgbNode::new(
+            compiler.add_node(Box::new(YuvToRgbNode::new_with_layout(
                 &self.device,
                 &self.shaders,
                 &self.compute_cache,
@@ -263,45 +285,35 @@ impl ExportRenderer {
                 clip.clip_width,
                 clip.clip_height,
                 color_info,
+                layout.semi_planar,
             )));
 
-            // Tone-map HDR clips to SDR for CPU/GPU export pipelines
-            let final_rgba_id = if color_info.is_hdr() {
-                use crate::timeline::source::{TransferFunction, ColorPrimaries};
-                let tonemapped_id = ResourceId::next(&mut id_counter);
-                let trc = match color_info.transfer_fn {
-                    TransferFunction::Pq  => InputTransferFn::Pq,
-                    TransferFunction::Hlg => InputTransferFn::Hlg,
-                    _                     => InputTransferFn::Linear,
-                };
-                let gamut = if color_info.effective_primaries(
-                    clip.clip_width, clip.clip_height
-                ) == ColorPrimaries::Bt2020 {
-                    GamutConversion::Bt2020ToBt709
-                } else {
-                    GamutConversion::None
-                };
-                let tm_params = ToneMapPushConstants::for_sdr_preview(
-                    trc,
-                    gamut,
-                    ToneMapMode::AcesFilmic,
-                    1000.0,
-                    clip.clip_width,
-                    clip.clip_height,
-                );
-                compiler.add_node(Box::new(ToneMapNode::new(
-                    &self.device,
-                    &self.shaders,
-                    &self.compute_cache,
-                    rgba_id,
-                    tonemapped_id,
-                    tm_params,
-                )));
-                tonemapped_id
-            } else {
-                rgba_id
-            };
+            // ── Colour transform into the output's space ──────────────────────
+            //
+            // P1.7 — this used to be an unconditional HDR->SDR tone-map, applied
+            // only to HDR clips.  It is now driven by the JOB's target colour
+            // space, which is what makes a real HDR export possible:
+            //
+            //   * SDR job, HDR clip  → decode PQ/HLG, BT.2020→709, ACES tone-map,
+            //                          re-encode sRGB.  (What it always did, minus
+            //                          the bug of writing linear light out.)
+            //   * HDR job, HDR clip  → line the transfer function and primaries up
+            //                          with the output's, highlights intact.
+            //   * HDR job, SDR clip  → decode sRGB, BT.709→2020, re-encode PQ, so
+            //                          the clip sits at its correct diffuse
+            //                          brightness in the HDR file rather than
+            //                          being stretched to peak white.
+            //   * SDR job, SDR clip  → no node at all.
+            let final_rgba_id = self.add_color_transform(
+                &mut compiler,
+                rgba_id,
+                &color_info,
+                clip.clip_width,
+                clip.clip_height,
+                &mut id_counter,
+            );
 
+            let final_rgba_id = self.add_effect_chain(&mut compiler, final_rgba_id, clip, &mut id_counter);
             comp_node.input_textures.push(final_rgba_id);
         }
 
@@ -322,6 +334,234 @@ impl ExportRenderer {
         self.upload_indices = upload_indices;
 
         Ok(())
+    }
+
+    /// Insert whatever colour-space conversion this clip needs to land in the
+    /// job's output colour space, returning the resource holding the result.
+    ///
+    /// Returns `input` unchanged when nothing is needed — an SDR clip in an SDR
+    /// job, which is the overwhelmingly common case, adds no node and costs no
+    /// pass.
+    ///
+    /// P1.7 — the previous logic here only ever went one direction (HDR clip →
+    /// SDR output) and was keyed off the clip alone, so the job's own target
+    /// colour space had no influence on the pixels at all. That is what made an
+    /// `output_color = bt2020(true, 10)` export a file with HDR tags over SDR
+    /// pixels. Both the source and the destination are now consulted.
+    fn add_color_transform(
+        &self,
+        compiler:    &mut RenderGraphCompiler,
+        input:       ResourceId,
+        clip_color:  &crate::timeline::source::ColorInfo,
+        width:       u32,
+        height:      u32,
+        id_counter:  &mut u32,
+    ) -> ResourceId {
+        use crate::timeline::source::TransferFunction;
+
+        let job_is_hdr  = self.job.is_hdr();
+        let clip_is_hdr = matches!(
+            clip_color.transfer_fn,
+            TransferFunction::Pq | TransferFunction::Hlg
+        );
+
+        let src_primaries = clip_color.effective_primaries(width, height);
+        let dst_primaries = self.job.output_color.effective_primaries(
+            self.job.width, self.job.height,
+        );
+        let gamut = GamutConversion::between(src_primaries, dst_primaries);
+        let src_trc = InputTransferFn::from_color_info(clip_color);
+
+        // Nothing to do: SDR in, SDR out, same primaries.  Skip the pass entirely
+        // rather than running an identity decode/encode round trip, which would
+        // cost a full-frame dispatch and lose a little precision to the two
+        // transfer-function conversions.
+        if !job_is_hdr && !clip_is_hdr && gamut == GamutConversion::None {
+            return input;
+        }
+
+        let output_id = ResourceId::next(id_counter);
+
+        let params = if job_is_hdr {
+            // HDR target: match the output's curve and keep the highlights.
+            let dst_trc = match self.job.output_color.transfer_fn {
+                TransferFunction::Hlg => InputTransferFn::Hlg,
+                // Everything else on an HDR job is PQ — `ExportJob::is_hdr` only
+                // returns true for PQ or HLG.
+                _                     => InputTransferFn::Pq,
+            };
+            let peak = self
+                .job
+                .hdr10
+                .as_ref()
+                .map(|h| h.peak_nits())
+                .unwrap_or(1000.0);
+            log::info!(
+                "[export] colour transform: {src_trc:?}/{src_primaries:?} → \
+                 {dst_trc:?}/{dst_primaries:?} (HDR passthrough, peak {peak} nits)"
+            );
+            ToneMapPushConstants::for_hdr_output(
+                src_trc, gamut, dst_trc, peak, width, height,
+            )
+        } else {
+            // SDR target: tone-map down to display-referred sRGB.
+            log::info!(
+                "[export] colour transform: {src_trc:?}/{src_primaries:?} → \
+                 SDR sRGB/{dst_primaries:?} (ACES tone-map)"
+            );
+            ToneMapPushConstants::for_sdr_preview(
+                src_trc,
+                gamut,
+                ToneMapMode::AcesFilmic,
+                1000.0,
+                width,
+                height,
+            )
+        };
+
+        compiler.add_node(Box::new(ToneMapNode::new(
+            &self.device,
+            &self.shaders,
+            &self.compute_cache,
+            input,
+            output_id,
+            params,
+        )));
+        output_id
+    }
+
+    fn add_effect_chain(
+        &self,
+        compiler: &mut RenderGraphCompiler,
+        input: ResourceId,
+        clip: &crate::render::frame_state::ClipRenderEntry,
+        id_counter: &mut u32,
+    ) -> ResourceId {
+        let effects = clip.effects;
+        let width = clip.clip_width;
+        let height = clip.clip_height;
+        let mut current = input;
+
+        if effects.color_enabled {
+            let output = ResourceId::next(id_counter);
+            compiler.add_node(Box::new(ColorCorrectionNode::new(
+                &self.device,
+                &self.shaders,
+                &self.compute_cache,
+                current,
+                output,
+                ColorCorrectionParams {
+                    lift: [0.0; 4],
+                    gamma: [1.0; 4],
+                    gain: [1.0; 4],
+                    saturation: effects.saturation,
+                    brightness: effects.brightness,
+                    contrast: effects.contrast,
+                    hue_shift: effects.hue.to_radians(),
+                    width,
+                    height,
+                    _pad0: 0.0,
+                    _pad1: 0.0,
+                },
+            )));
+            current = output;
+        }
+
+        if effects.blur_enabled {
+            let horizontal = ResourceId::next(id_counter);
+            compiler.add_node(Box::new(BlurPassNode::new(
+                &self.device,
+                &self.shaders,
+                &self.compute_cache,
+                current,
+                horizontal,
+                BlurParams::horizontal(effects.blur_radius, effects.blur_sigma, width, height),
+                "ExportBlurH",
+            )));
+            let vertical = ResourceId::next(id_counter);
+            compiler.add_node(Box::new(BlurPassNode::new(
+                &self.device,
+                &self.shaders,
+                &self.compute_cache,
+                horizontal,
+                vertical,
+                BlurParams::vertical(effects.blur_radius, effects.blur_sigma, width, height),
+                "ExportBlurV",
+            )));
+            current = vertical;
+        }
+
+        if effects.sharpen_enabled {
+            let output = ResourceId::next(id_counter);
+            compiler.add_node(Box::new(SharpenNode::new(
+                &self.device,
+                &self.shaders,
+                &self.compute_cache,
+                current,
+                output,
+                SharpenParams::new(effects.sharpen_amount, width, height),
+            )));
+            current = output;
+        }
+
+        if effects.vignette_enabled {
+            let output = ResourceId::next(id_counter);
+            compiler.add_node(Box::new(VignetteNode::new(
+                &self.device,
+                &self.shaders,
+                &self.compute_cache,
+                current,
+                output,
+                VignetteParams {
+                    intensity: effects.vignette_intensity,
+                    radius: effects.vignette_radius,
+                    softness: effects.vignette_softness,
+                    roundness: effects.vignette_roundness,
+                    center_x: 0.5,
+                    center_y: 0.5,
+                    width,
+                    height,
+                },
+            )));
+            current = output;
+        }
+
+        if effects.chroma_key_enabled {
+            let output = ResourceId::next(id_counter);
+            let [red, green, blue] = effects.chroma_key_color;
+            let max = red.max(green).max(blue);
+            let min = red.min(green).min(blue);
+            let delta = max - min;
+            let hue = if delta <= f32::EPSILON {
+                0.0
+            } else if (max - red).abs() <= f32::EPSILON {
+                60.0 * ((green - blue) / delta).rem_euclid(6.0)
+            } else if (max - green).abs() <= f32::EPSILON {
+                60.0 * ((blue - red) / delta + 2.0)
+            } else {
+                60.0 * ((red - green) / delta + 4.0)
+            };
+            compiler.add_node(Box::new(ChromaKeyNode::new(
+                &self.device,
+                &self.shaders,
+                &self.compute_cache,
+                current,
+                output,
+                ChromaKeyParams {
+                    key_hue: hue,
+                    tolerance: effects.chroma_key_tolerance * 360.0,
+                    softness: effects.chroma_key_softness * 360.0,
+                    min_saturation: 0.15,
+                    min_value: 0.08,
+                    spill_suppress: 0.3,
+                    width,
+                    height,
+                },
+            )));
+            current = output;
+        }
+
+        current
     }
 
     /// Upload YUV data for every active *video* clip into the staging buffers
@@ -359,12 +599,91 @@ impl ExportRenderer {
                 let slot_id = crate::io::slot_pool::FrameSlotId { tier, index };
 
                 io.pool.with_buffer_read(slot_id, |data| {
-                    upload.upload_frame(data, clip.is_nv12, clip.clip_width, clip.clip_height);
+                    upload.upload_frame(
+                        data,
+                        clip.frame_meta.layout.semi_planar,
+                        clip.clip_width,
+                        clip.clip_height,
+                    );
                 });
             } else {
                 log::warn!("[export] slot {slot_idx}: failed to downcast YuvUploadNode");
             }
         }
+    }
+
+    /// Hand a batch of NVENC bitstreams to the muxer, in the order NVENC produced
+    /// them (decode order).  Called for every packet the encoder returns, wherever
+    /// it came from — submission, slot reclaim, or the final drain.
+    fn mux_nvenc_packets(
+        &self,
+        packets: Vec<crate::interop::encode_interop::EncodedPacket>,
+        context: &str,
+    ) -> Result<(), RenderError> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        let ExportBackend::GpuNvenc { muxer, .. } = &self.backend else {
+            return Ok(());
+        };
+        let muxer_ref = &**muxer;
+        for packet in &packets {
+            if packet.bytes.is_empty() {
+                continue;
+            }
+            let mut sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
+                if let Err(e) = muxer_ref.write_packet(pkt, true) {
+                    log::error!("[export] NVENC mux write_packet failed ({context}): {e:?}");
+                }
+            };
+            crate::export::video_encoder::write_nvenc_packet(packet, &mut sink).map_err(|e| {
+                log::error!("[export] packet hand-off failed ({context}): {e:?}");
+                RenderError::GpuTimeout
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Free one pipeline slot: block until NVENC has finished with every in-flight
+    /// picture that still owns it, muxing whatever comes out.
+    ///
+    /// Must be called before recording GPU work that overwrites the slot's ABGR10
+    /// texture — that is the resource-lifetime guarantee of the async pipeline.
+    fn nvenc_reclaim_slot(&mut self, slot: usize) -> Result<(), RenderError> {
+        let packets = match &mut self.backend {
+            ExportBackend::GpuNvenc { video_enc, .. } => {
+                let interop = video_enc
+                    .nvenc_interop_mut()
+                    .expect("nvenc_interop_mut: invariant — GpuNvenc arm");
+                interop.reclaim_slot(slot).map_err(|e| {
+                    log::error!("[export] reclaim_slot({slot}) failed: {e:?}");
+                    RenderError::GpuTimeout
+                })?
+            }
+            _ => Vec::new(),
+        };
+        self.mux_nvenc_packets(packets, "slot reclaim")
+    }
+
+    /// Submit one rendered frame to NVENC and mux anything that came back.
+    ///
+    /// Non-blocking with respect to *this* frame: it returns as soon as the driver
+    /// has accepted the picture.  The packets it yields belong to earlier frames.
+    fn nvenc_submit_frame(&mut self, frame_idx: usize, slot: usize) -> Result<(), RenderError> {
+        let pts = self.job.frame_pts(frame_idx);
+        let packets = match &mut self.backend {
+            ExportBackend::GpuNvenc { video_enc, .. } => {
+                let interop = video_enc
+                    .nvenc_interop_mut()
+                    .expect("nvenc_interop_mut: invariant — GpuNvenc arm");
+                interop.encode_frame(pts, slot).map_err(|e| {
+                    log::error!("[export] encode_frame failed for frame {frame_idx}: {e:?}");
+                    RenderError::GpuTimeout
+                })?
+            }
+            _ => Vec::new(),
+        };
+        self.mux_nvenc_packets(packets, "encode submit")
     }
 
     pub fn render_segment(
@@ -506,36 +825,53 @@ impl ExportRenderer {
                 segment_index: segment.index,
             });
         } else {
-            // ── GPU / NVENC pipelined path ─────────────────────────────────────
+            // ── GPU / NVENC async pipelined path (P1.1) ─────────────────────────
             //
-            // Classic double-buffered pipeline: while NVENC encodes frame N-1 from
-            // slot (N-1)%2, the GPU renders frame N into slot N%2.  We only stall on
-            // `WaitForSubmissionIndex(prev_sid)` — the exact submission that wrote the
-            // *previous* slot — so the current GPU render can proceed concurrently.
+            // Three stages run concurrently, each on its own resources:
             //
-            //  Frame timeline (ideal, both units fully pipelined):
-            //  ┌──────────┬──────────┬──────────┬──────────┐
-            //  │ GPU: F0  │ GPU: F1  │ GPU: F2  │ GPU: F3  │  (slot 0, 1, 0, 1 …)
-            //  └──────────┴──────────┴──────────┴──────────┘
-            //             ┌──────────┬──────────┬──────────┐
-            //             │ ENC: F0  │ ENC: F1  │ ENC: F2  │
-            //             └──────────┴──────────┴──────────┘
+            //   GPU:    F0 ── F1 ── F2 ── F3 ── F4 …      (renders into slot N % S)
+            //   NVENC:       F0 ── F1 ── F2 ── F3 …       (encodes from slot N % S)
+            //   Muxer:            P0 ── P1 ── P2 …        (writes packets, decode order)
             //
-            // `pending` holds (frame_idx, SubmissionIndex, abgr10_slot) for the most
-            // recently submitted — but not yet encoded — frame.
+            // What used to serialise this was `encode_frame` waiting on the frame's
+            // own completion event before returning, so the CPU could never get
+            // ahead of the encoder.  Now submission is non-blocking and the only
+            // waits are the two that correctness actually requires:
+            //
+            //   * `WaitForSubmissionIndex(sid)` before handing a slot to NVENC —
+            //     the GPU must have finished writing that ABGR10 texture.
+            //   * `reclaim_slot(slot)` before rendering into a slot again — NVENC
+            //     must have finished reading it.  This is the backpressure: it
+            //     blocks only when the encoder has fallen `S` frames behind.
+            //
+            // `S` = `EncodeInterop::slot_count()`.  Each slot owns its own interop
+            // texture, registered resource, bitstream buffer and completion event,
+            // so nothing is shared between frames in flight.
+            let slot_count = match &self.backend {
+                ExportBackend::GpuNvenc { video_enc, .. } => video_enc
+                    .nvenc_interop()
+                    .expect("nvenc_interop: invariant — GpuNvenc arm")
+                    .slot_count(),
+                _ => 1,
+            };
 
-            // `pending` = (frame_idx, submission_index, abgr10_slot) of the last
-            // submitted frame that has not been encoded yet.
-            let mut pending: Option<(usize, wgpu::SubmissionIndex, usize)> = None;
-            let mut active_slot = 0usize;
+            // How many GPU submissions may be outstanding without having been
+            // handed to NVENC yet.  Keeping this strictly below `slot_count`
+            // guarantees the slot about to be rendered into is never one still
+            // waiting in `inflight` — those are always the 1..=GPU_LOOKAHEAD most
+            // recent frames, i.e. different slots modulo `slot_count`.
+            let gpu_lookahead = slot_count.saturating_sub(2).max(1);
 
-            // Iterate frame_start..=frame_end: the extra iteration at frame_end
-            // skips rendering and only drains the final pending frame (same
-            // pattern as the CPU readback path).
-            for frame_idx in segment.frame_start..=segment.frame_end {
+            // (frame_idx, submission index, slot) for frames the GPU is rendering
+            // or has rendered but that have not been submitted to NVENC yet.
+            // Oldest first.
+            let mut inflight: std::collections::VecDeque<(usize, wgpu::SubmissionIndex, usize)> =
+                std::collections::VecDeque::with_capacity(gpu_lookahead + 1);
+
+            for frame_idx in segment.frame_start..segment.frame_end {
                 // ── Check cancellation & pause ───────────────────────────────
                 if progress.control().is_cancelled() {
-                    log::info!("[export] cancelled by user during CPU render at frame {frame_idx}");
+                    log::info!("[export] cancelled by user during GPU render at frame {frame_idx}");
                     progress.report(self.frames_done, ExportPhase::Cancelled);
                     return Ok(());
                 }
@@ -548,170 +884,106 @@ impl ExportRenderer {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
 
-                // ── Render: submit GPU work for this frame ────────────────────
-                if frame_idx < segment.frame_end {
-                    let pts = self.job.frame_pts(frame_idx);
+                let slot = frame_idx % slot_count;
 
-                    let frame_state = self.scheduler.schedule_frame(
-                        pts,
-                        &self.timeline.read().unwrap(),
-                        &self.tracks.read().unwrap(),
-                        &self.sources.read().unwrap(),
-                    );
+                // ── Backpressure: make sure NVENC is done with this slot ───────
+                // No-op until the pipeline is full; after that it blocks on the
+                // OLDEST in-flight picture, which is the correct thing to wait for.
+                self.nvenc_reclaim_slot(slot)?;
 
-                    self.ensure_graph(&frame_state)?;
-                    self.upload_frame_data(&frame_state);
+                // ── Render: record and submit GPU work for this frame ──────────
+                let pts = self.job.frame_pts(frame_idx);
 
-                    let mut encoder = self.device.begin_frame();
-                    let rtt_id    = ResourceId::FINAL_COLOR;
-                    let width     = self.job.width;
-                    let height    = self.job.height;
-                    let device_ref = &self.device;
-                    let slot      = active_slot; // captured for the closure below
+                let frame_state = self.scheduler.schedule_frame(
+                    pts,
+                    &self.timeline.read().unwrap(),
+                    &self.tracks.read().unwrap(),
+                    &self.sources.read().unwrap(),
+                );
 
-                    let graph = self.cached_graph.as_mut().unwrap();
+                self.ensure_graph(&frame_state)?;
+                self.upload_frame_data(&frame_state);
 
-                    if let ExportBackend::GpuNvenc { video_enc, repack, .. } = &mut self.backend {
-                        let interop = video_enc.nvenc_interop()
-                            .expect("nvenc_interop: invariant — GpuNvenc arm");
-                        let abgr10_texture = interop.abgr10_texture_for_slot(slot);
-                        let abgr10_view =
-                            abgr10_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let mut encoder = self.device.begin_frame();
+                let rtt_id    = ResourceId::FINAL_COLOR;
+                let width     = self.job.width;
+                let height    = self.job.height;
+                let device_ref = &self.device;
 
-                        graph.execute_with_callback(
-                            &mut encoder,
-                            device_ref,
-                            &frame_state,
-                            |enc, ctx| {
-                                if ctx.contains(rtt_id) {
-                                    let in_view = ctx.get(rtt_id).texture.create_view(
-                                        &wgpu::TextureViewDescriptor::default(),
-                                    );
-                                    repack.record(enc, device_ref, &in_view, &abgr10_view, width, height);
-                                } else {
-                                    log::error!(
-                                        "[export] frame {frame_idx}: FINAL_COLOR missing from RenderContext!"
-                                    );
-                                }
-                            },
-                        );
-                    }
+                let graph = self.cached_graph.as_mut().unwrap();
 
-                    // Submit — non-blocking. GPU starts executing immediately.
-                    // We do NOT stall here; we overlap with encoding the prior frame below.
-                    let sid = self.device.submit(encoder);
+                if let ExportBackend::GpuNvenc { video_enc, repack, .. } = &mut self.backend {
+                    let interop = video_enc.nvenc_interop()
+                        .expect("nvenc_interop: invariant — GpuNvenc arm");
+                    let abgr10_texture = interop.abgr10_texture_for_slot(slot);
+                    let abgr10_view =
+                        abgr10_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-                    // Non-blocking poll: lets the driver queue the work without a CPU stall.
-                    self.device.device.poll(wgpu::Maintain::Poll);
-
-                    // ── Encode: process the previously submitted frame ─────────
-                    if let Some((prev_idx, prev_sid, prev_slot)) = pending.take() {
-                        // Wait only for the specific submission that wrote prev_slot.
-                        // The current frame's GPU work (sid) can still run concurrently.
-                        self.device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(prev_sid));
-
-                        let encode_result = if let ExportBackend::GpuNvenc { video_enc, muxer, .. } =
-                            &mut self.backend
-                        {
-                            let prev_pts = self.job.frame_pts(prev_idx);
-                            let interop = video_enc.nvenc_interop_mut()
-                                .expect("nvenc_interop_mut: invariant — GpuNvenc arm");
-                            let muxer_ref = &**muxer;
-                            let sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
-                                if let Err(e) = muxer_ref.write_packet(pkt, true) {
-                                    log::error!("[export] NVENC mux write_packet failed for frame {prev_idx}: {e:?}");
-                                }
-                            };
-                            interop.encode_frame(prev_pts, prev_slot)
-                                .map_err(|e| {
-                                    log::error!("[export] encode_frame failed for frame {prev_idx}: {e:?}");
-                                    RenderError::GpuTimeout
-                                })
-                                .map(|(bytes, frame_pts)| {
-                                    if !bytes.is_empty() {
-                                        // Wrap compressed bytes in a shim AVPacket for the muxer.
-                                        unsafe {
-                                            use crate::io::ffi::avutil::{av_packet_alloc, av_packet_free};
-                                            let pkt = av_packet_alloc();
-                                            if !pkt.is_null() {
-                                                (*pkt).data     = bytes.as_ptr() as *mut u8;
-                                                (*pkt).size     = bytes.len() as i32;
-                                                (*pkt).pts      = frame_pts;
-                                                (*pkt).dts      = frame_pts;
-                                                (*pkt).duration = 0;
-                                                sink(pkt);
-                                                (*pkt).data = std::ptr::null_mut();
-                                                (*pkt).size = 0;
-                                                av_packet_free(&mut (pkt as *mut _));
-                                            }
-                                        }
-                                    }
-                                })
-                        } else {
-                            Ok(())
-                        };
-
-                        encode_result?;
-
-                        self.frames_done += 1;
-                        progress.report(self.frames_done, ExportPhase::Rendering);
-                    }
-
-                    // Store this frame as the next pending encode, then advance slot.
-                    pending = Some((frame_idx, sid, active_slot));
-                    active_slot = 1 - active_slot;
-
-                } else {
-                    // ── Drain: encode the last pending frame ──────────────────
-                    if let Some((prev_idx, prev_sid, prev_slot)) = pending.take() {
-                        // Wait for the final GPU submission to complete before encoding.
-                        self.device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(prev_sid));
-
-                        if let ExportBackend::GpuNvenc { video_enc, muxer, .. } = &mut self.backend {
-                            let prev_pts = self.job.frame_pts(prev_idx);
-                            let interop  = video_enc.nvenc_interop_mut()
-                                .expect("nvenc_interop_mut: invariant — GpuNvenc arm");
-                            let muxer_ref = &**muxer;
-                            let sink = |pkt: *mut crate::io::ffi::avutil::AVPacket| {
-                                if let Err(e) = muxer_ref.write_packet(pkt, true) {
-                                    log::error!("[export] NVENC mux write_packet (drain) failed for frame {prev_idx}: {e:?}");
-                                }
-                            };
-                            match interop.encode_frame(prev_pts, prev_slot) {
-                                Ok((bytes, frame_pts)) if !bytes.is_empty() => {
-                                    unsafe {
-                                        use crate::io::ffi::avutil::{av_packet_alloc, av_packet_free};
-                                        let pkt = av_packet_alloc();
-                                        if !pkt.is_null() {
-                                            (*pkt).data     = bytes.as_ptr() as *mut u8;
-                                            (*pkt).size     = bytes.len() as i32;
-                                            (*pkt).pts      = frame_pts;
-                                            (*pkt).dts      = frame_pts;
-                                            (*pkt).duration = 0;
-                                            sink(pkt);
-                                            (*pkt).data = std::ptr::null_mut();
-                                            (*pkt).size = 0;
-                                            av_packet_free(&mut (pkt as *mut _));
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("[export] encode_frame failed for frame {prev_idx} (drain): {e:?}");
-                                    return Err(RenderError::GpuTimeout);
-                                }
-                                Ok(_) => {} // empty bitstream (e.g. B-frame delay) — not an error
+                    graph.execute_with_callback(
+                        &mut encoder,
+                        device_ref,
+                        &frame_state,
+                        |enc, ctx| {
+                            if ctx.contains(rtt_id) {
+                                let in_view = ctx.get(rtt_id).texture.create_view(
+                                    &wgpu::TextureViewDescriptor::default(),
+                                );
+                                repack.record(enc, device_ref, &in_view, &abgr10_view, width, height);
+                            } else {
+                                log::error!(
+                                    "[export] frame {frame_idx}: FINAL_COLOR missing from RenderContext!"
+                                );
                             }
-                        }
+                        },
+                    );
+                }
 
-                        self.frames_done += 1;
-                        progress.report(self.frames_done, ExportPhase::Rendering);
-                    }
+                // Submit — non-blocking.  The GPU starts executing immediately and
+                // this thread moves on.
+                let sid = self.device.submit(encoder);
+
+                // Non-blocking poll: lets the driver queue the work without a CPU stall.
+                self.device.device.poll(wgpu::Maintain::Poll);
+
+                inflight.push_back((frame_idx, sid, slot));
+
+                // ── Submit finished renders to NVENC ──────────────────────────
+                // Only once more than `gpu_lookahead` are outstanding, so the GPU
+                // stays ahead of the encoder rather than being paced by it.
+                while inflight.len() > gpu_lookahead {
+                    let (done_idx, done_sid, done_slot) = inflight
+                        .pop_front()
+                        .expect("inflight is non-empty: len > gpu_lookahead >= 1");
+                    // The one unavoidable GPU wait: NVENC must not read a texture
+                    // the GPU is still writing.  It is the OLDEST submission, so by
+                    // now it has usually completed already and this returns at once.
+                    self.device
+                        .device
+                        .poll(wgpu::Maintain::WaitForSubmissionIndex(done_sid));
+                    self.nvenc_submit_frame(done_idx, done_slot)?;
+
+                    self.frames_done += 1;
+                    progress.report(self.frames_done, ExportPhase::Rendering);
                 }
             }
 
+            // ── Drain: submit every remaining rendered frame ───────────────────
+            // Their bitstreams are collected here or, for whatever NVENC is still
+            // holding, by the EOS flush in `ExportEngine` after the last segment.
+            while let Some((done_idx, done_sid, done_slot)) = inflight.pop_front() {
+                self.device
+                    .device
+                    .poll(wgpu::Maintain::WaitForSubmissionIndex(done_sid));
+                self.nvenc_submit_frame(done_idx, done_slot)?;
+
+                self.frames_done += 1;
+                progress.report(self.frames_done, ExportPhase::Rendering);
+            }
+
             log::info!(
-                "[export] render_segment {} done (NVENC pipelined)",
-                segment.index
+                "[export] render_segment {} done (NVENC async pipeline, {} slot(s), \
+                 {} GPU frame(s) of lookahead)",
+                segment.index, slot_count, gpu_lookahead
             );
         }
 

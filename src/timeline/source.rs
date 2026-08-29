@@ -326,14 +326,140 @@ impl ColorInfo {
         matches!(self.transfer_fn, TransferFunction::Pq | TransferFunction::Hlg)
             || (self.matrix == MatrixCoefficients::Bt2020 && self.bit_depth >= 10)
     }
+
+    // ── FFmpeg enum mapping ────────────────────────────────────────────────
+    //
+    // The inverse of `from_ffmpeg`, used when *writing* colour description onto
+    // an encoder context / stream codecpar. `Unknown` maps to FFmpeg's
+    // `*_UNSPECIFIED` (2 for space/trc/primaries, 0 for range), which is exactly
+    // what an untouched context already holds — so a partially-unknown profile
+    // still round-trips without inventing metadata.
+
+    /// `AVColorSpace` (matrix coefficients) for `AVCodecContext::colorspace`.
+    pub fn av_color_space(&self) -> i32 {
+        match self.matrix {
+            MatrixCoefficients::Bt709   => 1,
+            MatrixCoefficients::Bt601   => 5, // AVCOL_SPC_BT470BG
+            MatrixCoefficients::Bt2020  => 9, // AVCOL_SPC_BT2020_NCL
+            MatrixCoefficients::Unknown => 2, // AVCOL_SPC_UNSPECIFIED
+        }
+    }
+
+    /// `AVColorRange` for `AVCodecContext::color_range`.
+    pub fn av_color_range(&self) -> i32 {
+        match self.range {
+            ColorRange::Limited => 1, // AVCOL_RANGE_MPEG
+            ColorRange::Full    => 2, // AVCOL_RANGE_JPEG
+            ColorRange::Unknown => 0, // AVCOL_RANGE_UNSPECIFIED
+        }
+    }
+
+    /// `AVColorTransferCharacteristic` for `AVCodecContext::color_trc`.
+    pub fn av_color_trc(&self) -> i32 {
+        match self.transfer_fn {
+            TransferFunction::Bt709   => 1,
+            TransferFunction::Linear  => 8,
+            TransferFunction::Srgb    => 13, // AVCOL_TRC_IEC61966_2_1
+            TransferFunction::Bt2020  => 14, // AVCOL_TRC_BT2020_10
+            TransferFunction::Pq      => 16, // AVCOL_TRC_SMPTE2084
+            TransferFunction::Hlg     => 18, // AVCOL_TRC_ARIB_STD_B67
+            TransferFunction::Unknown => 2,  // AVCOL_TRC_UNSPECIFIED
+        }
+    }
+
+    /// `AVColorPrimaries` for `AVCodecContext::color_primaries`.
+    pub fn av_color_primaries(&self) -> i32 {
+        match self.primaries {
+            ColorPrimaries::Bt709   => 1,
+            ColorPrimaries::Bt2020  => 9,
+            ColorPrimaries::Unknown => 2, // AVCOL_PRI_UNSPECIFIED
+        }
+    }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SampleFormat {
     F32Planar,
     F32Interleaved,
     I16Interleaved,
 }
+
+/// How the pixels of a *decoded* frame are actually laid out in the staging
+/// buffer, as opposed to what the container advertised.
+///
+/// P1.6 — these two facts have to travel with the frame rather than be inferred
+/// from `VideoStreamInfo`, because the decoder does not always emit the source's
+/// own format: it passes YUV420P / NV12 / P010 / YUV420P10 through untouched but
+/// converts anything else with swscale, and the conversion target depends on the
+/// source depth.  Reading the depth off the container while the buffer holds a
+/// converted format is what made 10-bit clips render as noise.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FrameLayout {
+    /// Bits per sample actually present in the buffer: 8, 10 or 12.
+    pub bit_depth: u8,
+    /// True when chroma is one interleaved plane (NV12, P010); false for planar
+    /// U and V planes (I420, YUV420P10LE).
+    pub semi_planar: bool,
+    /// True when the sample codes are MSB-aligned inside their 16-bit words, as
+    /// P010/P016 store them (`code << (16 - depth)`).  False for the LSB-aligned
+    /// layout every planar high-depth format uses.
+    ///
+    /// Only meaningful when `bit_depth > 8`, and the difference is a factor of 64
+    /// in brightness at 10-bit, so it is carried explicitly rather than guessed
+    /// from `semi_planar`.
+    pub msb_aligned: bool,
+}
+
+impl Default for FrameLayout {
+    fn default() -> Self {
+        Self::YUV420P8
+    }
+}
+
+impl FrameLayout {
+    /// 8-bit planar 4:2:0 — the format the decoder converts unknown inputs to.
+    pub const YUV420P8: Self = Self { bit_depth: 8, semi_planar: false, msb_aligned: false };
+    /// 8-bit semi-planar 4:2:0 (NV12), what most hardware decoders emit.
+    pub const NV12: Self = Self { bit_depth: 8, semi_planar: true, msb_aligned: false };
+    /// 10-bit semi-planar 4:2:0 (P010): codes MSB-aligned in 16-bit words.
+    pub const P010: Self = Self { bit_depth: 10, semi_planar: true, msb_aligned: true };
+    /// 10-bit planar 4:2:0 (YUV420P10LE): codes LSB-aligned in 16-bit words.
+    pub const YUV420P10: Self = Self { bit_depth: 10, semi_planar: false, msb_aligned: false };
+
+    /// Bytes per sample in the buffer: 1 for 8-bit, 2 for 10/12-bit.
+    pub fn bytes_per_sample(&self) -> usize {
+        if self.bit_depth > 8 { 2 } else { 1 }
+    }
+
+    /// True when this layout needs 16-bit GPU textures (R16Unorm / Rg16Unorm).
+    pub fn is_high_depth(&self) -> bool {
+        self.bit_depth > 8
+    }
+}
+
+/// A decoded frame's pixel layout together with the colour metadata that applies
+/// to it.
+///
+/// The colour part is read from the AVFrame, not the container: frame-level
+/// metadata is what the encoder actually signalled for these pixels, and it is
+/// allowed to differ from (or be present when absent in) the stream header.
+/// `ColorInfo::bit_depth` here always matches `layout.bit_depth`, so downstream
+/// range maths is done against the depth the buffer really holds.
+#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DecodedFrameMeta {
+    pub layout: FrameLayout,
+    pub color:  ColorInfo,
+}
+
+impl Default for DecodedFrameMeta {
+    fn default() -> Self {
+        Self {
+            layout: FrameLayout::YUV420P8,
+            color:  ColorInfo::bt709(),
+        }
+    }
+}
+
 
 /// SoA source registry — all arrays parallel, indexed by SourceId.
 #[derive(Debug, Clone)]
@@ -654,5 +780,79 @@ mod tests {
         assert_eq!(registry.media_status(id), MediaStatus::Available);
 
         assert!(registry.relink(SourceId(999), new_path).is_err());
+    }
+
+    /// Every `from_ffmpeg`-recognised code must come back out of the `av_color_*`
+    /// setters unchanged, otherwise an export silently re-tags its own input.
+    #[test]
+    fn test_av_color_mapping_round_trips() {
+        // (matrix, range, trc, primaries) — all fully specified, so `from_ffmpeg`
+        // applies none of its heuristics and the mapping is a pure inverse.
+        let cases = [
+            (1, 1, 1, 1, 8u8),    // Rec.709 limited 8-bit
+            (1, 2, 13, 1, 8),     // sRGB full range
+            (5, 1, 1, 1, 8),      // Rec.601 (AVCOL_SPC_BT470BG)
+            (9, 1, 16, 9, 10),    // HDR10: BT.2020 NCL + PQ
+            (9, 1, 18, 9, 10),    // HLG
+            (9, 1, 14, 9, 10),    // BT.2020 10-bit SDR transfer
+            (1, 1, 8, 1, 16),     // linear light
+        ];
+
+        for (matrix, range, trc, primaries, depth) in cases {
+            let ci = ColorInfo::from_ffmpeg(matrix, range, trc, primaries, depth, 1920, 1080);
+            assert_eq!(ci.av_color_space(), matrix, "matrix {matrix} did not round-trip");
+            assert_eq!(ci.av_color_range(), range, "range {range} did not round-trip");
+            assert_eq!(ci.av_color_trc(), trc, "trc {trc} did not round-trip");
+            assert_eq!(
+                ci.av_color_primaries(), primaries,
+                "primaries {primaries} did not round-trip"
+            );
+        }
+    }
+
+    /// Unknown fields must map to FFmpeg's `*_UNSPECIFIED`, never to a guess:
+    /// writing a wrong-but-specified value is worse than writing nothing, because
+    /// a decoder trusts it instead of falling back to its own default.
+    #[test]
+    fn test_av_color_unknown_maps_to_unspecified() {
+        let ci = ColorInfo {
+            transfer_fn: TransferFunction::Unknown,
+            range:       ColorRange::Unknown,
+            matrix:      MatrixCoefficients::Unknown,
+            primaries:   ColorPrimaries::Unknown,
+            bit_depth:   8,
+        };
+        assert_eq!(ci.av_color_space(), 2);     // AVCOL_SPC_UNSPECIFIED
+        assert_eq!(ci.av_color_range(), 0);     // AVCOL_RANGE_UNSPECIFIED
+        assert_eq!(ci.av_color_trc(), 2);       // AVCOL_TRC_UNSPECIFIED
+        assert_eq!(ci.av_color_primaries(), 2); // AVCOL_PRI_UNSPECIFIED
+    }
+
+    /// The SDR default an export job is tagged with, spelled out: anything else
+    /// here means every H.264 export is mislabelled.
+    #[test]
+    fn test_bt709_av_codes() {
+        let ci = ColorInfo::bt709();
+        assert_eq!(ci.av_color_space(), 1);
+        assert_eq!(ci.av_color_range(), 1); // limited/MPEG
+        assert_eq!(ci.av_color_trc(), 1);
+        assert_eq!(ci.av_color_primaries(), 1);
+        assert!(!ci.is_hdr());
+    }
+
+    /// HDR10 as the export path would construct it.
+    #[test]
+    fn test_bt2020_hdr_av_codes() {
+        let ci = ColorInfo::bt2020(true, 10);
+        assert_eq!(ci.av_color_space(), 9);     // BT2020_NCL
+        assert_eq!(ci.av_color_trc(), 16);      // SMPTE ST 2084 (PQ)
+        assert_eq!(ci.av_color_primaries(), 9);
+        assert!(ci.is_hdr());
+
+        // The non-HDR BT.2020 constructor still counts as HDR at 10-bit via the
+        // matrix+depth rule, but must carry the BT.2020 transfer, not PQ.
+        let sdr_2020 = ColorInfo::bt2020(false, 10);
+        assert_eq!(sdr_2020.av_color_trc(), 14);
+        assert!(sdr_2020.is_hdr());
     }
 }

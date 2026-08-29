@@ -4,7 +4,7 @@
 // The user configures codec, quality, and hardware preference here,
 // then clicks Export to kick off the job.
 
-use nexir::export::job::{AudioCodec, Container, VideoCodec, VideoQuality};
+use nexir::export::job::{AudioCodec, Container, Hdr10Metadata, VideoCodec, VideoQuality};
 use nexir::interop::capability::InteropCapability;
 
 /// Persistent state for the export settings panel.
@@ -16,6 +16,12 @@ pub struct ExportSettings {
     pub crf: u32,
     pub force_cpu: bool,
     pub cpu_preset: nexir::export::job::CpuPreset,
+    /// Export 10-bit HDR10 (BT.2020 + PQ) instead of 8-bit SDR Rec.709.
+    ///
+    /// Only offered for codecs that can carry it — see `VideoCodec::supports_hdr`.
+    /// Switching to a codec that cannot forces this back off, so the panel can
+    /// never hand `start_export` a combination `ExportJob::validate` rejects.
+    pub hdr: bool,
 }
 
 impl Default for ExportSettings {
@@ -27,6 +33,7 @@ impl Default for ExportSettings {
             crf: 23,
             force_cpu: false,
             cpu_preset: nexir::export::job::CpuPreset::Faster,
+            hdr: false,
         }
     }
 }
@@ -38,6 +45,18 @@ impl ExportSettings {
             VideoQuality::Crf(self.crf)
         } else {
             VideoQuality::TargetBitrate(200_000_000) // ProRes/VP9 default
+        }
+    }
+
+    /// The HDR10 grade to export with, or `None` for an SDR export.
+    ///
+    /// `hdr` is only honoured for a codec that supports it, so a stale `true`
+    /// left over from a codec change can never produce an invalid job.
+    pub fn hdr10(&self) -> Option<Hdr10Metadata> {
+        if self.hdr && self.video_codec.supports_hdr() {
+            Some(Hdr10Metadata::bt2020_1000_nits())
+        } else {
+            None
         }
     }
 
@@ -111,11 +130,51 @@ pub fn draw(
                                     settings.video_codec = codec;
                                     // Auto-update container to match new codec
                                     settings.container = ExportSettings::auto_container(codec);
+                                    // H.264 cannot carry HDR here — clear the
+                                    // toggle rather than leaving it set and
+                                    // silently ignored.
+                                    if !codec.supports_hdr() {
+                                        settings.hdr = false;
+                                    }
                                 }
                             }
                         });
                 });
             });
+
+            // ── Dynamic range ─────────────────────────────────────────────────
+            //
+            // P1.7 — the switch that makes an export genuinely HDR: 10-bit
+            // BT.2020 + PQ pixels with mastering-display metadata, rather than
+            // SDR pixels under HDR tags.
+            if settings.video_codec.supports_hdr() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Dynamic range:").strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.checkbox(&mut settings.hdr, "HDR10 (10-bit BT.2020 PQ)");
+                    });
+                });
+                if settings.hdr {
+                    ui.label(
+                        egui::RichText::new(
+                            "Encodes 10-bit with PQ + 1000 nit mastering metadata. \
+                             SDR clips are converted to BT.2020; HDR clips keep their \
+                             highlights instead of being tone-mapped.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "Dynamic range: SDR (Rec.709) — HDR requires H.265, ProRes or VP9",
+                    )
+                    .weak()
+                    .italics()
+                    .small(),
+                );
+            }
 
             // ── Container ─────────────────────────────────────────────────────
             ui.horizontal(|ui| {

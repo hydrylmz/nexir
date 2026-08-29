@@ -92,12 +92,13 @@ fn run_benchmark(device: &Arc<GpuDevice>, config: &BenchmarkConfig) -> Profiling
             let y_id = ResourceId::next(&mut id_counter);
             let uv_id = ResourceId::next(&mut id_counter);
 
-            let u_idx = compiler.add_node(Box::new(YuvUploadNode::new(
+            let u_idx = compiler.add_node(Box::new(YuvUploadNode::new_with_layout(
                 device, 0, config.canvas_w, config.canvas_h, y_id, uv_id,
+                nexir::timeline::source::FrameLayout::NV12,
             )));
             uploader_indices.push(u_idx);
 
-            compiler.add_node(Box::new(YuvToRgbNode::new(
+            compiler.add_node(Box::new(YuvToRgbNode::new_with_layout(
                 device,
                 &shaders,
                 &compute,
@@ -107,6 +108,8 @@ fn run_benchmark(device: &Arc<GpuDevice>, config: &BenchmarkConfig) -> Profiling
                 config.canvas_w,
                 config.canvas_h,
                 color_info,
+                // The bench uploads NV12 (semi-planar) sample data.
+                true,
             )));
 
             let mut composite = CompositeNode::new(
@@ -127,12 +130,13 @@ fn run_benchmark(device: &Arc<GpuDevice>, config: &BenchmarkConfig) -> Profiling
                 let rgb_id = ResourceId::next(&mut id_counter);
                 let cc_id = ResourceId::next(&mut id_counter);
 
-                let u_idx = compiler.add_node(Box::new(YuvUploadNode::new(
+                let u_idx = compiler.add_node(Box::new(YuvUploadNode::new_with_layout(
                     device, i, config.canvas_w, config.canvas_h, y_id, uv_id,
+                    nexir::timeline::source::FrameLayout::NV12,
                 )));
                 uploader_indices.push(u_idx);
 
-                compiler.add_node(Box::new(YuvToRgbNode::new(
+                compiler.add_node(Box::new(YuvToRgbNode::new_with_layout(
                     device,
                     &shaders,
                     &compute,
@@ -142,6 +146,8 @@ fn run_benchmark(device: &Arc<GpuDevice>, config: &BenchmarkConfig) -> Profiling
                     config.canvas_w,
                     config.canvas_h,
                     color_info,
+                    // The bench uploads NV12 (semi-planar) sample data.
+                    true,
                 )));
 
                 let mut params = ColorCorrectionParams::identity(config.canvas_w, config.canvas_h);
@@ -199,12 +205,13 @@ fn run_benchmark(device: &Arc<GpuDevice>, config: &BenchmarkConfig) -> Profiling
                 let lut_id = ResourceId::next(&mut id_counter);
                 let key_id = ResourceId::next(&mut id_counter);
 
-                let u_idx = compiler.add_node(Box::new(YuvUploadNode::new(
+                let u_idx = compiler.add_node(Box::new(YuvUploadNode::new_with_layout(
                     device, i, config.canvas_w, config.canvas_h, y_id, uv_id,
+                    nexir::timeline::source::FrameLayout::NV12,
                 )));
                 uploader_indices.push(u_idx);
 
-                compiler.add_node(Box::new(YuvToRgbNode::new(
+                compiler.add_node(Box::new(YuvToRgbNode::new_with_layout(
                     device,
                     &shaders,
                     &compute,
@@ -214,6 +221,8 @@ fn run_benchmark(device: &Arc<GpuDevice>, config: &BenchmarkConfig) -> Profiling
                     config.canvas_w,
                     config.canvas_h,
                     color_info,
+                    // The bench uploads NV12 (semi-planar) sample data.
+                    true,
                 )));
 
                 compiler.add_node(Box::new(ColorCorrectionNode::new(
@@ -312,7 +321,12 @@ fn run_benchmark(device: &Arc<GpuDevice>, config: &BenchmarkConfig) -> Profiling
             corner_pin: nexir::timeline::transform::CornerPin::identity(),
             matte_mode: nexir::timeline::transform::MatteMode::None,
             effects: Default::default(),
-            is_nv12: true,
+            // The bench feeds `make_nv12` data, so describe it as NV12 —
+            // `ClipSignature`/`YuvUploadNode` both key off this.
+            frame_meta: nexir::timeline::source::DecodedFrameMeta {
+                layout: nexir::timeline::source::FrameLayout::NV12,
+                color:  color_info,
+            },
             kind: ClipKind::Video,
         });
     }

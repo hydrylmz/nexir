@@ -43,13 +43,12 @@ impl log::Log for SimpleFileLogger {
         eprint!("{}", msg);
 
         // Write to file
-        if let Ok(mut guard) = self.file.lock() {
-            if let Some(file) = guard.as_mut() {
+        if let Ok(mut guard) = self.file.lock()
+            && let Some(file) = guard.as_mut() {
                 use std::io::Write;
                 let _ = file.write_all(msg.as_bytes());
                 let _ = file.flush();
             }
-        }
     }
 
     fn flush(&self) {}
@@ -111,12 +110,11 @@ fn main() {
 
         eprint!("{}", log_content);
 
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(dir) = exe_path.parent() {
+        if let Ok(exe_path) = std::env::current_exe()
+            && let Some(dir) = exe_path.parent() {
                 let log_path = dir.join("nexir_crash.log");
                 let _ = std::fs::write(log_path, log_content);
             }
-        }
     }));
 
     info!("Starting Nexir UI");
@@ -168,7 +166,7 @@ fn main() {
                         }
                         WindowEvent::RedrawRequested => {
                             let viewport_size = app_state.update(&window);
-                            app_state.render(&*device, &surface, &window, viewport_size);
+                            app_state.render(&device, &surface, &window, viewport_size);
                         }
                         _ => {}
                     }

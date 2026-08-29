@@ -55,19 +55,17 @@ impl MediaEntry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum LibraryPanel {
+    #[default]
     MediaPool,
     Text,
     Effects,
 }
 
-impl Default for LibraryPanel {
-    fn default() -> Self {
-        Self::MediaPool
-    }
-}
 
 /// State owned by `NexirApp` for the media pool panel.
+#[derive(Default)]
 pub struct MediaPoolState {
     pub entries: Vec<MediaEntry>,
     pub selected: Option<usize>,
@@ -76,17 +74,6 @@ pub struct MediaPoolState {
     pub active_panel: LibraryPanel,
 }
 
-impl Default for MediaPoolState {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            selected: None,
-            pending_import: None,
-            dragging_item: None,
-            active_panel: LibraryPanel::default(),
-        }
-    }
-}
 
 pub fn draw(ui: &mut Ui, state: &mut MediaPoolState) {
     ui.horizontal(|ui| {

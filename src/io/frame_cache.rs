@@ -5,13 +5,22 @@ use std::num::NonZeroUsize;
 use dashmap::DashMap;
 use lru::LruCache;
 use crate::timeline::ids::SourceId;
+use crate::timeline::source::DecodedFrameMeta;
 use crate::io::slot_pool::{FrameSlotId, FrameSlotPool};
 
 type CacheKey = (SourceId, i64); // (source, pts in project timebase)
 
+/// A cached frame: which slot holds its pixels, and what those pixels are.
+///
+/// P1.6 — the metadata used to be a bare `bool` ("is NV12"), which could not
+/// express bit depth, code alignment or any colour property, so the render path
+/// read those off the container instead.  Carrying `DecodedFrameMeta` means the
+/// clip is rendered with the colour the DECODER reported for these exact pixels.
+pub type CachedFrame = (FrameSlotId, DecodedFrameMeta);
+
 pub struct FrameCache {
     /// DashMap for O(1) concurrent reads from multiple threads.
-    index: DashMap<CacheKey, (FrameSlotId, bool)>,
+    index: DashMap<CacheKey, CachedFrame>,
     /// LRU tracker — mutex-protected because eviction order requires serialisation.
     lru:   Mutex<LruCache<CacheKey, ()>>,
     /// Pool reference for releasing evicted slots.
@@ -28,14 +37,14 @@ impl FrameCache {
         }
     }
 
-    /// Look up a cached frame. Returns the (FrameSlotId, is_nv12) if present.
+    /// Look up a cached frame. Returns its slot and decoded metadata if present.
     /// Does NOT promote the key in the LRU — use `touch()` for that.
-    pub fn get(&self, source_id: SourceId, pts: i64) -> Option<(FrameSlotId, bool)> {
+    pub fn get(&self, source_id: SourceId, pts: i64) -> Option<CachedFrame> {
         self.index.get(&(source_id, pts)).map(|r| *r)
     }
 
     /// Promote a key to most-recently-used and return its slot.
-    pub fn touch(&self, source_id: SourceId, pts: i64) -> Option<(FrameSlotId, bool)> {
+    pub fn touch(&self, source_id: SourceId, pts: i64) -> Option<CachedFrame> {
         let slot = self.get(source_id, pts)?;
         self.lru.lock().unwrap().promote(&(source_id, pts));
         Some(slot)
@@ -43,7 +52,13 @@ impl FrameCache {
 
     /// Insert a newly decoded frame into the cache.
     /// Evicts the least-recently-used entry if the cache is full.
-    pub fn insert(&self, source_id: SourceId, pts: i64, slot_id: FrameSlotId, is_nv12: bool) {
+    pub fn insert(
+        &self,
+        source_id: SourceId,
+        pts: i64,
+        slot_id: FrameSlotId,
+        meta: DecodedFrameMeta,
+    ) {
         // Step 1 — Try to insert into LRU (evict if full).
         let mut lru = self.lru.lock().unwrap();
         if let Some((evicted_key, _)) = lru.push((source_id, pts), ()) {
@@ -53,7 +68,7 @@ impl FrameCache {
         }
 
         // Step 2 — Insert into the index.
-        self.index.insert((source_id, pts), (slot_id, is_nv12));
+        self.index.insert((source_id, pts), (slot_id, meta));
     }
 
     pub fn evict_one(&self) -> bool {

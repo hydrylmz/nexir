@@ -195,13 +195,17 @@ impl FrameScheduler {
                     corner_pin: clip.corner_pin,
                     matte_mode: clip.matte_mode,
                     effects: clip.effects,
-                    is_nv12: false,
+                    // Still images and text bypass the YUV path entirely (their
+                    // upload node writes RGBA directly), so this metadata is never
+                    // consulted; sRGB full-range is the honest description of what
+                    // those pixels are.
+                    frame_meta: still_image_frame_meta(),
                     kind: clip.kind.clone(),
                 });
                 continue;
             }
 
-            let (slot, is_nv12) = match slot_info {
+            let (slot, frame_meta) = match slot_info {
                 Some(s) => s,
                 None => continue,
             };
@@ -220,7 +224,7 @@ impl FrameScheduler {
                 corner_pin: clip.corner_pin,
                 matte_mode: clip.matte_mode,
                 effects: clip.effects,
-                is_nv12,
+                frame_meta,
                 kind: clip.kind.clone(),
             });
         }
@@ -295,7 +299,7 @@ impl FrameScheduler {
                     corner_pin: clip.corner_pin,
                     matte_mode: clip.matte_mode,
                     effects: clip.effects,
-                    is_nv12: false,
+                    frame_meta: still_image_frame_meta(),
                     kind: clip.kind.clone(),
                 });
                 continue;
@@ -308,7 +312,7 @@ impl FrameScheduler {
                 .touch(clip.source_id, quantized_pts)
                 .or_else(|| self.io_layer.decode_blocking(clip.source_id, quantized_pts));
 
-            let (slot, is_nv12) = match slot_info {
+            let (slot, frame_meta) = match slot_info {
                 Some(s) => s,
                 None => continue, // source not importable / pool full
             };
@@ -327,11 +331,23 @@ impl FrameScheduler {
                 corner_pin: clip.corner_pin,
                 matte_mode: clip.matte_mode,
                 effects: clip.effects,
-                is_nv12,
+                frame_meta,
                 kind: clip.kind.clone(),
             });
         }
 
         entries
+    }
+}
+
+/// Frame metadata for clips that never go through the YUV path: still images and
+/// text, whose upload nodes write RGBA(16F) straight into the composite input.
+///
+/// Describing them as sRGB full-range is accurate and keeps `frame_meta` a
+/// meaningful field everywhere rather than a placeholder some entries lie about.
+fn still_image_frame_meta() -> crate::timeline::source::DecodedFrameMeta {
+    crate::timeline::source::DecodedFrameMeta {
+        layout: crate::timeline::source::FrameLayout::YUV420P8,
+        color:  crate::timeline::source::ColorInfo::srgb(),
     }
 }

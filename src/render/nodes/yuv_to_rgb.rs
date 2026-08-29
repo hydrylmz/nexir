@@ -9,32 +9,32 @@ use crate::render::frame_state::FrameState;
 use crate::render::device::GpuDevice;
 use crate::render::compute::{ComputePipelineCache, ComputePassHelper, PipelineKey};
 use crate::render::shader::registry::{ShaderRegistry, BuiltinShader};
-use crate::timeline::source::{ColorInfo, ColorRange, MatrixCoefficients};
+use crate::colour::yuv::YuvConversion;
+use crate::timeline::source::ColorInfo;
 
-/// Push constants for the YUV→RGB compute shader. 16 bytes.
-/// Must match the WGSL `struct YuvParams` layout exactly.
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct YuvParams {
-    /// 0 = BT.601, 1 = BT.709, 2 = BT.2020
-    pub color_space:   u32,
-    /// 0 = full range, 1 = limited range
-    pub limited_range: u32,
-    /// Texture dimensions (needed for bounds check in shader).
-    pub width:         u32,
-    pub height:        u32,
-}
+/// Push constants for the YUV→RGB compute shader.
+///
+/// This is [`YuvConversion`] verbatim — the colour decisions are made on the CPU
+/// (see `src/colour/yuv.rs`) so they can be unit-tested without a GPU, and the
+/// shader only applies the resolved numbers.
+pub type YuvParams = YuvConversion;
+
+/// Byte size of the push-constant block, kept in one place because the pipeline
+/// layout and the WGSL `var<push_constant>` must agree exactly.
+const YUV_PUSH_CONSTANT_BYTES: u32 = std::mem::size_of::<YuvConversion>() as u32;
 
 pub struct YuvToRgbNode {
-    /// Y-plane texture (R8Unorm), produced by YuvUploadNode.
+    /// Y-plane texture (R8Unorm or R16Unorm), produced by YuvUploadNode.
     pub in_y:          ResourceId,
-    /// UV-plane texture (Rg8Unorm), produced by YuvUploadNode.
+    /// UV-plane texture (Rg8Unorm or Rg16Unorm), produced by YuvUploadNode.
     pub in_uv:         ResourceId,
     /// RGBA16Float output texture written by this node.
     pub out_rgba:      ResourceId,
     pub width:         u32,
     pub height:        u32,
-    color_info:        ColorInfo,
+    /// The fully resolved conversion: matrix, range and bit-depth handling for
+    /// this clip's actual metadata.  Computed once at graph-compile time.
+    conversion:        YuvConversion,
     pipeline:          Arc<wgpu::ComputePipeline>,
     bind_group_layout: wgpu::BindGroupLayout,
     device:            Arc<wgpu::Device>,
@@ -42,6 +42,12 @@ pub struct YuvToRgbNode {
 }
 
 impl YuvToRgbNode {
+    /// Build the node for a clip whose chroma is planar (I420 / YUV420P10LE …).
+    ///
+    /// Prefer [`Self::new_with_layout`] and pass the real layout: for 10-bit
+    /// content, planar and semi-planar differ by a factor of 64 in sample
+    /// normalisation, so guessing is a visible bug rather than a nuance.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device:         &GpuDevice,
         shaders:        &ShaderRegistry,
@@ -53,7 +59,33 @@ impl YuvToRgbNode {
         height:         u32,
         color_info:     ColorInfo,
     ) -> Self {
-        // Step 1 — Build bind group layout: Y(r8), UV(rg8), RGBA(rgba16f)
+        Self::new_with_layout(
+            device, shaders, pipeline_cache,
+            in_y, in_uv, out_rgba, width, height, color_info,
+            false,
+        )
+    }
+
+    /// Build the node, stating whether the source's chroma is semi-planar.
+    ///
+    /// `is_semi_planar` is true for NV12 and P010 (one interleaved chroma plane;
+    /// P010 additionally MSB-aligns its 10-bit codes) and false for planar YUV.
+    /// It reaches `YuvConversion` unchanged — see the module docs there for why
+    /// it matters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_layout(
+        device:         &GpuDevice,
+        shaders:        &ShaderRegistry,
+        pipeline_cache: &ComputePipelineCache,
+        in_y:           ResourceId,
+        in_uv:          ResourceId,
+        out_rgba:       ResourceId,
+        width:          u32,
+        height:         u32,
+        color_info:     ColorInfo,
+        is_semi_planar: bool,
+    ) -> Self {
+        // Step 1 — Build bind group layout: Y, UV, RGBA(rgba16f)
         let bind_group_layout = device.device.create_bind_group_layout(
             &wgpu::BindGroupLayoutDescriptor {
                 label: Some("yuv_to_rgb_bgl"),
@@ -95,14 +127,14 @@ impl YuvToRgbNode {
             },
         );
 
-        // Step 2 — Build pipeline layout with 16-byte push constants
+        // Step 2 — Build pipeline layout with the YuvConversion push constants
         let pipeline_layout = device.device.create_pipeline_layout(
             &wgpu::PipelineLayoutDescriptor {
                 label: Some("yuv_to_rgb_layout"),
                 bind_group_layouts: &[&bind_group_layout],
                 push_constant_ranges: &[wgpu::PushConstantRange {
                     stages: wgpu::ShaderStages::COMPUTE,
-                    range: 0..16,
+                    range: 0..YUV_PUSH_CONSTANT_BYTES,
                 }],
             },
         );
@@ -116,18 +148,41 @@ impl YuvToRgbNode {
             &shader_mod,
         );
 
+        // Step 4 — Resolve the colour conversion once, here.  `YuvConversion`
+        // applies ColorInfo's own resolution heuristics for unsignalled metadata
+        // (SD → BT.601, UHD → BT.2020, unknown range → limited).
+        let conversion = YuvConversion::new(color_info, width, height, is_semi_planar);
+        log::debug!(
+            "[colour] YuvToRgb {}x{}: matrix={:?} range={:?} depth={} semi_planar={} \
+             (sample_scale={:.3}, luma {:.4}/{:.4}, chroma {:.4}/{:.4})",
+            width, height,
+            color_info.effective_matrix(width, height),
+            color_info.effective_range(),
+            color_info.bit_depth,
+            is_semi_planar,
+            conversion.sample_scale,
+            conversion.luma_offset, conversion.luma_scale,
+            conversion.chroma_offset, conversion.chroma_scale,
+        );
+
         Self {
             in_y,
             in_uv,
             out_rgba,
             width,
             height,
-            color_info,
+            conversion,
             pipeline,
             bind_group_layout,
             device: Arc::clone(&device.device),
             bg_cache: Mutex::new(None),
         }
+    }
+
+    /// The resolved conversion this node will apply.  Exposed so tests (and the
+    /// inspector) can check what colour handling a clip actually got.
+    pub fn conversion(&self) -> &YuvConversion {
+        &self.conversion
     }
 }
 
@@ -160,7 +215,7 @@ impl RenderNode for YuvToRgbNode {
         // Step 2 — Create per-frame bind group if cache missed
         let mut cache = self.bg_cache.lock().unwrap();
         let cache_key = [y_res.view_id, uv_res.view_id, rgba_res.view_id];
-        
+
         if cache.is_none() || cache.as_ref().unwrap().0 != cache_key {
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("yuv_to_rgb_bg"),
@@ -176,27 +231,10 @@ impl RenderNode for YuvToRgbNode {
 
         let bind_group = &cache.as_ref().unwrap().1;
 
-        // Step 4 — Build push constants from ColorInfo
-        let color_space_u32 = match self.color_info.effective_matrix(self.width, self.height) {
-            MatrixCoefficients::Bt601  => 0u32,
-            MatrixCoefficients::Bt709  => 1u32,
-            MatrixCoefficients::Bt2020 => 2u32,
-            MatrixCoefficients::Unknown => 1u32,
-        };
-        let limited_range = match self.color_info.effective_range() {
-            ColorRange::Full    => 0u32,
-            ColorRange::Limited => 1u32,
-            ColorRange::Unknown => 1u32,
-        };
-        let params = YuvParams {
-            color_space:   color_space_u32,
-            limited_range,
-            width:         self.width,
-            height:        self.height,
-        };
-        let push_bytes = bytemuck::bytes_of(&params);
+        // Step 3 — Hand the pre-resolved conversion to the shader.
+        let push_bytes = bytemuck::bytes_of(&self.conversion);
 
-        // Step 5 — Begin compute pass and dispatch
+        // Step 4 — Begin compute pass and dispatch
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("yuv_to_rgb"),
             timestamp_writes: None,

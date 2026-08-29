@@ -38,15 +38,50 @@ pub mod swscale_ffi {
         ) -> std::ffi::c_int;
 
         pub fn sws_freeContext(swsCtx: *mut SwsContext);
+
+        /// Coefficient table for one of the `SWS_CS_*` colour spaces.
+        pub fn sws_getCoefficients(colorspace: std::ffi::c_int) -> *const std::ffi::c_int;
+
+        /// Pin the matrix and range swscale converts with.
+        ///
+        /// P1.7 — without this call swscale uses its default (BT.601) matrix no
+        /// matter what the stream is tagged as, so a BT.2020 export would carry
+        /// BT.601-converted samples: a real hue shift, not just wrong metadata.
+        pub fn sws_setColorspaceDetails(
+            c:          *mut SwsContext,
+            inv_table:  *const std::ffi::c_int,
+            srcRange:   std::ffi::c_int,
+            table:      *const std::ffi::c_int,
+            dstRange:   std::ffi::c_int,
+            brightness: std::ffi::c_int,
+            contrast:   std::ffi::c_int,
+            saturation: std::ffi::c_int,
+        ) -> std::ffi::c_int;
     }
 
     pub const AV_PIX_FMT_YUV420P:   i32 = 0;
     pub const AV_PIX_FMT_YUV422P:   i32 = 5;
     pub const AV_PIX_FMT_NV12:      i32 = 23;
     pub const AV_PIX_FMT_RGBA:      i32 = 26;
+    /// Packed 16-bit-per-channel RGBA, little-endian — the swscale input for a
+    /// 10-bit encode, where RGBA8 would throw away the precision the whole HDR
+    /// path exists to keep.
     pub const AV_PIX_FMT_RGBA64:    i32 = 105;
     pub const SWS_BILINEAR:         i32 = 4;
     pub const SWS_POINT:             i32 = 0x10;
+
+    /// swscale's 16.16 fixed-point identity for brightness/contrast/saturation.
+    pub const SWS_ONE_16_16: i32 = 1 << 16;
+
+    /// Whether an encoder output format stores more than 8 bits per component.
+    ///
+    /// Asked of the format the encoder was actually opened with rather than of the
+    /// job, so a hardware encoder that fell back to a different format cannot end
+    /// up with a mismatched swscale input.  `av_pix_fmt_bit_depth` is FFmpeg's own
+    /// descriptor lookup, so this cannot drift from the enum.
+    pub fn pix_fmt_is_high_depth(fmt: i32) -> bool {
+        unsafe { crate::io::ffi::avutil::av_pix_fmt_bit_depth(fmt) > 8 }
+    }
 }
 
 pub struct VideoEncoder {
@@ -56,7 +91,16 @@ pub struct VideoEncoder {
     packet:      *mut crate::io::ffi::avutil::AVPacket,
     frame_count: i64,
     yuv_buffer:  *mut u8,
-    rgba8_buf:   Vec<u8>,
+    /// Scratch buffer holding the swscale input for one frame.
+    ///
+    /// 8-bit jobs pack RGBA8 here (4 bytes/px); 10-bit jobs pack RGBA64LE
+    /// (8 bytes/px), because narrowing to 8 bits first would discard exactly the
+    /// precision a 10-bit encode exists to carry.
+    rgb_buf:     Vec<u8>,
+    /// True when the encoder is fed 10-bit-or-higher pixels — i.e. an HDR job or
+    /// ProRes.  Selects which packer `encode_frame` runs and which swscale input
+    /// format `open` configured.
+    high_depth:  bool,
 }
 
 unsafe impl Send for VideoEncoder {}
@@ -64,9 +108,14 @@ unsafe impl Send for VideoEncoder {}
 impl VideoEncoder {
     pub fn open(job: &ExportJob) -> Result<Self, EncodeError> {
         unsafe {
-            let hw_candidates = match job.video_codec {
-                VideoCodec::H264 => vec!["h264_nvenc", "h264_amf", "h264_qsv"],
-                VideoCodec::H265 => vec!["hevc_nvenc", "hevc_amf", "hevc_qsv"],
+            // NVENC/AMF/QSV are only probed when the job's depth is one they can
+            // take.  For a 10-bit HDR job that means HEVC only: no vendor H.264
+            // encoder accepts P010, and asking for it is a guaranteed open
+            // failure that would just log noise before falling back.
+            let hw_candidates = match (job.video_codec, job.encode_bit_depth() >= 10) {
+                (VideoCodec::H264, false) => vec!["h264_nvenc", "h264_amf", "h264_qsv"],
+                (VideoCodec::H264, true)  => vec![],
+                (VideoCodec::H265, _)     => vec!["hevc_nvenc", "hevc_amf", "hevc_qsv"],
                 _ => vec![],
             };
 
@@ -137,18 +186,73 @@ impl VideoEncoder {
             av_frame_set_height(yuv_frame, job.height as i32);
             av_frame_set_format(yuv_frame, out_pix_fmt);
 
-            // Always use AV_PIX_FMT_RGBA (RGBA8) for swscale input.
-            // FFmpeg's libswscale lacks SIMD for RGBAF16LE input (runs an unoptimized
-            // scalar C float loop ~180ms/frame), whereas RGBA8 -> YUV420P uses
-            // hand-written AVX2 assembly (ff_rgba_to_yuv420p_avx2 ~2ms/frame).
-            // Our rgba16_to_rgba8 Rust SIMD loop converts RGBA16F -> RGBA8 in ~3ms.
+            // Feed swscale RGBA8 for an 8-bit encode and RGBA64LE for a 10-bit one.
+            //
+            // FFmpeg's libswscale lacks SIMD for RGBAF16LE input (an unoptimised
+            // scalar float loop, ~180 ms/frame), whereas RGBA8 -> YUV420P uses
+            // hand-written AVX2 assembly (~2 ms/frame) and RGBA64 -> 10-bit planar
+            // has a fast integer path.  Our own f16 -> u8/u16 packers below run in
+            // ~3 ms, so both cases stay well clear of the float path.
+            //
+            // RGBA8 is NOT usable for the 10-bit encode: quantising to 8 bits here
+            // would throw away exactly the precision the HDR path exists to keep,
+            // and PQ at 8 bits bands visibly in every gradient.
+            let high_depth = swscale_ffi::pix_fmt_is_high_depth(out_pix_fmt);
+            let src_pix_fmt = if high_depth {
+                swscale_ffi::AV_PIX_FMT_RGBA64
+            } else {
+                swscale_ffi::AV_PIX_FMT_RGBA
+            };
+
             let sws = swscale_ffi::sws_getContext(
-                job.width as i32, job.height as i32, swscale_ffi::AV_PIX_FMT_RGBA,
+                job.width as i32, job.height as i32, src_pix_fmt,
                 job.width as i32, job.height as i32, out_pix_fmt,
                 swscale_ffi::SWS_POINT,
                 std::ptr::null(), std::ptr::null(), std::ptr::null()
             );
+            if sws.is_null() {
+                avcodec_free_context(&mut (ctx as *mut _));
+                return Err(EncodeError::SwsConvert);
+            }
+
+            // P1.7 — pin the RGB->YUV matrix and range to what the stream is
+            // TAGGED as.  swscale otherwise applies its BT.601 default, so a
+            // BT.2020 HDR export would be tagged BT.2020 while carrying BT.601
+            // samples.  The source is full-range RGB either way (srcRange = 1).
+            let dst_coeffs = swscale_ffi::sws_getCoefficients(job.sws_colorspace());
+            let src_coeffs = swscale_ffi::sws_getCoefficients(1); // SWS_CS_ITU709
+            let cs_ret = swscale_ffi::sws_setColorspaceDetails(
+                sws,
+                src_coeffs, 1,                    // RGB input is always full range
+                dst_coeffs, job.sws_dst_range(),
+                0,
+                swscale_ffi::SWS_ONE_16_16,
+                swscale_ffi::SWS_ONE_16_16,
+            );
+            if cs_ret < 0 {
+                // Not fatal — the conversion still runs, just with swscale's
+                // default matrix.  Log loudly: it means the file's colour tags and
+                // its samples disagree.
+                log::warn!(
+                    "[encoder] sws_setColorspaceDetails failed ({cs_ret}) — output \
+                     will be tagged colorspace {} but converted with swscale's \
+                     default matrix",
+                    job.sws_colorspace()
+                );
+            } else {
+                log::info!(
+                    "[encoder] swscale: {}-bit {} -> pix_fmt {}, colorspace {}, dst_range {}",
+                    if high_depth { 16 } else { 8 },
+                    if high_depth { "RGBA64" } else { "RGBA8" },
+                    out_pix_fmt,
+                    job.sws_colorspace(),
+                    job.sws_dst_range(),
+                );
+            }
+
             let packet = av_packet_alloc();
+
+            let bytes_per_px = if high_depth { 8usize } else { 4usize };
 
             Ok(Self {
                 ctx,
@@ -157,7 +261,10 @@ impl VideoEncoder {
                 packet,
                 frame_count: 0,
                 yuv_buffer,
-                rgba8_buf:   Vec::with_capacity((job.width * job.height * 4) as usize),
+                rgb_buf:    Vec::with_capacity(
+                    job.width as usize * job.height as usize * bytes_per_px,
+                ),
+                high_depth,
             })
         }
     }
@@ -174,13 +281,13 @@ impl VideoEncoder {
 
         avcodec_ctx_set_dimensions(ctx, job.width as i32, job.height as i32);
 
-        let out_pix_fmt = if is_hw {
-            swscale_ffi::AV_PIX_FMT_NV12
-        } else if job.video_codec.ffmpeg_id() == 147 {
-            swscale_ffi::AV_PIX_FMT_YUV422P
-        } else {
-            swscale_ffi::AV_PIX_FMT_YUV420P
-        };
+        // P1.7 — the encoder's pixel format now comes from the job rather than
+        // being hardcoded 8-bit.  `ExportJob::encoder_pix_fmt` returns P010 /
+        // YUV420P10LE for an HDR job, NV12 / YUV420P for SDR, and always
+        // YUV422P10LE for ProRes (which has no 8-bit mode).  Feeding an HDR job
+        // through yuv420p was the reason a file could be tagged HDR10 and still
+        // carry SDR pixels.
+        let out_pix_fmt = job.encoder_pix_fmt(is_hw);
         avcodec_ctx_set_pix_fmt(ctx, out_pix_fmt);
 
         let enc_tb = AVRational { num: job.frame_rate.den as i32, den: job.frame_rate.num as i32 };
@@ -269,6 +376,50 @@ impl VideoEncoder {
             avcodec_ctx_set_flags(ctx, AV_CODEC_FLAG_GLOBAL_HEADER);
         }
 
+        // P1.7 — colour description. Set BEFORE avcodec_open2 so libavcodec bakes
+        // it into the bitstream's VUI; setting it afterwards only reaches the
+        // container. `job.output_color` describes what the encoder is fed: Rec.709
+        // after the renderer's tone-map for an SDR job, BT.2020 + PQ for an HDR one.
+        let color = &job.output_color;
+        avcodec_ctx_set_color_space(ctx, color.av_color_space());
+        avcodec_ctx_set_color_range(ctx, color.av_color_range());
+        avcodec_ctx_set_color_trc(ctx, color.av_color_trc());
+        avcodec_ctx_set_color_primaries(ctx, color.av_color_primaries());
+        // AVCHROMA_LOC_LEFT (1) — MPEG-2/H.264/HEVC 4:2:0 siting, which is what
+        // both swscale and NVENC produce here.
+        avcodec_ctx_set_chroma_location(ctx, 1);
+
+        // P1.7 — HDR10 static metadata, also before open2: libavcodec reads
+        // `decoded_side_data` there, and that is what makes libx265 emit the
+        // mastering-display and content-light-level SEI into the bitstream.
+        // Without it a BT.2020/PQ file carries no grade information and displays
+        // fall back to their own guesses.
+        if let Some(hdr) = job.hdr10.as_ref() {
+            let ret = crate::export::ffi::encoder_ffi::avcodec_ctx_set_hdr10_metadata(
+                ctx,
+                hdr.primaries.as_ptr(),
+                hdr.white_point.as_ptr(),
+                hdr.min_luminance,
+                hdr.max_luminance,
+                hdr.max_cll,
+                hdr.max_fall,
+            );
+            if ret < 0 {
+                // Non-fatal: the file is still valid HDR10 by its colour tags,
+                // just unmastered.  Worth a warning rather than failing an export
+                // that is otherwise correct.
+                log::warn!(
+                    "[encoder] failed to attach HDR10 static metadata to the encoder \
+                     context — the bitstream will carry no mastering-display SEI"
+                );
+            } else {
+                log::info!(
+                    "[encoder] HDR10 metadata: max_luminance={} cd/m², MaxCLL={}, MaxFALL={}",
+                    hdr.peak_nits(), hdr.max_cll, hdr.max_fall
+                );
+            }
+        }
+
         let ret = avcodec_open2(ctx, codec, std::ptr::null_mut());
         if ret < 0 {
             avcodec_free_context(&mut (ctx as *mut _));
@@ -286,10 +437,18 @@ impl VideoEncoder {
         let width  = unsafe { av_frame_get_width(self.yuv_frame)  as u32 };
         let height = unsafe { av_frame_get_height(self.yuv_frame) as u32 };
 
-        // Fast path for swscale: convert f16→u8 first using Rust SIMD.
-        self.rgba16_to_rgba8(&frame.data, width, height);
-        let src_ptr = self.rgba8_buf.as_ptr();
-        let bytes_per_row = width * 4;
+        // Pack the RGBA16Float render target into whichever integer RGB format
+        // swscale was configured for, then let swscale's optimised path do the
+        // RGB->YUV conversion.  See `open` for why the f16 texture is not handed
+        // to swscale directly.
+        let bytes_per_row = if self.high_depth {
+            self.rgba16f_to_rgba64(&frame.data, width, height);
+            width * 8
+        } else {
+            self.rgba16f_to_rgba8(&frame.data, width, height);
+            width * 4
+        };
+        let src_ptr = self.rgb_buf.as_ptr();
 
         unsafe {
             let mut src_data: [*const u8; 8] = [std::ptr::null(); 8];
@@ -308,6 +467,11 @@ impl VideoEncoder {
             );
 
             av_frame_set_pts(self.yuv_frame, self.frame_count);
+            // One tick in the encoder timebase (which is 1/frame_rate), so the
+            // muxer can size the final `stts` entry.  With duration = 0 the mp4
+            // track's `mdhd` duration ends exactly at the last frame's PTS and
+            // decoders flag that frame AV_PKT_FLAG_DISCARD, silently losing it.
+            av_frame_set_duration(self.yuv_frame, 1);
             self.frame_count += 1;
 
             let mut ret = avcodec_send_frame(self.ctx, self.yuv_frame);
@@ -339,6 +503,15 @@ impl VideoEncoder {
             if ret < 0 {
                 break;
             }
+            // Guarantee a non-zero packet duration.  Not every encoder wrapper
+            // propagates AVFrame::duration onto its output packets, and the mp4/mov
+            // muxer sizes the final `stts` entry from the LAST packet's duration:
+            // when that is 0 the track's `mdhd` duration ends exactly at the final
+            // frame's PTS, and decoders flag the frame AV_PKT_FLAG_DISCARD — which
+            // silently drops the last frame of every export.
+            if (*self.packet).duration == 0 {
+                (*self.packet).duration = 1; // one tick of the encoder timebase
+            }
             packet_sink(self.packet);
             av_packet_unref(self.packet);
         }
@@ -350,14 +523,14 @@ impl VideoEncoder {
     /// Processes 4 channels at a time using chunks_exact for better autovectorisation
     /// compared to the old per-channel scalar loop. The compiler can emit SSE/AVX
     /// instructions for the f16→f32→u8 pipeline when iterating over contiguous chunks.
-    fn rgba16_to_rgba8(&mut self, data: &[u8], width: u32, height: u32) {
+    fn rgba16f_to_rgba8(&mut self, data: &[u8], width: u32, height: u32) {
         let pixel_count = (width * height) as usize;
         let target_len = pixel_count * 4;
-        if self.rgba8_buf.len() != target_len {
-            self.rgba8_buf.resize(target_len, 0);
+        if self.rgb_buf.len() != target_len {
+            self.rgb_buf.resize(target_len, 0);
         }
         let src_chunks = data[..pixel_count * 8].chunks_exact(8);
-        let dst_chunks = self.rgba8_buf.chunks_exact_mut(4);
+        let dst_chunks = self.rgb_buf.chunks_exact_mut(4);
         for (src, dst) in src_chunks.zip(dst_chunks) {
             // Read 4 f16 channels (R, G, B, A) from 8 bytes.
             let r = half::f16::from_le_bytes([src[0], src[1]]).to_f32();
@@ -368,6 +541,34 @@ impl VideoEncoder {
             dst[1] = (g * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
             dst[2] = (b * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
             dst[3] = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    /// Convert Rgba16Float (f16) pixel data to RGBA64LE (u16 per channel).
+    ///
+    /// P1.7 — the 10-bit path's equivalent of `rgba16f_to_rgba8`. Scaling to the
+    /// full 16-bit range rather than to 1023 matters: swscale's RGBA64 -> 10-bit
+    /// YUV conversion assumes 16-bit input and shifts down itself, so pre-scaling
+    /// to 10 bits here would lose a factor of 64 in brightness.
+    ///
+    /// f16 has an 11-bit significand, so it represents every 10-bit code exactly
+    /// and the 16-bit intermediate is lossless with respect to the 10-bit output.
+    fn rgba16f_to_rgba64(&mut self, data: &[u8], width: u32, height: u32) {
+        let pixel_count = (width * height) as usize;
+        let target_len = pixel_count * 8;
+        if self.rgb_buf.len() != target_len {
+            self.rgb_buf.resize(target_len, 0);
+        }
+        let src_chunks = data[..pixel_count * 8].chunks_exact(8);
+        let dst_chunks = self.rgb_buf.chunks_exact_mut(8);
+        for (src, dst) in src_chunks.zip(dst_chunks) {
+            for c in 0..4 {
+                let v = half::f16::from_le_bytes([src[c * 2], src[c * 2 + 1]]).to_f32();
+                let scaled = (v * 65535.0 + 0.5).clamp(0.0, 65535.0) as u16;
+                let bytes = scaled.to_le_bytes();
+                dst[c * 2]     = bytes[0];
+                dst[c * 2 + 1] = bytes[1];
+            }
         }
     }
 
@@ -403,6 +604,50 @@ pub enum EncodeError {
 
 // ─── Phase 7 addition ───────────────────────────────────────────────────────
 
+/// Hand one NVENC bitstream to a `packet_sink` as a borrowed `AVPacket`.
+///
+/// The packet points directly at `packet.bytes` (no copy) and its data pointer
+/// is cleared before `av_packet_free` so FFmpeg never tries to free a
+/// Rust-owned allocation.  `bytes` must outlive the sink call, which it does:
+/// the caller owns the `EncodedPacket` for the whole call.
+///
+/// PTS and DTS are written separately — see `DtsQueue` in `encode_interop.rs`
+/// for why `dts = pts` is wrong for a reordering encoder — and
+/// `AV_PKT_FLAG_KEY` is set from the picture type NVENC reported so the muxer
+/// can build a correct sync-sample table.
+pub(crate) fn write_nvenc_packet(
+    packet:      &crate::interop::encode_interop::EncodedPacket,
+    packet_sink: &mut dyn FnMut(*mut crate::io::ffi::avutil::AVPacket),
+) -> Result<(), EncodeError> {
+    use crate::io::ffi::avutil::{av_packet_alloc, av_packet_free, AV_PKT_FLAG_KEY};
+
+    unsafe {
+        let pkt = av_packet_alloc();
+        if pkt.is_null() {
+            return Err(EncodeError::Alloc);
+        }
+        (*pkt).data     = packet.bytes.as_ptr() as *mut u8;
+        (*pkt).size     = packet.bytes.len() as i32;
+        (*pkt).pts      = packet.pts;
+        (*pkt).dts      = packet.dts;
+        // One tick in the muxer's video timebase (1/frame_rate).  libavcodec sets
+        // this itself on the CPU path; here the packet is built by hand, and a
+        // zero duration on the LAST packet makes the mp4 track's `mdhd` duration
+        // stop at that frame's PTS — decoders then flag it AV_PKT_FLAG_DISCARD
+        // and the final frame silently vanishes.
+        (*pkt).duration = 1;
+        (*pkt).flags    = if packet.is_keyframe { AV_PKT_FLAG_KEY } else { 0 };
+
+        packet_sink(pkt);
+
+        // Detach the Rust-owned buffer before freeing the packet shell.
+        (*pkt).data = std::ptr::null_mut();
+        (*pkt).size = 0;
+        av_packet_free(&mut (pkt as *mut _));
+    }
+    Ok(())
+}
+
 /// Selects between the Phase 6 CPU-FFmpeg encoder and the Phase 7 NVENC path.
 /// All upstream callers (EncoderQueue, ExportEngine, Muxer) remain unchanged —
 /// they consume the unified `encode_frame` interface regardless of which variant is active.
@@ -429,17 +674,45 @@ impl VideoEncoderBackend {
     pub fn select(
         job:        &ExportJob,
         capability: &crate::interop::capability::InteropCapability,
-        cuda_ctx:   Option<&crate::interop::cuda_context::CudaContext>,
+        cuda_ctx:   Option<&std::sync::Arc<crate::interop::cuda_context::CudaContext>>,
         device:     &crate::render::device::GpuDevice,
     ) -> Result<Self, EncodeError> {
         let nvenc_eligible = matches!(
             job.video_codec,
             VideoCodec::H264 | VideoCodec::H265,
         );
+
+        // P1.7 — an HDR job never takes the zero-copy NVENC path.
+        //
+        // `EncodeInterop` feeds NVENC ABGR10 and initialises the session from the
+        // driver's preset config, patching only `frameIntervalP` at a byte offset
+        // it verifies. Producing a Main10 HEVC stream additionally requires
+        // `profileGUID` and the codec-specific `pixelBitDepthMinus8`, both of
+        // which live inside NV_ENC_CONFIG's per-codec union — territory this code
+        // deliberately does not poke at guessed offsets (see the offset discussion
+        // in `interop/ffi/nvenc.rs`). Left alone, the session would encode a
+        // Main-profile 8-bit stream from the 10-bit input, i.e. exactly the
+        // tagged-HDR-with-SDR-pixels file this work exists to eliminate.
+        //
+        // The FFmpeg path is not a downgrade in speed: it still resolves
+        // `hevc_nvenc` first, so the encode remains on the GPU. What it gives up
+        // is the zero-copy readback, and it gains a libavcodec wrapper that
+        // configures Main10 + P010 correctly.
+        if job.is_hdr() {
+            log::info!(
+                "[export] HDR job — using the FFmpeg encoder path (hevc_nvenc if \
+                 available) rather than zero-copy NVENC: the direct interop \
+                 session cannot be configured for Main10 10-bit output"
+            );
+            return Ok(Self::FfmpegCpu(VideoEncoder::open(job)?));
+        }
+
         if capability.is_available() && nvenc_eligible {
             if let Some(ctx) = cuda_ctx {
+                // Clone the Arc: EncodeInterop must own a share of the CUDA
+                // primary context for as long as its NVENC session lives.
                 match crate::interop::encode_interop::EncodeInterop::open(
-                    ctx,
+                    std::sync::Arc::clone(ctx),
                     device,
                     job,
                     capability.transport,
@@ -451,7 +724,7 @@ impl VideoEncoderBackend {
                         return Ok(Self::CudaNvenc { enc, param_enc });
                     }
                     Err(e) => {
-                        log::warn!("[export] Direct NVENC interop open failed: {:?}, falling back to FFmpeg", e);
+                        log::warn!("[export] Direct NVENC interop open failed: {e}, falling back to FFmpeg");
                     }
                 }
             }
@@ -477,54 +750,48 @@ impl VideoEncoderBackend {
             Self::CudaNvenc { enc, .. } => {
                 // Encode via NVENC directly.
                 // The pipelined renderer loop calls nvenc_interop_mut() and passes the
-                // correct ping-pong slot explicitly. This arm is a fallback for any
-                // non-pipelined callers; slot 0 is safe because both slots hold the same
-                // registered resource type and NVENC selects based on the mapped handle.
-                let (bytes, pts) = enc.encode_frame(frame.pts, 0)
+                // correct pipeline slot explicitly. This arm is a fallback for any
+                // non-pipelined callers; slot 0 is safe because `encode_frame`
+                // reclaims the slot itself before reusing it.
+                let packets = enc.encode_frame(frame.pts, 0)
                     .map_err(|e| EncodeError::Interop(format!("{:?}", e)))?;
 
-                if bytes.is_empty() {
-                    return Ok(());
-                }
-
-                // Wrap the compressed bytes in a minimal AVPacket shim so packet_sink's
-                // existing signature keeps working unmodified. The muxer is completely
-                // unaware which backend produced the packet.
-                unsafe {
-                    use crate::io::ffi::avutil::{av_packet_alloc, av_packet_free};
-                    let pkt = av_packet_alloc();
-                    if pkt.is_null() {
-                        return Err(EncodeError::Alloc);
+                // An empty Vec means the encoder accepted the picture and is still
+                // working — the bitstream arrives from a later call or from flush().
+                for packet in &packets {
+                    if packet.bytes.is_empty() {
+                        continue;
                     }
-                    // Point the packet at our owned bytes (zero-copy hand-off).
-                    (*pkt).data     = bytes.as_ptr() as *mut u8;
-                    (*pkt).size     = bytes.len() as i32;
-                    (*pkt).pts      = pts;
-                    (*pkt).dts      = pts;
-                    (*pkt).duration = 0;
-                    // Keep `bytes` alive across the sink call.
-                    packet_sink(pkt);
-                    // Reset data pointer before freeing so av_packet_free
-                    // doesn't try to free a Rust-owned allocation.
-                    (*pkt).data = std::ptr::null_mut();
-                    (*pkt).size = 0;
-                    av_packet_free(&mut (pkt as *mut _));
+                    write_nvenc_packet(packet, packet_sink)?;
                 }
-
                 Ok(())
             }
         }
     }
 
     /// Flush any buffered frames.
-    /// For NVENC, sends a zero-length encode-picture call with the EOS flag.
+    ///
+    /// For NVENC this submits the EOS picture and writes out every packet the
+    /// encoder was still holding; skipping it silently truncates the tail of the
+    /// export whenever the driver kept reordering enabled.
     pub fn flush(
         &mut self,
         packet_sink: &mut dyn FnMut(*mut crate::io::ffi::avutil::AVPacket),
     ) -> Result<(), EncodeError> {
         match self {
-            Self::FfmpegCpu(enc)              => enc.flush(packet_sink),
-            Self::CudaNvenc { .. }            => Ok(()), // NVENC flushes implicitly on session destroy
+            Self::FfmpegCpu(enc) => enc.flush(packet_sink),
+            Self::CudaNvenc { enc, .. } => {
+                let packets = enc
+                    .flush()
+                    .map_err(|e| EncodeError::Interop(format!("NVENC flush failed: {e:?}")))?;
+                for packet in &packets {
+                    if packet.bytes.is_empty() {
+                        continue;
+                    }
+                    write_nvenc_packet(packet, packet_sink)?;
+                }
+                Ok(())
+            }
         }
     }
 
