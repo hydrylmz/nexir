@@ -315,6 +315,35 @@ impl ExportJob {
         }
     }
 
+    /// Whether the zero-copy NVENC path can describe this job's colour correctly.
+    ///
+    /// `Abgr10RepackNode` hands NVENC **RGB** (`NV_ENC_BUFFER_FORMAT_ABGR10`), so
+    /// the RGB→YUV conversion happens inside the driver, not in our shader. With
+    /// no VUI configured the driver applies BT.601 — while `Muxer::open` tags the
+    /// stream from `output_color`, which is BT.709 for every normal export. The
+    /// result is a file whose samples and tags disagree: red decodes as
+    /// `[255, 25, 0]` instead of `[255, 0, 0]`, a hue error small enough to be
+    /// mistaken for codec loss.
+    ///
+    /// Selecting the matrix would mean writing
+    /// `NV_ENC_CONFIG_{H264,HEVC}_VUI_PARAMETERS`, which lives inside
+    /// NV_ENC_CONFIG's per-codec union — the guessed-offset territory
+    /// `interop/ffi/nvenc.rs` deliberately refuses to enter without vendor
+    /// headers, and which `preset_cfg_version_matches` does not validate.
+    ///
+    /// So the gate is narrow and honest: zero-copy is only safe when the job's own
+    /// matrix already matches what the driver will apply. Anything else takes the
+    /// FFmpeg path, where libavcodec's nvenc wrapper writes the VUI properly. That
+    /// keeps the encode on the GPU and gives up only the zero-copy readback.
+    ///
+    /// To restore zero-copy for BT.709, the fix is to convert RGB→YUV in our own
+    /// repack shader and feed NVENC NV12/P010 — then the driver performs no matrix
+    /// conversion at all and our tags are authoritative by construction.
+    pub fn nvenc_zero_copy_is_colour_safe(&self) -> bool {
+        // The driver's default for RGB input, per the H.264/HEVC VUI defaults.
+        self.output_color.matrix == MatrixCoefficients::Bt601
+    }
+
     pub fn validate(&self) -> Result<(), JobError> {
         if self.pts_in >= self.pts_out {
             return Err(JobError::NegativeDuration);

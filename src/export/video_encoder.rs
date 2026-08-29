@@ -708,6 +708,22 @@ impl VideoEncoderBackend {
         }
 
         if capability.is_available() && nvenc_eligible {
+            // P1.7 — the zero-copy path feeds NVENC RGB and lets the driver pick
+            // the RGB→YUV matrix, which is BT.601. `Muxer::open` tags the stream
+            // BT.709. See `ExportJob::nvenc_zero_copy_is_colour_safe` for the full
+            // reasoning and for what it would take to lift this.
+            if !job.nvenc_zero_copy_is_colour_safe() {
+                log::info!(
+                    "[export] output is tagged {:?} but the zero-copy NVENC path \
+                     would have the driver convert RGB with BT.601 — using the \
+                     FFmpeg encoder path (h264_nvenc/hevc_nvenc if available) so \
+                     the samples match the tags. The encode stays on the GPU; only \
+                     the zero-copy readback is given up.",
+                    job.output_color.matrix
+                );
+                return Ok(Self::FfmpegCpu(VideoEncoder::open(job)?));
+            }
+
             if let Some(ctx) = cuda_ctx {
                 // Clone the Arc: EncodeInterop must own a share of the CUDA
                 // primary context for as long as its NVENC session lives.

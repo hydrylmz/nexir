@@ -36,7 +36,8 @@ mod export_validation {
     use crate::timeline::mutation::{insert_clip, ClipInsertParams};
     use crate::timeline::rational::Rational;
     use crate::timeline::source::{
-        ColorInfo, PixelFormat, SourceRegistry, VideoStreamInfo, VideoRotation,
+        ColorInfo, MatrixCoefficients, PixelFormat, SourceRegistry, VideoStreamInfo,
+        VideoRotation,
     };
     use crate::timeline::store::{ClipKind, TimelineStore};
     use crate::timeline::track::{Track, TrackList};
@@ -46,9 +47,14 @@ mod export_validation {
     const TB: Rational = Rational { num: 1, den: 90_000 };
     const FPS: Rational = Rational { num: 30, den: 1 };
 
-    /// Export canvas.  320x240 keeps the encode fast and, being SD, makes both
-    /// swscale and the decoder pick BT.601 — which is what `yuv_to_rgb_bt601`
-    /// below inverts.  Both dimensions are even, as YUV420 chroma requires.
+    /// Export canvas.  320x240 keeps the encode fast, and both dimensions are
+    /// even as YUV420 chroma requires.
+    ///
+    /// The resolution no longer decides the matrix: since P1.7 the encoder pins
+    /// swscale to `ExportJob::sws_colorspace()` (see
+    /// `VideoEncoder::open`'s `sws_setColorspaceDetails` call), so an SDR job is
+    /// converted with BT.709 coefficients regardless of frame size, matching the
+    /// BT.709 tags it writes.  `yuv_to_rgb_bt709` below is the matching inverse.
     const W: u32 = 320;
     const H: u32 = 240;
     /// 6 patches of 40 rows each.
@@ -102,17 +108,30 @@ mod export_validation {
         img.save(path).expect("failed to write test pattern PNG");
     }
 
-    /// BT.601 limited-range YUV → RGB, the inverse of what swscale applies when
-    /// converting RGBA to YUV420P for an SD frame with no explicit colour
-    /// metadata.
-    fn yuv_to_rgb_bt601(y: u8, u: u8, v: u8) -> [u8; 3] {
+    /// Limited-range YUV → RGB for the matrix the file is tagged with.
+    ///
+    /// Both matrices are needed because the two encoder paths land on different
+    /// ones and each is correct for its own file: `VideoEncoder::open` pins
+    /// swscale to `job.sws_colorspace()` (BT.709 for a normal SDR export), while
+    /// the zero-copy NVENC path has the driver convert RGB with BT.601. Inverting
+    /// with the wrong one misreads red by ~22 levels — small enough to look like
+    /// codec loss, which is exactly why the test picks the matrix from the job
+    /// rather than assuming one.
+    fn yuv_to_rgb(matrix: MatrixCoefficients, y: u8, u: u8, v: u8) -> [u8; 3] {
         let yf = (y as f32 - 16.0) / 219.0;
         let uf = (u as f32 - 128.0) / 224.0;
         let vf = (v as f32 - 128.0) / 224.0;
 
-        let r = yf + 1.402 * vf;
-        let g = yf - 0.344136 * uf - 0.714136 * vf;
-        let b = yf + 1.772 * uf;
+        // Inverses of the respective luma coefficients: BT.709 uses
+        // Kr = 0.2126 / Kb = 0.0722, BT.601 uses Kr = 0.299 / Kb = 0.114.
+        let (ar, bg, cg, db) = match matrix {
+            MatrixCoefficients::Bt601 => (1.402, 0.344_136, 0.714_136, 1.772),
+            _                         => (1.5748, 0.187_324, 0.468_124, 1.8556),
+        };
+
+        let r = yf + ar * vf;
+        let g = yf - bg * uf - cg * vf;
+        let b = yf + db * uf;
 
         [
             (r * 255.0 + 0.5).clamp(0.0, 255.0) as u8,
@@ -125,6 +144,9 @@ mod export_validation {
     struct DecodedFrame {
         width:  u32,
         height: u32,
+        /// Matrix the file is tagged with, so `rgb_at` inverts the same conversion
+        /// the encoder applied rather than a hardcoded guess.
+        matrix: MatrixCoefficients,
         y:      Vec<u8>,
         u:      Vec<u8>,
         v:      Vec<u8>,
@@ -141,7 +163,7 @@ mod export_validation {
             let cw = self.width.div_ceil(2);
             let yi = (y * self.width + x) as usize;
             let ci = ((y / 2) * cw + (x / 2)) as usize;
-            yuv_to_rgb_bt601(self.y[yi], self.u[ci], self.v[ci])
+            yuv_to_rgb(self.matrix, self.y[yi], self.u[ci], self.v[ci])
         }
     }
 
@@ -150,6 +172,11 @@ mod export_validation {
     ///
     /// Returns the decoded frames plus the PTS values the container reported, so
     /// callers can assert on timestamps as well as pixels.
+    ///
+    /// Each frame carries the matrix the STREAM IS TAGGED WITH, read from the raw
+    /// codecpar, so `rgb_at` inverts whatever conversion the encoder actually
+    /// applied. This is what lets one helper verify both encoder paths: they pick
+    /// different matrices, and each is right for its own file.
     fn decode_file(path: &Path, max_frames: usize) -> (Vec<DecodedFrame>, Vec<i64>) {
         let mut demuxer = crate::io::demuxer::Demuxer::open(path)
             .expect("failed to open the exported file for verification");
@@ -160,6 +187,18 @@ mod export_validation {
 
         let width  = stream.width.expect("exported stream has no width");
         let height = stream.height.expect("exported stream has no height");
+
+        // Raw codecpar, not `StreamInfo::color_info`: the latter fills unspecified
+        // fields in with resolution heuristics, which would report BT.601 for this
+        // SD frame regardless of what the file says.
+        let tagged_matrix = match unsafe {
+            crate::io::ffi::avcodec::avcodecpar_get_color_space(stream.codecpar)
+        } {
+            5 | 6 => MatrixCoefficients::Bt601, // BT470BG / SMPTE170M
+            9     => MatrixCoefficients::Bt2020,
+            _     => MatrixCoefficients::Bt709,
+        };
+        eprintln!("[export_validation] stream is tagged matrix {tagged_matrix:?}");
 
         // enable_hw = false: a hardware decoder would hand back NV12 (or a
         // hw-frame that needs a transfer), and this check wants one fixed layout.
@@ -221,6 +260,7 @@ mod export_validation {
             frames.push(DecodedFrame {
                 width:  w,
                 height: h,
+                matrix: tagged_matrix,
                 y: buf[..luma_len].to_vec(),
                 u: buf[luma_len..luma_len + chroma_len].to_vec(),
                 v: buf[luma_len + chroma_len..luma_len + 2 * chroma_len].to_vec(),
@@ -249,6 +289,7 @@ mod export_validation {
                     frames.push(DecodedFrame {
                         width:  w,
                         height: h,
+                        matrix: tagged_matrix,
                         y: buf[..luma_len].to_vec(),
                         u: buf[luma_len..luma_len + chroma_len].to_vec(),
                         v: buf[luma_len + chroma_len..luma_len + 2 * chroma_len].to_vec(),
@@ -399,6 +440,9 @@ mod export_validation {
             render_threads: 1,
             cpu_preset:     CpuPreset::Medium,
             output_color:   crate::timeline::source::ColorInfo::bt709(),
+            // SDR by default; the HDR test calls `set_hdr10` on the returned job
+            // so the colour tags and the static metadata can never disagree.
+            hdr10:          None,
         }
     }
 
@@ -732,16 +776,23 @@ mod export_validation {
     /// off the opened `AVCodecContext`, where only `open_codec_context` could have
     /// put them.
     ///
-    /// Metadata only: the job still encodes 8-bit YUV420p, so the file this would
-    /// produce is *tagged* HDR without carrying HDR pixels. That is deliberate —
-    /// what is under test is the tagging path, and a real HDR export additionally
-    /// needs a 10-bit pixel format and the renderer's tone-map bypassed (still
-    /// open, tracked as the remainder of P1.7).
+    /// Scope: the TAGGING path only, and deliberately so.  It sets
+    /// `output_color` by hand and leaves `hdr10` at `None`, so no static metadata
+    /// is attached and no file is written — `VideoEncoder::open` is the only thing
+    /// exercised.  Whether the *pixels* are really 10-bit PQ is a different
+    /// question, answered end-to-end by `hdr10_export_carries_10bit_pq_pixels`
+    /// below.
+    ///
+    /// H.265 is used because `ExportJob::encode_bit_depth` floors an HDR job at 10
+    /// bits and `VideoCodec::supports_hdr` rejects H.264 for exactly that reason;
+    /// asking for BT.2020/PQ on the H264 job `make_job` returns would be an
+    /// invalid job rather than a tagging test.
     #[test]
     fn encoder_context_carries_requested_color_description() {
         init_logging();
         let mp4 = scratch("colortag").with_extension("mp4");
         let mut job = make_job(mp4, 10 * (TB.den / FPS.num));
+        job.video_codec = VideoCodec::H265;
         job.output_color = crate::timeline::source::ColorInfo::bt2020(true, 10);
 
         let encoder = crate::export::video_encoder::VideoEncoder::open(&job)
@@ -790,6 +841,14 @@ mod export_validation {
     ///
     /// Set `NEXIR_REQUIRE_NVENC=1` to turn the remaining skip into a failure too
     /// (for CI on a machine that is supposed to have the hardware).
+    ///
+    /// The job is tagged BT.601 on purpose. The zero-copy path hands NVENC RGB and
+    /// the driver converts it with BT.601, so `ExportJob::nvenc_zero_copy_is_colour_safe`
+    /// only lets a BT.601 job through — a BT.709 job is routed to the FFmpeg
+    /// encoder precisely so its samples cannot disagree with its tags. Asking for
+    /// BT.601 here is therefore what makes this test exercise the zero-copy path at
+    /// all, and `assert_container_color` plus the pixel checks then verify the
+    /// driver's own conversion against the matrix the file declares.
     #[test]
     fn nvenc_export_matches_pattern() {
         init_logging();
@@ -803,7 +862,14 @@ mod export_validation {
 
         let duration_pts = 10 * (TB.den / FPS.num);
         let harness = build_harness(&png, duration_pts);
-        let job = make_job(mp4.clone(), duration_pts);
+        let mut job = make_job(mp4.clone(), duration_pts);
+        job.output_color = crate::timeline::source::ColorInfo::bt601();
+        assert!(
+            job.nvenc_zero_copy_is_colour_safe(),
+            "this test only means something if the job is eligible for the \
+             zero-copy path"
+        );
+        let job = job;
 
         let require_nvenc = std::env::var("NEXIR_REQUIRE_NVENC")
             .map(|v| v != "0" && !v.is_empty())
@@ -832,7 +898,7 @@ mod export_validation {
         // and `run_export` already reports which backend the engine chose.
         let (phase, was_nvenc) = run_export(
             &harness,
-            make_job(mp4.clone(), duration_pts),
+            job.clone(),
             false,
             std::time::Duration::from_secs(120),
         );
@@ -882,6 +948,299 @@ mod export_validation {
         let _ = std::fs::remove_file(&png);
         if std::env::var("NEXIR_KEEP_EXPORT").is_ok() {
             eprintln!("[export_validation] kept export at {}", mp4.display());
+        } else {
+            let _ = std::fs::remove_file(&mp4);
+        }
+    }
+
+    /// Decode a 10-bit export and return each frame's LUMA plane as 10-bit codes.
+    ///
+    /// Separate from [`decode_file`] rather than a flag on it: that helper asserts
+    /// an 8-bit planar decode and unpacks three `u8` planes, and an HDR file is
+    /// `yuv420p10le` — two bytes per sample.  Asserting the decoded depth here is
+    /// half of what makes the HDR test meaningful: a file that was tagged HDR but
+    /// encoded 8-bit fails on this assertion before any pixel is examined.
+    ///
+    /// Only luma is returned because the pixel assertions below sample neutral
+    /// patches (black / white / grey), where chroma carries no information.
+    fn decode_10bit_luma(path: &Path, max_frames: usize) -> Vec<Vec<u16>> {
+        let mut demuxer = crate::io::demuxer::Demuxer::open(path)
+            .expect("failed to open the exported HDR file for verification");
+        let stream = demuxer
+            .video_stream
+            .clone()
+            .expect("exported HDR file has no video stream");
+        let width  = stream.width.expect("exported HDR stream has no width");
+        let height = stream.height.expect("exported HDR stream has no height");
+
+        let mut decoder =
+            crate::io::decoder::Decoder::open_sw(&stream, stream.codecpar)
+                .expect("failed to open a software decoder for the exported HDR file");
+
+        // yuv420p10le is 3 * w * h bytes (2 bytes/sample, 1.5 samples/pixel).
+        let mut buf = vec![0u8; width as usize * height as usize * 4 + 64];
+        let mut frames: Vec<Vec<u16>> = Vec::new();
+
+        let take = |frame: &crate::io::decoder::DecodedFrame, buf: &[u8]| -> Vec<u16> {
+            assert_eq!(
+                frame.meta.layout.bit_depth, 10,
+                "the exported file decoded back at {}-bit — it is tagged HDR10 but \
+                 carries {}-bit samples, which is precisely the tagged-SDR failure \
+                 this test exists to catch",
+                frame.meta.layout.bit_depth, frame.meta.layout.bit_depth
+            );
+            assert!(
+                !frame.is_semi_planar(),
+                "expected planar yuv420p10le from the software decoder, got semi-planar"
+            );
+            assert!(
+                !frame.meta.layout.msb_aligned,
+                "expected LSB-aligned 10-bit codes from a planar decode"
+            );
+            let luma_len = (frame.width * frame.height) as usize;
+            buf[..luma_len * 2]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        };
+
+        while frames.len() < max_frames {
+            let pkt = match demuxer.next_video_packet() {
+                Ok(Some(p)) => p,
+                Ok(None) => break,
+                Err(e) => panic!("demuxing the exported HDR file failed: {e:?}"),
+            };
+            match decoder.decode_into(&pkt, &mut buf, None) {
+                Ok(Some(frame)) => {
+                    let plane = take(&frame, &buf);
+                    frames.push(plane);
+                }
+                Ok(None) => continue,
+                Err(e) => panic!("decoding the exported HDR file failed: {e:?}"),
+            }
+        }
+        // Frame-threaded decoding holds back roughly one frame per core, so a
+        // short file yields most of its frames here.
+        while frames.len() < max_frames {
+            match decoder.drain_into(&mut buf) {
+                Ok(Some(frame)) => {
+                    let plane = take(&frame, &buf);
+                    frames.push(plane);
+                }
+                Ok(None) => break,
+                Err(e) => panic!("draining the HDR decoder failed: {e:?}"),
+            }
+        }
+
+        assert!(
+            !frames.is_empty(),
+            "the exported HDR file produced no decodable frames"
+        );
+        frames
+    }
+
+    /// SMPTE ST 2084 OETF: linear luminance in nits -> PQ code value in [0,1].
+    ///
+    /// Written out here rather than reused from the shader so the expectation is
+    /// derived independently of the code under test — the whole point is to check
+    /// the GPU actually applied this curve.
+    fn pq_code_for_nits(nits: f32) -> f32 {
+        let l = (nits / 10_000.0).clamp(0.0, 1.0);
+        if l <= 0.0 {
+            return 0.0;
+        }
+        const M1: f32 = 0.159_301_76;
+        const M2: f32 = 78.843_75;
+        const C1: f32 = 0.835_937_5;
+        const C2: f32 = 18.851_562;
+        const C3: f32 = 18.687_5;
+        let v = l.powf(M1);
+        ((C1 + C2 * v) / (1.0 + C3 * v)).powf(M2)
+    }
+
+    /// A full HDR10 export, checked all the way down to the sample values.
+    ///
+    /// This is the assertion the rest of P1.7 was building towards, and the one
+    /// that distinguishes a REAL HDR file from an SDR file wearing HDR tags. Four
+    /// independent things have to hold, and each has its own failure mode:
+    ///
+    /// 1. **10-bit decode** — `decode_10bit_luma` refuses anything else. An 8-bit
+    ///    encode with BT.2020/PQ tags dies here.
+    /// 2. **Colour description in the container** — `trc == 16` (ST 2084) and
+    ///    `primaries == 9` (BT.2020), read off the raw codecpar.
+    /// 3. **Static metadata present** — MDCV + CLL, via
+    ///    `avcodecpar_get_hdr10_metadata`. Tags alone leave a display guessing.
+    /// 4. **The pixels changed** — the luma of each neutral patch matches the PQ
+    ///    code for that patch's diffuse luminance, NOT its SDR code. sRGB white is
+    ///    100 nits, whose PQ code is ~0.515, so a correct HDR encode puts white at
+    ///    roughly half scale. A tone-mapped or passed-through SDR frame would put
+    ///    it near 1.0 — a ~370-code gap at 10-bit, far outside the tolerance.
+    ///
+    /// Point 4 is what none of the other tests can see: 1-3 all pass for a file
+    /// whose renderer never applied the PQ transform.
+    ///
+    /// H.265 is the codec because `VideoCodec::supports_hdr` allows only H265,
+    /// ProRes and VP9, and H.265 is the one of those with a CRF-controlled encoder
+    /// and a fast 10-bit decode.
+    #[test]
+    fn hdr10_export_carries_10bit_pq_pixels() {
+        init_logging();
+        let _guard = export_lock();
+        let png = scratch("hdr").with_extension("png");
+        let mp4 = scratch("hdr").with_extension("mp4");
+        write_test_pattern(&png);
+
+        let duration_pts = 10 * (TB.den / FPS.num);
+        let harness = build_harness(&png, duration_pts);
+
+        let mut job = make_job(mp4.clone(), duration_pts);
+        job.video_codec = VideoCodec::H265;
+        job.set_hdr10(crate::export::job::Hdr10Metadata::bt2020_1000_nits())
+            .expect("H.265 must accept an HDR10 configuration");
+        assert!(job.is_hdr(), "set_hdr10 did not put the job on the HDR path");
+        assert_eq!(
+            job.encode_bit_depth(), 10,
+            "an HDR job must encode at least 10-bit"
+        );
+        job.validate().expect("the HDR job must validate");
+
+        // force_cpu = true: `VideoEncoderBackend::select` already refuses the
+        // zero-copy NVENC path for an HDR job (it cannot be configured for
+        // Main10), so this only skips creating a CUDA context that would go
+        // unused.  `VideoEncoder::open` still resolves hevc_nvenc first if it is
+        // present, so the encode itself may well run on the GPU.
+        let (phase, _) = run_export(
+            &harness,
+            job.clone(),
+            true,
+            std::time::Duration::from_secs(180),
+        );
+        assert_eq!(
+            phase, ExportPhase::Done,
+            "HDR export did not finish cleanly: {phase:?}"
+        );
+        assert!(mp4.exists(), "HDR export reported Done but produced no file");
+
+        // ── 2. Colour description ────────────────────────────────────────────
+        assert_container_color(&mp4, &job.output_color, "hdr export");
+        {
+            use crate::io::ffi::avcodec::{
+                avcodecpar_get_color_primaries, avcodecpar_get_color_trc,
+            };
+            let demuxer = crate::io::demuxer::Demuxer::open(&mp4)
+                .expect("failed to reopen the HDR export");
+            let stream = demuxer.video_stream.clone().expect("no video stream");
+            let (trc, primaries) = unsafe {
+                (
+                    avcodecpar_get_color_trc(stream.codecpar),
+                    avcodecpar_get_color_primaries(stream.codecpar),
+                )
+            };
+            assert_eq!(
+                trc, 16,
+                "container transfer characteristic is {trc}, expected 16 \
+                 (SMPTE ST 2084 / PQ)"
+            );
+            assert_eq!(
+                primaries, 9,
+                "container colour primaries are {primaries}, expected 9 (BT.2020)"
+            );
+
+            // ── 3. Static metadata ───────────────────────────────────────────
+            let mut out = [0i64; 8];
+            let mask = unsafe {
+                crate::export::ffi::muxer_ffi::avcodecpar_get_hdr10_metadata(
+                    stream.codecpar,
+                    out.as_mut_ptr(),
+                )
+            };
+            assert_ne!(
+                mask & 1, 0,
+                "the container carries no mastering-display metadata (mdcv box) — \
+                 an HDR10 file without it is an unmastered grade"
+            );
+            assert_ne!(
+                mask & 2, 0,
+                "the container carries no content-light-level metadata (clli box)"
+            );
+            assert_eq!(out[0], 1, "mastering display has no primaries");
+            assert_eq!(out[1], 1, "mastering display has no luminance");
+            let expected = crate::export::job::Hdr10Metadata::bt2020_1000_nits();
+            // max_luminance is stored as a rational; compare in nits so a
+            // different-but-equivalent denominator does not fail the test.
+            let max_nits = out[4] as f64 / out[5].max(1) as f64;
+            assert!(
+                (max_nits - expected.peak_nits() as f64).abs() < 1.0,
+                "mastering display peak is {max_nits} cd/m², expected {}",
+                expected.peak_nits()
+            );
+            assert_eq!(
+                out[6] as u32, expected.max_cll,
+                "MaxCLL in the container does not match the job"
+            );
+            assert_eq!(
+                out[7] as u32, expected.max_fall,
+                "MaxFALL in the container does not match the job"
+            );
+        }
+
+        // ── 1. + 4. Depth and pixels ─────────────────────────────────────────
+        let frames = decode_10bit_luma(&mp4, job.total_frames());
+        let plane = &frames[0];
+
+        // 10-bit limited range: code = 64 + value * (940 - 64).
+        let to_code = |y: u16| (y as f32 - 64.0) / 876.0;
+        // ±0.035 of full scale (~31 codes at 10-bit) absorbs CRF 18 on a flat
+        // patch plus the RGBA64 round trip.  The SDR-vs-PQ gap this has to
+        // separate is ~0.48 of full scale, an order of magnitude larger.
+        const PQ_TOL: f32 = 0.035;
+
+        // Neutral patches only: the 709->2020 gamut rotation leaves saturated
+        // colours with a luma that depends on the matrix as well as the curve,
+        // which would test two things at once.  Indices are into `PATCHES`.
+        for &(idx, name, srgb) in &[
+            (0usize, "black",    0.0f32),
+            (1usize, "white",    1.0f32),
+            (5usize, "50% gray", 128.0 / 255.0),
+        ] {
+            let y = idx as u32 * PATCH_H + PATCH_H / 2;
+            let sample = plane[(y * W + W / 2) as usize];
+            let got = to_code(sample);
+
+            // sRGB EOTF -> linear, where 1.0 = 100 nits diffuse white, then PQ.
+            let linear = if srgb <= 0.04045 {
+                srgb / 12.92
+            } else {
+                ((srgb + 0.055) / 1.055).powf(2.4)
+            };
+            let want = pq_code_for_nits(linear * 100.0);
+
+            assert!(
+                (got - want).abs() <= PQ_TOL,
+                "patch '{name}': decoded 10-bit luma {sample} = code {got:.4}, \
+                 expected PQ code {want:.4} for {:.1} nits (tolerance {PQ_TOL}). \
+                 An SDR-encoded frame would read {srgb:.4} here — if `got` is close \
+                 to that instead, the renderer never applied the PQ transform and \
+                 the file is tagged HDR over SDR pixels.",
+                linear * 100.0
+            );
+        }
+
+        // White is the discriminating sample, so state it separately: PQ puts
+        // 100-nit diffuse white at roughly half scale, and nothing that skipped
+        // the transform can land there.
+        let white = to_code(plane[((PATCH_H + PATCH_H / 2) * W + W / 2) as usize]);
+        assert!(
+            white < 0.75,
+            "white decoded to code {white:.4}; a PQ-encoded 100-nit white sits near \
+             {:.4}, so a value this high means the frame is display-referred SDR \
+             wearing HDR tags",
+            pq_code_for_nits(100.0)
+        );
+
+        let _ = std::fs::remove_file(&png);
+        if std::env::var("NEXIR_KEEP_EXPORT").is_ok() {
+            eprintln!("[export_validation] kept HDR export at {}", mp4.display());
         } else {
             let _ = std::fs::remove_file(&mp4);
         }

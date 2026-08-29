@@ -23,6 +23,7 @@ fn main() {
         pts_out: 3000,
         cpu_preset: CpuPreset::Medium,
         output_color: nexir::timeline::source::ColorInfo::bt709(),
+        hdr10: None,
     };
 
     let video_enc = VideoEncoderBackend::FfmpegCpu(VideoEncoder::open(&job).unwrap());
