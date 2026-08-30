@@ -74,6 +74,37 @@ pub struct MediaPoolState {
     pub active_panel: LibraryPanel,
 }
 
+impl MediaPoolState {
+    /// Take whatever the file dialog selected and fold it into the entry list.
+    ///
+    /// P2.7 — this is split out of [`draw`] on purpose. The only untestable part of
+    /// media import is `rfd::FileDialog::pick_files`, which blocks on a human and
+    /// panics without a display; everything that decides what an import MEANS —
+    /// classification, de-duplication, ordering — is on this side of that seam and
+    /// needs no window. `draw` calls this immediately after setting
+    /// `pending_import`, so the tested path is the shipped path rather than a
+    /// parallel implementation.
+    ///
+    /// Returns how many entries were added, which is what a caller needs to know
+    /// whether anything actually happened.
+    pub fn apply_pending_import(&mut self) -> usize {
+        let Some(paths) = self.pending_import.take() else {
+            return 0;
+        };
+        let before = self.entries.len();
+        for path in paths {
+            let entry = MediaEntry::from_path(path);
+            // Re-importing a file the pool already holds must not duplicate it: the
+            // list is a library keyed by path, and a second entry would give the
+            // same media two selectable rows and two drag sources.
+            if !self.entries.iter().any(|e| e.path == entry.path) {
+                self.entries.push(entry);
+            }
+        }
+        self.entries.len() - before
+    }
+}
+
 
 pub fn draw(ui: &mut Ui, state: &mut MediaPoolState) {
     ui.horizontal(|ui| {
@@ -309,15 +340,9 @@ fn draw_media_pool(ui: &mut Ui, state: &mut MediaPoolState) {
     ui.separator();
 
     // ── Process any pending imports ────────────────────────────────────
-    if let Some(paths) = state.pending_import.take() {
-        for path in paths {
-            let entry = MediaEntry::from_path(path);
-            // Avoid duplicates
-            if !state.entries.iter().any(|e| e.path == entry.path) {
-                state.entries.push(entry);
-            }
-        }
-    }
+    // The classification and de-duplication live on `MediaPoolState` so they can
+    // be tested without a file dialog; see `apply_pending_import`.
+    state.apply_pending_import();
 
     // ── Entry list ────────────────────────────────────────────────────
     if state.entries.is_empty() {
