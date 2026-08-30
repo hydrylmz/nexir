@@ -19,6 +19,20 @@ void avcodec_ctx_set_time_base(AVCodecContext* ctx, AVRational tb) { ctx->time_b
 void avcodec_ctx_set_flags(AVCodecContext* ctx, int flags) { ctx->flags |= flags; }
 void avcodec_ctx_set_dimensions(AVCodecContext* ctx, int w, int h) { ctx->width = w; ctx->height = h; }
 void avcodec_ctx_set_pix_fmt(AVCodecContext* ctx, enum AVPixelFormat fmt) { ctx->pix_fmt = fmt; }
+
+/* Whether `fmt` is a pixel format libavutil actually describes.
+ *
+ * P2.3 — this exists because `sws_getContext` does NOT validate its format
+ * arguments: it calls `av_pix_fmt_desc_get(fmt)` and dereferences the result, so
+ * an unknown format (AV_PIX_FMT_NONE from a decoder that emitted a frame before
+ * negotiating one, or a format from a newer libavutil than the one linked) trips
+ * `Assertion desc failed at libswscale/swscale_internal.h:778` and takes the
+ * whole process down with STATUS_STACK_BUFFER_OVERRUN.  An unsupported input file
+ * must be an Err, not a crash, so `Decoder::emit_frame` checks this first. */
+int av_pix_fmt_is_known(int fmt) {
+    if (fmt < 0) return 0;
+    return av_pix_fmt_desc_get((enum AVPixelFormat)fmt) != NULL;
+}
 void avcodec_ctx_set_gop_size(AVCodecContext* ctx, int gop) { ctx->gop_size = gop; }
 void avcodec_ctx_set_bit_rate(AVCodecContext* ctx, int64_t br) { ctx->bit_rate = br; }
 void avcodec_ctx_set_sample_rate(AVCodecContext* ctx, int sr) { ctx->sample_rate = sr; }

@@ -12,6 +12,7 @@ use crate::io::ffi::avutil::{
     av_frame_set_color_space, av_frame_set_color_range,
     av_frame_set_color_trc, av_frame_set_color_primaries,
     av_pix_fmt_bit_depth,
+    av_pix_fmt_is_known,
     av_image_copy_to_buffer, av_image_fill_arrays, AVERROR_EOF, AVERROR_EAGAIN, AV_NOPTS_VALUE,
     AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV420P10LE,
     frame_layout_for_pix_fmt,
@@ -56,6 +57,22 @@ pub struct Decoder {
     /// True once the NULL end-of-stream packet has been sent, i.e. the decoder is
     /// in draining mode and will accept no further input until it is flushed.
     draining:  bool,
+    /// Packets `avcodec_send_packet` refused with EAGAIN, oldest first.
+    ///
+    /// P2.3 — a refused packet must not be dropped: every caller treats
+    /// `Ok(None)`/`Ok(Some(..))` as "I am done with that packet, here is the next
+    /// one", so a packet that never got in is gone. For an intra-only codec that
+    /// loses a frame; for AV1 it breaks the OBU sequence and the following send
+    /// fails with "Invalid data found when processing input".
+    ///
+    /// A QUEUE rather than one slot, because the re-send can itself be refused —
+    /// measured on a 2 s AV1 fixture, where packet 13's send AND its retry both
+    /// returned EAGAIN while packet 14 was already being offered. With a single
+    /// slot one of the two is always lost.
+    ///
+    /// `Packet` owns its `AVPacket` (`av_packet_ref`), so holding these across
+    /// calls is sound; the buffer is shared, not copied.
+    pending:   std::collections::VecDeque<Packet>,
 }
 
 // SAFETY: Decoder owns all pointers exclusively; not shared across threads.
@@ -74,6 +91,10 @@ impl Decoder {
     pub fn flush(&mut self) {
         unsafe { avcodec_flush_buffers(self.ctx); }
         self.draining = false;
+        // Any held packets belong to the position being seeked away from, so they
+        // must go — re-sending them after a flush would decode frames from before
+        // the seek and hand them back as if they were at the new position.
+        self.pending.clear();
     }
 
     /// Open a decoder for the given stream.
@@ -150,7 +171,14 @@ impl Decoder {
             return Err(DecodeError::Alloc);
         }
 
-        Ok(Decoder { ctx, frame, sw_frame, hw_type, draining: false })
+        Ok(Decoder {
+            ctx,
+            frame,
+            sw_frame,
+            hw_type,
+            draining: false,
+            pending: std::collections::VecDeque::new(),
+        })
     }
 
     /// Open a software-only decoder (no hardware acceleration).
@@ -202,7 +230,14 @@ impl Decoder {
             return Err(DecodeError::Alloc);
         }
 
-        Ok(Decoder { ctx, frame, sw_frame, hw_type: HwDeviceType::None, draining: false })
+        Ok(Decoder {
+            ctx,
+            frame,
+            sw_frame,
+            hw_type: HwDeviceType::None,
+            draining: false,
+            pending: std::collections::VecDeque::new(),
+        })
     }
 
     /// Decode one frame and write its pixel data into `dst` (a mapped staging buffer slice).
@@ -231,43 +266,78 @@ impl Decoder {
             &crate::interop::capability::InteropCapability,
         )>,
     ) -> Result<Option<DecodedFrame>, DecodeError> {
-        // Step 1 & 2 — Send packet and receive frame
-        let mut got_frame = false;
-        loop {
-            // Try sending the packet
-            let send_ret = unsafe { avcodec_send_packet(self.ctx, packet.as_ptr()) };
-            if send_ret < 0 && send_ret != AVERROR_EAGAIN {
-                return Err(DecodeError::Send(av_err_to_string(send_ret)));
+        // Feed the decoder, then take at most ONE frame back out.
+        //
+        // P2.3 — two coupled bugs lived here, and the second is only reachable
+        // once the first is fixed.
+        //
+        // 1. The old loop latched a `got_frame` flag and kept iterating. With
+        //    `avcodec_send_packet` returning EAGAIN (input queue full, which
+        //    frame-threading reaches within a few packets) it would receive a
+        //    frame, set the flag, iterate, re-send, and call
+        //    `avcodec_receive_frame` AGAIN. That second receive returns EAGAIN —
+        //    and receive **unrefs its destination frame before doing anything
+        //    else** — so the frame just obtained was wiped while the flag still
+        //    claimed it. `emit_frame` read `format` off an empty AVFrame, got
+        //    AV_PIX_FMT_NONE (-1), missed `frame_layout_for_pix_fmt`, and handed
+        //    -1 to `sws_getContext`, which aborts the process inside libswscale
+        //    (`Assertion desc failed at swscale_internal.h:778`,
+        //    STATUS_STACK_BUFFER_OVERRUN). Every codec can reach it; AV1 got there
+        //    first because libdav1d fills its input queue fastest.
+        // 2. Returning without keeping the refused packet DROPS it, because the
+        //    caller moves on to the next one. For AV1 that is a gap in the OBU
+        //    sequence and the next send fails with "Invalid data found when
+        //    processing input".
+        //
+        // Hence: drain the backlog first, offer the new packet, keep it if it is
+        // refused, and receive exactly once. Receive is the only call that touches
+        // `self.frame`, and `emit_frame` reads it immediately afterwards.
+        while let Some(front) = self.pending.pop_front() {
+            let ret = unsafe { avcodec_send_packet(self.ctx, front.as_ptr()) };
+            if ret == AVERROR_EAGAIN {
+                // Still no room. Put it back at the FRONT to preserve order, and
+                // do not offer the caller's packet yet — it goes behind this one.
+                self.pending.push_front(front);
+                self.pending.push_back(packet.clone_ref());
+                return self.receive_one(dst, interop);
             }
-
-            // Try receiving a frame
-            let recv_ret = unsafe { avcodec_receive_frame(self.ctx, self.frame) };
-            if recv_ret == 0 {
-                // Successfully got a frame!
-                got_frame = true;
-                // If send_ret was EAGAIN, it means the packet wasn't sent yet,
-                // but since we freed up space by receiving a frame, the NEXT loop iteration will send it.
-                if send_ret == 0 {
-                    break;
-                }
-            } else if recv_ret == AVERROR_EAGAIN || recv_ret == AVERROR_EOF {
-                if send_ret == 0 {
-                    // Packet sent, but no frame ready yet
-                    break;
-                } else {
-                    // Send was EAGAIN, Receive is EAGAIN (should never happen)
-                    break;
-                }
-            } else {
-                return Err(DecodeError::Receive(av_err_to_string(recv_ret)));
+            if ret < 0 {
+                return Err(DecodeError::Send(av_err_to_string(ret)));
             }
         }
 
-        if !got_frame {
+        let send_ret = unsafe { avcodec_send_packet(self.ctx, packet.as_ptr()) };
+        if send_ret == AVERROR_EAGAIN {
+            self.pending.push_back(packet.clone_ref());
+        } else if send_ret < 0 {
+            return Err(DecodeError::Send(av_err_to_string(send_ret)));
+        }
+
+        self.receive_one(dst, interop)
+    }
+
+    /// Take at most one frame out of the decoder and emit it.
+    ///
+    /// Split out of [`Self::decode_into`] so the receive happens exactly once per
+    /// call: the frame `avcodec_receive_frame` fills must be read by `emit_frame`
+    /// before anything can call receive again, because receive unrefs it first.
+    fn receive_one(
+        &mut self,
+        dst: &mut [u8],
+        interop: Option<(
+            &crate::interop::cuda_context::CudaContext,
+            &crate::interop::decode_interop::DecodeInteropTarget,
+            &crate::interop::capability::InteropCapability,
+        )>,
+    ) -> Result<Option<DecodedFrame>, DecodeError> {
+        let recv_ret = unsafe { avcodec_receive_frame(self.ctx, self.frame) };
+        if recv_ret == 0 {
+            return self.emit_frame(dst, interop);
+        }
+        if recv_ret == AVERROR_EAGAIN || recv_ret == AVERROR_EOF {
             return Ok(None);
         }
-
-        self.emit_frame(dst, interop)
+        Err(DecodeError::Receive(av_err_to_string(recv_ret)))
     }
 
     /// Signal end-of-stream and pull one buffered frame out of the decoder.
@@ -288,6 +358,31 @@ impl Decoder {
         &mut self,
         dst: &mut [u8],
     ) -> Result<Option<DecodedFrame>, DecodeError> {
+        // Any packets still held from an EAGAIN must go in BEFORE the EOS packet,
+        // or their frames are lost: `avcodec_send_packet(NULL)` closes the input,
+        // so a backlog offered afterwards is refused outright.
+        //
+        // P2.3 — measured: without this the AV1 fixture decodes 55 of 60 frames
+        // even with the backlog queue in place, because the queue still held
+        // packets when the demuxer hit EOF and `drain_into` sent EOS past them.
+        // The five missing frames are exactly the queue's depth at that moment.
+        //
+        // A loop rather than a single send because the decoder may still be full
+        // here; each `receive_one` takes one frame out and makes room, and the
+        // caller calls again until `Ok(None)`.
+        while let Some(front) = self.pending.pop_front() {
+            let ret = unsafe { avcodec_send_packet(self.ctx, front.as_ptr()) };
+            if ret == AVERROR_EAGAIN {
+                self.pending.push_front(front);
+                // Hand back the frame that frees the slot; the backlog is retried
+                // on the next call.
+                return self.receive_one(dst, None);
+            }
+            if ret < 0 && ret != AVERROR_EOF {
+                return Err(DecodeError::Send(av_err_to_string(ret)));
+            }
+        }
+
         if !self.draining {
             // NULL packet = "no more input".  Sending it twice is not an error but
             // there is no reason to, so the flag keeps it to once.
@@ -442,7 +537,30 @@ impl Decoder {
                 // Conversion needed.  Pick the target from the source's depth so
                 // high-bit-depth sources stay high-bit-depth.
                 None => {
+                    // P2.3 — refuse a format libavutil does not describe BEFORE
+                    // handing it to swscale.  `sws_getContext` does not validate
+                    // its arguments: it calls `av_pix_fmt_desc_get(fmt)` and
+                    // dereferences the result, so an unknown format trips
+                    // `Assertion desc failed at libswscale/swscale_internal.h:778`
+                    // and takes the process down with STATUS_STACK_BUFFER_OVERRUN
+                    // rather than returning NULL.  An unreadable input file has to
+                    // be an `Err` the caller can report, not a crash that loses
+                    // the user's session.
+                    if av_pix_fmt_is_known(fmt) == 0 {
+                        av_frame_unref(self.frame);
+                        av_frame_unref(self.sw_frame);
+                        return Err(DecodeError::Convert(format!(
+                            "the decoder emitted pixel format {fmt}, which this \
+                             build of libavutil does not describe — it cannot be \
+                             converted, and passing it to swscale would abort the \
+                             process"
+                        )));
+                    }
                     let src_depth = Self::pix_fmt_bit_depth(fmt);
+                    log::debug!(
+                        "[decoder] converting pix_fmt {fmt} ({src_depth}-bit, \
+                         {w}x{h}) — not a layout the upload path takes directly"
+                    );
                     let (dst_fmt, dst_layout) = if src_depth > 8 {
                         (AV_PIX_FMT_YUV420P10LE, FrameLayout::YUV420P10)
                     } else {
@@ -588,8 +706,12 @@ impl Decoder {
         demuxer:           &mut Demuxer,
         target_stream_pts: i64,
     ) -> Result<i64, DecodeError> {
-        // Step 1 — Flush the decoder's internal buffer
-        unsafe { avcodec_flush_buffers(self.ctx); }
+        // Step 1 — Flush the decoder's internal buffer.
+        //
+        // Via `self.flush()` rather than `avcodec_flush_buffers` directly, so the
+        // held EAGAIN packet and the draining flag are cleared too: a packet from
+        // before the seek must not be re-sent afterwards.
+        self.flush();
 
         // Step 2 — Discard loop: decode and throw away until target PTS
         loop {

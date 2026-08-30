@@ -45,6 +45,15 @@ impl Packet {
         self.inner as *const _
     }
 
+    /// A second owning handle to the same packet data.
+    ///
+    /// `av_packet_ref` shares the buffer rather than copying it, so this is cheap.
+    /// P2.3 — `Decoder` needs it to hold a packet libavcodec refused with EAGAIN
+    /// until it can be re-offered, without taking ownership away from the caller.
+    pub fn clone_ref(&self) -> Self {
+        Self::from_raw(self.inner)
+    }
+
     /// True when the container marked this packet a sync sample.
     pub fn is_keyframe(&self) -> bool {
         self.flags & crate::io::ffi::avutil::AV_PKT_FLAG_KEY != 0

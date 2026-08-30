@@ -151,6 +151,13 @@ extern "C" {
     /// Bit shift of component 0 inside its storage word: 6 for P010 (MSB-aligned
     /// 10-bit), 0 for LSB-aligned planar formats.
     pub fn av_pix_fmt_component_shift(fmt: std::ffi::c_int) -> std::ffi::c_int;
+    /// Whether libavutil has a descriptor for this pixel format.
+    ///
+    /// P2.3 — must be checked before handing a format to `sws_getContext`, which
+    /// does NOT validate its arguments: it dereferences
+    /// `av_pix_fmt_desc_get(fmt)` unconditionally, so an unknown format aborts the
+    /// process inside libswscale instead of returning NULL.
+    pub fn av_pix_fmt_is_known(fmt: std::ffi::c_int) -> std::ffi::c_int;
 
     pub fn av_frame_set_width(frame: *mut AVFrame, width: std::ffi::c_int);
     pub fn av_frame_set_height(frame: *mut AVFrame, height: std::ffi::c_int);
