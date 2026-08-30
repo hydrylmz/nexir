@@ -26,14 +26,28 @@ pub struct Packet {
     pub stream_index: i32,
     /// PTS in stream timebase ticks. `AV_NOPTS_VALUE` if unknown.
     pub pts:          i64,
+    /// DTS in stream timebase ticks. `AV_NOPTS_VALUE` if unknown.
+    ///
+    /// Read off the container rather than derived: for a reordering encoder this
+    /// is NOT `pts`, and it is the field the muxer's index is built on, so it is
+    /// the only thing that can confirm the DTS a file actually carries is
+    /// monotonic (see `DtsQueue` in `src/interop/encode_interop.rs`).
+    pub dts:          i64,
     /// Duration in stream timebase ticks.
     pub duration:     i64,
+    /// `AV_PKT_FLAG_*` bits; bit 0 is `AV_PKT_FLAG_KEY`.
+    pub flags:        i32,
 }
 
 impl Packet {
     /// Raw const pointer for passing to the decoder.
     pub fn as_ptr(&self) -> *const AVPacket {
         self.inner as *const _
+    }
+
+    /// True when the container marked this packet a sync sample.
+    pub fn is_keyframe(&self) -> bool {
+        self.flags & crate::io::ffi::avutil::AV_PKT_FLAG_KEY != 0
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -48,7 +62,9 @@ impl Packet {
                 inner,
                 stream_index: (*inner).stream_index,
                 pts: (*inner).pts,
+                dts: (*inner).dts,
                 duration: (*inner).duration,
+                flags: (*inner).flags,
             }
         }
     }
@@ -181,7 +197,9 @@ impl Demuxer {
             // Since AVPacket is opaque we call the accessor.
             let pkt_stream_idx = unsafe { av_packet_stream_index(self.packet_buf) };
             let pkt_pts         = unsafe { av_packet_pts(self.packet_buf) };
+            let pkt_dts         = unsafe { av_packet_dts(self.packet_buf) };
             let pkt_duration    = unsafe { av_packet_duration(self.packet_buf) };
+            let pkt_flags       = unsafe { av_packet_flags(self.packet_buf) };
 
             if pkt_stream_idx != video_idx {
                 // Not our stream — unref and continue
@@ -206,7 +224,9 @@ impl Demuxer {
                 inner:        owned_pkt,
                 stream_index: pkt_stream_idx,
                 pts:          pkt_pts,
+                dts:          pkt_dts,
                 duration:     pkt_duration,
+                flags:        pkt_flags,
             }));
         }
     }
@@ -249,7 +269,9 @@ impl Demuxer {
                     inner:        owned_pkt,
                     stream_index: unsafe { (*owned_pkt).stream_index },
                     pts:          unsafe { (*owned_pkt).pts },
+                    dts:          unsafe { (*owned_pkt).dts },
                     duration:     unsafe { (*owned_pkt).duration },
+                    flags:        unsafe { (*owned_pkt).flags },
                 }));
             } else {
                 unsafe { av_packet_unref(self.packet_buf); }
@@ -385,5 +407,7 @@ unsafe extern "C" {
 extern "C" {
     fn av_packet_stream_index(pkt: *const AVPacket) -> i32;
     fn av_packet_pts(pkt: *const AVPacket) -> i64;
+    fn av_packet_dts(pkt: *const AVPacket) -> i64;
     fn av_packet_duration(pkt: *const AVPacket) -> i64;
+    fn av_packet_flags(pkt: *const AVPacket) -> i32;
 }

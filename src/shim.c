@@ -70,6 +70,11 @@ int avcodecpar_get_bit_depth(AVCodecParameters* par) {
 int av_packet_stream_index(AVPacket* pkt) { return pkt->stream_index; }
 int64_t av_packet_pts(AVPacket* pkt) { return pkt->pts; }
 int64_t av_packet_duration(AVPacket* pkt) { return pkt->duration; }
+/* Decode timestamp.  Distinct from `pts` for any reordering encoder, and the
+ * value mp4/matroska index on — so P1.5's monotonicity assertion has to read
+ * this rather than inferring it from the presentation timestamp. */
+int64_t av_packet_dts(AVPacket* pkt) { return pkt->dts; }
+int av_packet_flags(AVPacket* pkt) { return pkt->flags; }
 
 int av_frame_get_width(AVFrame* f) { return f->width; }
 int av_frame_get_height(AVFrame* f) { return f->height; }
