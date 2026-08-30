@@ -9,7 +9,11 @@ use crate::timeline::{
 use std::path::PathBuf;
 
 /// Project-level settings (resolution, framerate, timebase).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// `PartialEq` so callers can detect a change: the UI's settings widgets mutate
+/// this in place, and the only way to notice afterwards is to compare against the
+/// previous value (see `HistoryState::record_settings_change` in the ui crate).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectSettings {
     pub width: u32,
     pub height: u32,

@@ -445,6 +445,22 @@ impl NexirApp {
                 self.project.settings.height,
             );
         }
+        // P2.7 — a settings change is an undoable edit.
+        //
+        // The top bar's combo boxes mutate `project.settings` in place during
+        // `draw`, so there is no point at which a caller can `record()` first;
+        // the change is detected afterwards by comparing against the value from
+        // before the panel ran.  Without this the change was never recorded, and
+        // the user's next Ctrl+Z reverted an EARLIER clip edit while leaving the
+        // new frame rate in place — which reads as undo corrupting the timeline.
+        if prev_settings.width != self.project.settings.width
+            || prev_settings.height != self.project.settings.height
+            || prev_settings.frame_rate != self.project.settings.frame_rate
+            || prev_settings.timebase != self.project.settings.timebase
+        {
+            self.history
+                .record_settings_change(&self.project, prev_settings.clone());
+        }
         if let Some(action) = top_bar_action {
             match action {
                 crate::layout::top_bar::TopBarAction::Undo => {
@@ -1548,16 +1564,16 @@ impl NexirApp {
         // 10-bit, so a mis-set panel can never produce a file tagged HDR over SDR
         // pixels.  The panel already hides the toggle for those codecs; this is the
         // backstop.
-        if let Some(hdr) = self.export_settings.hdr10() {
-            if let Err(e) = job.set_hdr10(hdr) {
-                log::error!(
-                    "[export] HDR10 was requested but cannot be used for this job \
-                     ({e:?}) — exporting SDR instead"
-                );
-                self.export_status = Some(
-                    "HDR10 is not supported for this codec — exported as SDR".to_string(),
-                );
-            }
+        if let Some(hdr) = self.export_settings.hdr10()
+            && let Err(e) = job.set_hdr10(hdr)
+        {
+            log::error!(
+                "[export] HDR10 was requested but cannot be used for this job \
+                 ({e:?}) — exporting SDR instead"
+            );
+            self.export_status = Some(
+                "HDR10 is not supported for this codec — exported as SDR".to_string(),
+            );
         }
 
         // NOTE (Encode Interop): Prepare CudaContext if hardware interop is available and not forced to CPU.
