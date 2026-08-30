@@ -190,7 +190,14 @@ impl LutNode {
         }
     }
 
-    /// Set image dimensions (must be called before the node is used in a graph).
+    /// Set image dimensions.
+    ///
+    /// **Mandatory before the node enters a graph.** `new` cannot infer the frame
+    /// size (it only sees the LUT cube), so it leaves these at zero, and
+    /// [`RenderNode::declare_resources`] would then ask wgpu for a zero-sized
+    /// texture — which fails as `Dimension X is zero` from inside
+    /// `Device::create_texture`, naming neither this node nor this method. The
+    /// assertion in `declare_resources` exists to name it.
     pub fn set_size(&mut self, width: u32, height: u32) {
         self.params.width  = width;
         self.params.height = height;
@@ -202,6 +209,13 @@ impl RenderNode for LutNode {
 
     fn declare_resources(&self, builder: &mut ResourceBuilder) {
         use crate::render::resource::{ResourceDescriptor, ResolutionSource, TextureAccess};
+        assert!(
+            self.params.width > 0 && self.params.height > 0,
+            "LutNode::set_size was never called: this node's output would be a \
+             {}x{} texture. `new` cannot know the frame size, so the caller must \
+             set it before adding the node to a graph.",
+            self.params.width, self.params.height
+        );
         builder.creates.push((self.out_rgba, ResourceDescriptor {
             label: Some(format!("Lut3D_{}", self.out_rgba.0)),
             size: ResolutionSource::Fixed(self.params.width, self.params.height),

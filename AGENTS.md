@@ -102,6 +102,10 @@ Hardcoded dark theme in `NexirApp::new()`. No theme switching. Window size: 1280
 
 8. **`Abgr10RepackNode` is off the export path.** It survives only as the tree's one 10-bit packing (a future P010/HDR reuse) with its own passing test. If it stops earning that, delete it *and* `src/tests/abgr10_repack.rs` together rather than leaving a second unexercised encode path.
 
+9. **`src/bin/bench.rs` may only print what it measured.** It previously reported `gpu_utilization: 88.5`, `nvenc_utilization: 94.0` and `ram_used_bytes: 420 MB` as hardcoded literals, and its "Zero-Copy NVENC" path was a `std::thread::yield_now()` — so the NVENC column timed a thread yield next to a fabricated utilisation figure. Now: every `SystemMetrics` field is `Option`, unmeasured ones print `n/a` (pinned by `profiling::tests::unmeasured_system_metrics_print_as_not_available`), and the NVENC path opens a real `EncodeInterop` session and reports its packet count and bitstream size. **Missing hardware must stay a printed skip, never a zero row** — filling a metric from arithmetic instead of a driver query (NVML, `cuMemGetInfo`) is the regression. `allocated_gpu_bytes` is the one exception and is labelled a lower bound, because it counts only what the bench itself allocated, not the graph's texture pool. The bench needs `cuda.dll` beside the binary (`cp target/debug/*.dll target/release/`) or interop probes as `transport=None` and three of five benchmarks skip.
+
+10. **`LutNode::set_size` is mandatory and `new` cannot do it for you.** `LutNode::new` only sees the LUT cube, so it leaves `params.width/height` at zero; `declare_resources` then asks wgpu for a zero-sized texture and the failure is `Dimension X is zero` from inside `Device::create_texture`, naming neither the node nor the missing call. There is now an assertion in `declare_resources` that names both. `EffectChainBuilder` constructs its own params with the canvas size and is unaffected — the bench was the only direct caller, which is why this stayed latent.
+
 ## Style Notes
 
 - `.gitignore` lists `Cargo.lock` but the file is committed — don't "fix" this

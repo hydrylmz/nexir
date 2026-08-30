@@ -8,6 +8,12 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PipelineStage {
     Decode,
+    /// Handing already-decoded pixel data to the GPU (`queue.write_texture`).
+    ///
+    /// Distinct from [`Self::Decode`] on purpose: a caller that feeds the graph
+    /// pre-made sample data is measuring an upload, and recording that under
+    /// `Decode` would report a decode cost for work no decoder did.
+    Upload,
     Scheduler,
     YuvToRgb,
     Effects,
@@ -24,6 +30,7 @@ impl PipelineStage {
     pub fn all() -> &'static [PipelineStage] {
         &[
             PipelineStage::Decode,
+            PipelineStage::Upload,
             PipelineStage::Scheduler,
             PipelineStage::YuvToRgb,
             PipelineStage::Effects,
@@ -40,6 +47,7 @@ impl PipelineStage {
     pub fn display_name(&self) -> &'static str {
         match self {
             PipelineStage::Decode => "Decode",
+            PipelineStage::Upload => "Upload",
             PipelineStage::Scheduler => "Scheduler",
             PipelineStage::YuvToRgb => "YUV → RGB",
             PipelineStage::Effects => "Effects",
@@ -141,29 +149,109 @@ pub struct StageStats {
     pub percentage_of_total: f64,
 }
 
-/// System and resource utilization metrics.
+/// Resource counters that accompany a [`ProfileReport`].
+///
+/// Every field is an `Option` and every one of them is `None` until something
+/// **measures** it. That is deliberate, and it is the whole design of this
+/// struct: it used to be a bag of `f32`/`u64` that a caller filled with plausible
+/// constants (`gpu_utilization: 88.5`, `ram_used_bytes: 420 MB`), which the
+/// report then printed indistinguishably from a real reading. A number that was
+/// never measured is not a small inaccuracy in a benchmark — it is the benchmark
+/// reporting a result it does not have.
+///
+/// So: fill a field only from a real measurement, leave the rest `None`, and
+/// [`ProfileReport::format_table`] prints `n/a` for them. Adding a driver query
+/// (NVML for GPU/NVENC utilisation, `cuMemGetInfo` for VRAM, an OS call for RAM)
+/// means setting the corresponding field; nothing else has to change.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemMetrics {
-    /// GPU core utilization percentage (0.0 .. 100.0)
-    pub gpu_utilization: f32,
-    /// CPU core utilization percentage (0.0 .. 100.0)
-    pub cpu_utilization: f32,
-    /// NVENC encoder hardware utilization percentage (0.0 .. 100.0)
-    pub nvenc_utilization: f32,
-    /// VRAM memory in use (bytes)
-    pub vram_used_bytes: u64,
-    /// System RAM memory in use (bytes)
-    pub ram_used_bytes: u64,
-    /// GPU memory upload transfer bytes (CPU -> GPU)
-    pub gpu_upload_bytes: u64,
-    /// GPU memory download transfer bytes (GPU -> CPU)
-    pub gpu_download_bytes: u64,
-    /// Frame queue depth
-    pub frame_queue_depth: usize,
-    /// Decode queue depth
-    pub decode_queue_depth: usize,
-    /// Encode queue depth
-    pub encode_queue_depth: usize,
+    /// GPU core utilization percentage (0.0 .. 100.0).
+    ///
+    /// Requires a driver query (NVML `nvmlDeviceGetUtilizationRates`); wgpu
+    /// exposes nothing equivalent, so this stays `None` in-process.
+    pub gpu_utilization: Option<f32>,
+    /// CPU core utilization percentage (0.0 .. 100.0). Needs an OS-specific
+    /// query (`GetSystemTimes` / `/proc/stat`).
+    pub cpu_utilization: Option<f32>,
+    /// NVENC encoder hardware utilization percentage (0.0 .. 100.0). NVML's
+    /// `nvmlDeviceGetEncoderUtilization`.
+    pub nvenc_utilization: Option<f32>,
+    /// VRAM in use, as reported by the driver (`cuMemGetInfo`) — NOT a sum of
+    /// what the caller believes it allocated. For that, see
+    /// [`Self::allocated_gpu_bytes`].
+    pub vram_used_bytes: Option<u64>,
+    /// Bytes of GPU memory the caller itself allocated, computed from its own
+    /// texture and buffer sizes.
+    ///
+    /// Honest but narrow: it counts what the caller asked for and knows nothing
+    /// about the render graph's internal pool, alignment padding, or driver
+    /// overhead, so it is a lower bound on real VRAM use rather than a
+    /// measurement of it.
+    pub allocated_gpu_bytes: Option<u64>,
+    /// Process resident set size in bytes, from an OS query.
+    pub ram_used_bytes: Option<u64>,
+    /// Bytes uploaded CPU → GPU, counted by the caller as it uploads.
+    pub gpu_upload_bytes: Option<u64>,
+    /// Bytes read back GPU → CPU, counted by the caller as it reads back.
+    pub gpu_download_bytes: Option<u64>,
+    /// Frame queue depth, from the queue itself.
+    pub frame_queue_depth: Option<usize>,
+    /// Decode queue depth, from the queue itself.
+    pub decode_queue_depth: Option<usize>,
+    /// Encode queue depth, from the queue itself.
+    pub encode_queue_depth: Option<usize>,
+}
+
+impl SystemMetrics {
+    /// The `System Metrics` block of a report table.
+    ///
+    /// Unmeasured fields print `n/a` rather than a zero: `0.0%` GPU utilisation
+    /// and "not measured" are different claims, and a reader has no way to tell
+    /// them apart once both are printed as a number.
+    pub fn format_block(&self) -> String {
+        fn pct(v: Option<f32>) -> String {
+            v.map(|x| format!("{x:>5.1}%")).unwrap_or_else(|| format!("{:>6}", "n/a"))
+        }
+        fn mb(v: Option<u64>) -> String {
+            v.map(|b| format!("{:>7.1} MB", b as f64 / (1024.0 * 1024.0)))
+                .unwrap_or_else(|| format!("{:>10}", "n/a"))
+        }
+        fn depth(v: Option<usize>) -> String {
+            v.map(|d| d.to_string()).unwrap_or_else(|| "n/a".into())
+        }
+
+        let mut out = String::from("System Metrics (n/a = not measured, never estimated):\n");
+        out.push_str(&format!(
+            "  GPU Util:   {}  |  NVENC Util: {}  |  CPU Util:   {}\n",
+            pct(self.gpu_utilization),
+            pct(self.nvenc_utilization),
+            pct(self.cpu_utilization),
+        ));
+        out.push_str(&format!(
+            "  VRAM (driver): {} |  RAM (RSS): {}\n",
+            mb(self.vram_used_bytes),
+            mb(self.ram_used_bytes),
+        ));
+        if let Some(allocated) = self.allocated_gpu_bytes {
+            out.push_str(&format!(
+                "  GPU bytes this run allocated itself: {} (lower bound; excludes \
+                 the graph's texture pool)\n",
+                mb(Some(allocated)),
+            ));
+        }
+        out.push_str(&format!(
+            "  Transfers: up {} | down {}\n",
+            mb(self.gpu_upload_bytes),
+            mb(self.gpu_download_bytes),
+        ));
+        out.push_str(&format!(
+            "  Queue Depths: Frame={}, Decode={}, Encode={}\n",
+            depth(self.frame_queue_depth),
+            depth(self.decode_queue_depth),
+            depth(self.encode_queue_depth),
+        ));
+        out
+    }
 }
 
 /// Summary report over a sequence of profiled frames.
@@ -225,17 +313,7 @@ impl ProfileReport {
             100.0
         ));
         out.push_str("------------------------------------------------------------------------\n");
-        out.push_str(&format!(
-            "System Metrics:\n  GPU Util:   {:>5.1}%  |  NVENC Util: {:>5.1}%  |  CPU Util:   {:>5.1}%\n  VRAM Usage: {:>5.1} MB |  RAM Usage:  {:>5.1} MB\n  Queue Depths: Frame={}, Decode={}, Encode={}\n",
-            self.system_metrics.gpu_utilization,
-            self.system_metrics.nvenc_utilization,
-            self.system_metrics.cpu_utilization,
-            self.system_metrics.vram_used_bytes as f64 / (1024.0 * 1024.0),
-            self.system_metrics.ram_used_bytes as f64 / (1024.0 * 1024.0),
-            self.system_metrics.frame_queue_depth,
-            self.system_metrics.decode_queue_depth,
-            self.system_metrics.encode_queue_depth
-        ));
+        out.push_str(&self.system_metrics.format_block());
         out.push_str("========================================================================\n");
         out
     }
@@ -421,6 +499,46 @@ mod tests {
         assert!(table.contains("Decode"));
         assert!(table.contains("Composite"));
         assert!(table.contains("NVENC"));
+    }
+
+    #[test]
+    fn unmeasured_system_metrics_print_as_not_available() {
+        // The regression this pins: `SystemMetrics` used to be plain numbers, a
+        // caller filled them with plausible constants, and the table printed
+        // those as if they had been read from the driver.
+        let metrics = SystemMetrics::default();
+        let block = metrics.format_block();
+        assert!(
+            block.contains("n/a"),
+            "an all-unmeasured SystemMetrics must print n/a, got:\n{block}"
+        );
+        for forbidden in ["0.0%", "0.0 MB"] {
+            assert!(
+                !block.contains(forbidden),
+                "unmeasured metrics must not print {forbidden} — a zero reading and \
+                 no reading are different claims:\n{block}"
+            );
+        }
+        assert!(
+            !block.contains("Frame=0"),
+            "an unmeasured queue depth must not print as 0:\n{block}"
+        );
+    }
+
+    #[test]
+    fn measured_system_metrics_are_printed() {
+        let metrics = SystemMetrics {
+            gpu_utilization: Some(42.5),
+            gpu_upload_bytes: Some(8 * 1024 * 1024),
+            frame_queue_depth: Some(3),
+            ..Default::default()
+        };
+        let block = metrics.format_block();
+        assert!(block.contains("42.5%"), "measured GPU util missing:\n{block}");
+        assert!(block.contains("8.0 MB"), "measured upload bytes missing:\n{block}");
+        assert!(block.contains("Frame=3"), "measured queue depth missing:\n{block}");
+        // The ones still unmeasured stay honest in the same block.
+        assert!(block.contains("n/a"), "unset fields must still say n/a:\n{block}");
     }
 
     #[test]
