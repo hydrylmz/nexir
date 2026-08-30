@@ -9,8 +9,12 @@ mod app;
 mod audio_mixer;
 mod autosave;
 mod history;
+#[cfg(test)]
+mod history_tests;
 mod image_still;
 pub mod layout;
+#[cfg(test)]
+mod media_pool_tests;
 mod waveform;
 
 struct SimpleFileLogger {

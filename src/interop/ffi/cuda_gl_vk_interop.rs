@@ -63,11 +63,13 @@ pub struct CudaArray3DDescriptor {
 /// Measured against `nv-codec-headers` `n12.2.72.0`'s `dynlink_cuda.h` with
 /// `offsetof` (probe: `nvchk/extbuf_probe.c layout`):
 ///
+/// ```text
 ///     size 88
 ///     offset    0
 ///     size      8
 ///     flags    16
 ///     reserved 20
+/// ```
 #[repr(C)]
 pub struct CudaExternalMemoryBufferDesc {
     /// Byte offset into the imported allocation where the mapping starts.
