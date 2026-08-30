@@ -473,8 +473,22 @@ const NV_ENC_CODEC_H264_GUID: [u8; 16] = [
     0xAA, 0x85, 0x1E, 0x50, 0xF3, 0x21, 0xF6, 0xBF,
 ];
 // HEVC GUID: {790CDC88-4522-4d7b-9425-BDA9975F7603}
+//
+// The first four bytes are `Data1` in LITTLE-ENDIAN order, so 0x790CDC88 is
+// `88 DC 0C 79`.  This constant read `88 CD 0C 79` until P1.2 — one transposed
+// nibble, and the only symptom was `nvEncInitializeEncoder` returning
+// NV_ENC_ERR_UNSUPPORTED_PARAM (12) for every H.265 job at every resolution,
+// which reads exactly like "this GPU cannot do HEVC" and silently routed every
+// H.265 export to the FFmpeg encoder.
+//
+// Both GUIDs are checked by `nvchk/nv12_probe.c --codec h264|hevc`, which diffs
+// these exact bytes against the vendor header's own `static const GUID` and then
+// initialises a session with THESE bytes rather than the header's — so a typo
+// here reproduces the driver failure in the probe instead of being masked by it.
+// Verified 2026-08-30: match, NV_ENC_SUCCESS, and the decoded bars exact; with
+// one nibble flipped back, UNSUPPORTED_PARAM (12).  See `nvchk/README.md`.
 const NV_ENC_CODEC_HEVC_GUID: [u8; 16] = [
-    0x88, 0xCD, 0x0C, 0x79, 0x22, 0x45, 0x7B, 0x4d,
+    0x88, 0xDC, 0x0C, 0x79, 0x22, 0x45, 0x7B, 0x4d,
     0x94, 0x25, 0xBD, 0xA9, 0x97, 0x5F, 0x76, 0x03,
 ];
 // Preset GUIDs live in `crate::interop::ffi::nvenc` (NV_ENC_PRESET_P1/P4/P7_GUID),

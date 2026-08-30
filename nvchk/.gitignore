@@ -9,5 +9,6 @@ ffnvcodec/
 .hdrwork/
 *.exe
 *.h264
+*.hevc
 *.raw
 *.txt

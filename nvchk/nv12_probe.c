@@ -22,8 +22,22 @@
 // a rung that merely returns NV_ENC_SUCCESS proves nothing, because NVENC will
 // happily encode garbage.
 //
+// SECOND QUESTION, added for P1.2: is the CODEC GUID in
+// `src/interop/encode_interop.rs` byte-for-byte what the vendor header declares?
+//
+// `--codec hevc` initialises an HEVC session instead of H.264 and, either way,
+// dumps the selected GUID's RAW MEMORY BYTES next to the byte array the Rust
+// side hard-codes.  That comparison is the whole point: a GUID's first four
+// bytes are `Data1` in little-endian order, so {790CDC88-...} is `88 dc 0c 79`,
+// and the Rust constant read `88 cd 0c 79` — one transposed nibble.  The only
+// symptom was nvEncInitializeEncoder returning NV_ENC_ERR_UNSUPPORTED_PARAM (12)
+// for every HEVC job at every resolution, which is indistinguishable from "this
+// GPU has no HEVC encoder" and silently routed every H.265 export to the FFmpeg
+// path.  A wrong GUID cannot be caught by any struct-layout probe, and the driver
+// never names the field it rejected — hence this.
+//
 // Build: gcc -O1 -o nv12_probe.exe nv12_probe.c
-// Run:   ./nv12_probe.exe
+// Run:   ./nv12_probe.exe [--codec h264|hevc]
 
 #include <stdio.h>
 #include <stdint.h>
@@ -143,10 +157,60 @@ static const char *nv_name(NVENCSTATUS s) {
     }
 }
 
-static const GUID CODEC_H264 = { 0x6bc82762, 0x4e63, 0x4ca4,
-    { 0xaa, 0x85, 0x1e, 0x50, 0xf3, 0x21, 0xf6, 0xbf } };
+// Codec GUIDs are taken from the VENDOR HEADER's own `static const GUID`
+// definitions rather than transcribed here.  That is deliberate: a hand-copied
+// GUID in the probe could carry the same typo as the one in the Rust FFI and the
+// two would agree while both being wrong, which is exactly the failure mode this
+// is meant to detect.  `NV_ENC_CODEC_H264_GUID` / `NV_ENC_CODEC_HEVC_GUID` come
+// straight from ffnvcodec/nvEncodeAPI_n12.2.72.0.h:144-149.
 static const GUID PRESET_P4  = { 0x90a7b826, 0xdf06, 0x4862,
     { 0xb9, 0xd2, 0xcd, 0x6d, 0x73, 0xa0, 0x86, 0x81 } };
+
+// What `src/interop/encode_interop.rs` hard-codes, byte for byte, so this probe
+// fails loudly if the two ever diverge again.  Keep in sync with the two
+// `NV_ENC_CODEC_*_GUID` arrays there.
+static const uint8_t RUST_H264_GUID[16] = {
+    0x62, 0x27, 0xC8, 0x6B, 0x63, 0x4E, 0xa4, 0x4c,
+    0xAA, 0x85, 0x1E, 0x50, 0xF3, 0x21, 0xF6, 0xBF,
+};
+static const uint8_t RUST_HEVC_GUID[16] = {
+    0x88, 0xDC, 0x0C, 0x79, 0x22, 0x45, 0x7B, 0x4d,
+    0x94, 0x25, 0xBD, 0xA9, 0x97, 0x5F, 0x76, 0x03,
+};
+
+/// Print a GUID's raw memory bytes beside what the Rust side declares, and
+/// return 1 when they match.
+///
+/// The comparison is on RAW BYTES, not on the `{Data1-Data2-...}` text form:
+/// `Data1` is a `unsigned long` and therefore little-endian in memory, so
+/// {790CDC88-...} is `88 dc 0c 79` and a byte array that "looks like" the
+/// printed GUID is wrong.  That is the mistake this catches.
+static int compare_guid(const char *label, const GUID *header_guid,
+                        const uint8_t *rust_bytes) {
+    const uint8_t *hb = (const uint8_t *)header_guid;
+    int same = memcmp(hb, rust_bytes, 16) == 0;
+
+    printf("%s GUID:\n", label);
+    printf("   vendor header bytes :");
+    for (int i = 0; i < 16; i++) printf(" %02x", hb[i]);
+    printf("\n   Rust FFI bytes      :");
+    for (int i = 0; i < 16; i++) printf(" %02x", rust_bytes[i]);
+    printf("\n   -> %s\n", same ? "MATCH" : "*** MISMATCH ***");
+
+    if (!same) {
+        printf("   first differing byte:");
+        for (int i = 0; i < 16; i++) {
+            if (hb[i] != rust_bytes[i]) {
+                printf(" index %d, header 0x%02x vs Rust 0x%02x\n", i, hb[i], rust_bytes[i]);
+                break;
+            }
+        }
+        printf("   A wrong codec GUID makes nvEncInitializeEncoder return\n"
+               "   NV_ENC_ERR_UNSUPPORTED_PARAM (12) with no indication of which\n"
+               "   field was rejected — it looks like missing hardware support.\n");
+    }
+    return same;
+}
 
 // ---------------------------------------------------------------------------
 // The test pattern, in NV12, BT.709 limited range, computed here so the
@@ -304,13 +368,39 @@ static int run_rung(NV_ENCODE_API_FUNCTION_LIST *fl,
     return ok;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     // Unbuffered: a crash mid-probe must not swallow the lines that say how far
     // it got, which is the only diagnostic a driver access violation leaves.
     setvbuf(stdout, NULL, _IONBF, 0);
-    printf("nv12_probe: NVENC NV12 zero-copy input shape, %dx%d\n", PROBE_W, PROBE_H);
+
+    // ---- which codec ----
+    int want_hevc = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
+            i++;
+            if      (strcmp(argv[i], "hevc") == 0 || strcmp(argv[i], "h265") == 0) want_hevc = 1;
+            else if (strcmp(argv[i], "h264") == 0)                                 want_hevc = 0;
+            else { printf("unknown --codec '%s' (want h264 or hevc)\n", argv[i]); return 2; }
+        } else {
+            printf("usage: %s [--codec h264|hevc]\n", argv[0]);
+            return 2;
+        }
+    }
+    const char *codec_label = want_hevc ? "HEVC" : "H264";
+    const GUID *codec_guid  = want_hevc ? &NV_ENC_CODEC_HEVC_GUID : &NV_ENC_CODEC_H264_GUID;
+    const uint8_t *rust_guid = want_hevc ? RUST_HEVC_GUID : RUST_H264_GUID;
+    const char *ext = want_hevc ? "hevc" : "h264";
+
+    printf("nv12_probe: NVENC NV12 zero-copy input shape, %dx%d, codec %s\n",
+           PROBE_W, PROBE_H, codec_label);
     printf("compiled against header API %u.%u\n\n",
            NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION);
+
+    // ---- the GUID question, answered before any driver call ----
+    // Deliberately first: it needs no CUDA context and no session, so it still
+    // reports even on a machine where everything below is unavailable.
+    int guid_ok = compare_guid(codec_label, codec_guid, rust_guid);
+    printf("\n");
 
     // ---- CUDA ----
     HMODULE cu = LoadLibraryA("nvcuda.dll");
@@ -369,7 +459,17 @@ int main(void) {
     NV_ENC_INITIALIZE_PARAMS init;
     memset(&init, 0, sizeof(init));
     init.version         = NV_ENC_INITIALIZE_PARAMS_VER;
-    init.encodeGUID      = CODEC_H264;
+    // Initialise with the RUST FFI's bytes, not the header's.
+    //
+    // This is the load-bearing choice in the probe.  Using the header GUID here
+    // would make the session succeed even when the Rust constant is wrong — the
+    // byte diff above would report the mismatch, but the driver half of the check
+    // would pass regardless and prove nothing about the shipping code.  Feeding
+    // the driver exactly what `EncodeInterop::open` feeds it means a typo in
+    // `src/interop/encode_interop.rs` REPRODUCES the real failure here:
+    // NV_ENC_ERR_UNSUPPORTED_PARAM (12).  Verified by flipping one nibble of
+    // RUST_HEVC_GUID and re-running.
+    memcpy(&init.encodeGUID, rust_guid, 16);
     init.presetGUID      = PRESET_P4;
     init.encodeWidth     = PROBE_W;
     init.encodeHeight    = PROBE_H;
@@ -383,8 +483,28 @@ int main(void) {
     init.maxEncodeHeight = PROBE_H;
     init.tuningInfo      = NV_ENC_TUNING_INFO_HIGH_QUALITY;
     st = fl.nvEncInitializeEncoder(session, &init);
-    printf("nvEncInitializeEncoder    -> %s (%d)\n", nv_name(st), st);
-    if (st != NV_ENC_SUCCESS) return 1;
+    printf("nvEncInitializeEncoder(%s, Rust GUID bytes) -> %s (%d)\n",
+           codec_label, nv_name(st), st);
+    if (st != NV_ENC_SUCCESS) {
+        // The GUID is the field this probe exists to rule out, so say so rather
+        // than leaving the reader to conclude the GPU lacks the codec.
+        if (st == NV_ENC_ERR_UNSUPPORTED_PARAM) {
+            printf("   NV_ENC_ERR_UNSUPPORTED_PARAM names no field.  The GUID\n"
+                   "   comparison above %s, so %s.\n",
+                   guid_ok ? "MATCHED" : "FAILED",
+                   guid_ok ? "look elsewhere (preset, tuningInfo, or the GPU "
+                             "genuinely lacks this codec)"
+                           : "that mismatch IS the cause — this is the exact "
+                             "failure the shipping code hit");
+        }
+        return 1;
+    }
+
+    // The positive half of the GUID check, and it is only meaningful because the
+    // bytes above came from the Rust constant: the driver accepts what our FFI
+    // sends as a codec it actually implements.
+    printf("   session initialised for %s — the driver accepts the Rust FFI's\n"
+           "   codec GUID bytes as a codec it implements\n", codec_label);
 
     // ---- the pattern ----
     size_t nv12_size = (size_t)PROBE_W * PROBE_H * 3 / 2;
@@ -393,6 +513,13 @@ int main(void) {
     build_nv12(host, PROBE_W, PROBE_H);
 
     int a_ok = 0, b_ok = 0, b0_ok = 0;
+
+    // Bitstream filenames carry the codec so an HEVC run cannot silently
+    // overwrite an H.264 one and be decoded with the wrong -f later.
+    char path_a[64], path_b[64], path_b0[64];
+    snprintf(path_a,  sizeof(path_a),  "rung_a.%s",  ext);
+    snprintf(path_b,  sizeof(path_b),  "rung_b.%s",  ext);
+    snprintf(path_b0, sizeof(path_b0), "rung_b0.%s", ext);
 
     // ---- rung A: linear device buffer, CUDADEVICEPTR ----
     CUdeviceptr_t dptr = 0;
@@ -405,7 +532,7 @@ int main(void) {
         if (cr == 0) {
             a_ok = run_rung(&fl, session, "A (linear buffer, CUDADEVICEPTR, pitch=W)",
                             NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
-                            (void *)(uintptr_t)dptr, PROBE_W, "rung_a.h264");
+                            (void *)(uintptr_t)dptr, PROBE_W, path_a);
         }
     }
 
@@ -438,14 +565,16 @@ int main(void) {
         if (cr == 0) {
             b_ok = run_rung(&fl, session, "B (CUarray Wx1.5H, CUDAARRAY, pitch=W)",
                             NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
-                            arr, PROBE_W, "rung_b.h264");
+                            arr, PROBE_W, path_b);
             b0_ok = run_rung(&fl, session, "B0 (same array, CUDAARRAY, pitch=0 as today)",
                              NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
-                             arr, 0, "rung_b0.h264");
+                             arr, 0, path_b0);
         }
     }
 
     printf("\n---- summary ----\n");
+    printf("codec %s GUID vs Rust FFI                          : %s\n",
+           codec_label, guid_ok ? "MATCH" : "*** MISMATCH ***");
     printf("rung A  (linear buffer / CUDADEVICEPTR / pitch=W) : %s\n", a_ok ? "bitstream written" : "NO OUTPUT");
     printf("rung B  (CUarray Wx1.5H / CUDAARRAY / pitch=W)    : %s\n", b_ok ? "bitstream written" : "NO OUTPUT");
     printf("rung B0 (CUarray Wx1.5H / CUDAARRAY / pitch=0)    : %s\n", b0_ok ? "bitstream written" : "NO OUTPUT");
