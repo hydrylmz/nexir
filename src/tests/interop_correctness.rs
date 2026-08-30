@@ -217,7 +217,7 @@ mod interop_correctness {
         let cpu_out  = tmp.join("nexir_test_export_cpu.mp4");
         let cuda_out = tmp.join("nexir_test_export_cuda.mp4");
 
-        // Step 2 — CPU path (forced FfmpegCpu backend).
+        // Step 2 — CPU path (forced FfmpegEncoder backend).
         let cpu_start = std::time::Instant::now();
         run_export_with_backend(
             &test_file, &cpu_out, &capability, &device,
@@ -276,7 +276,7 @@ mod interop_correctness {
         force_cpu:  bool,
     ) {
         // When force_cpu is true, shadow the capability with a None variant
-        // so VideoEncoderBackend::select() always picks FfmpegCpu.
+        // so VideoEncoderBackend::select() always picks FfmpegEncoder.
         let effective_cap = if force_cpu {
             InteropCapability::none()
         } else {

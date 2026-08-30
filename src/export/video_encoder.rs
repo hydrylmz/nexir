@@ -648,14 +648,23 @@ pub(crate) fn write_nvenc_packet(
     Ok(())
 }
 
-/// Selects between the Phase 6 CPU-FFmpeg encoder and the Phase 7 NVENC path.
+/// Selects between the libavcodec encoder and the direct zero-copy NVENC path.
 /// All upstream callers (EncoderQueue, ExportEngine, Muxer) remain unchanged —
 /// they consume the unified `encode_frame` interface regardless of which variant is active.
 pub enum VideoEncoderBackend {
-    /// Phase 6 path: CPU readback → sws_scale → libx264/libx265/ProRes via FFmpeg.
-    /// Used when CUDA interop is unavailable, OR the job's codec is not H.264/HEVC
-    /// (NVENC in Phase 7 scope only covers H.264/HEVC; ProRes/VP9 always use this path).
-    FfmpegCpu(VideoEncoder),
+    /// libavcodec path: CPU readback → sws_scale → FFmpeg encoder.
+    ///
+    /// **Not necessarily a CPU encode.** `VideoEncoder::open` probes
+    /// `h264_nvenc`/`hevc_nvenc` (then AMF, then QSV) before falling back to
+    /// libx264/libx265, so for H.264/HEVC jobs this usually still encodes on the
+    /// GPU — what it gives up versus `CudaNvenc` is the zero-copy upload, not
+    /// hardware acceleration. Genuine software encoding only happens when no
+    /// vendor encoder opens, or for codecs NVENC does not cover (ProRes, VP9).
+    ///
+    /// Chosen when CUDA interop is unavailable, the codec is outside NVENC's
+    /// H.264/HEVC scope, or the output's bit depth / range cannot be signalled by
+    /// the direct interop session (see `select`).
+    FfmpegEncoder(VideoEncoder),
     /// Phase 7 path: zero-copy CUDA/NVENC — RTT texture → NV12 convert → NVENC.
     /// `param_enc` is a minimal libx264 context opened solely to provide
     /// `AVCodecContext` parameters for `Muxer::open` stream header setup.
@@ -704,7 +713,7 @@ impl VideoEncoderBackend {
                  available) rather than zero-copy NVENC: the direct interop \
                  session cannot be configured for Main10 10-bit output"
             );
-            return Ok(Self::FfmpegCpu(VideoEncoder::open(job)?));
+            return Ok(Self::FfmpegEncoder(VideoEncoder::open(job)?));
         }
 
         if capability.is_available() && nvenc_eligible {
@@ -726,7 +735,7 @@ impl VideoEncoderBackend {
                     job.output_color.bit_depth,
                     job.output_color.effective_range()
                 );
-                return Ok(Self::FfmpegCpu(VideoEncoder::open(job)?));
+                return Ok(Self::FfmpegEncoder(VideoEncoder::open(job)?));
             }
 
             if let Some(ctx) = cuda_ctx {
@@ -750,7 +759,7 @@ impl VideoEncoderBackend {
                 }
             }
         }
-        Ok(Self::FfmpegCpu(VideoEncoder::open(job)?))
+        Ok(Self::FfmpegEncoder(VideoEncoder::open(job)?))
     }
 
     /// Encode one frame.
@@ -759,14 +768,14 @@ impl VideoEncoderBackend {
     /// GPU→CPU round trip (ExportRenderer's ping-pong readback is skipped for this
     /// variant). Only `frame.pts` is used.
     ///
-    /// For `FfmpegCpu`, this is an exact delegate to `VideoEncoder::encode_frame`.
+    /// For `FfmpegEncoder`, this is an exact delegate to `VideoEncoder::encode_frame`.
     pub fn encode_frame(
         &mut self,
         frame:       &RawFrame,
         packet_sink: &mut dyn FnMut(*mut crate::io::ffi::avutil::AVPacket),
     ) -> Result<(), EncodeError> {
         match self {
-            Self::FfmpegCpu(enc) => enc.encode_frame(frame, packet_sink),
+            Self::FfmpegEncoder(enc) => enc.encode_frame(frame, packet_sink),
 
             Self::CudaNvenc { enc, .. } => {
                 // Encode via NVENC directly.
@@ -800,7 +809,7 @@ impl VideoEncoderBackend {
         packet_sink: &mut dyn FnMut(*mut crate::io::ffi::avutil::AVPacket),
     ) -> Result<(), EncodeError> {
         match self {
-            Self::FfmpegCpu(enc) => enc.flush(packet_sink),
+            Self::FfmpegEncoder(enc) => enc.flush(packet_sink),
             Self::CudaNvenc { enc, .. } => {
                 let packets = enc
                     .flush()
@@ -819,14 +828,14 @@ impl VideoEncoderBackend {
     /// Returns a raw pointer to the `AVCodecContext` for use by `Muxer::open`
     /// when writing stream header parameters (codec_id, width, height, extradata).
     ///
-    /// For `FfmpegCpu` this is the live encoder context.
+    /// For `FfmpegEncoder` this is the live encoder context.
     /// For `CudaNvenc` this delegates to the `param_enc` minimal FFmpeg context
     /// that was opened alongside the NVENC session purely for this purpose.
     /// The muxer copies the parameters immediately via `avcodec_parameters_from_context`
     /// and never stores the raw pointer beyond `Muxer::open`.
     pub fn codec_ctx(&self) -> *const crate::io::ffi::avcodec::AVCodecContext {
         match self {
-            Self::FfmpegCpu(enc)              => enc.codec_ctx(),
+            Self::FfmpegEncoder(enc)              => enc.codec_ctx(),
             Self::CudaNvenc { param_enc, .. } => param_enc.codec_ctx(),
         }
     }

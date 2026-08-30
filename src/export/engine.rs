@@ -67,8 +67,8 @@ impl ExportEngine {
         // Select NVENC (GPU) or libx264/libx265 (CPU) encoder based on hardware
         // availability and user preference. force_cpu overrides auto-detection.
         let video_enc = if self.force_cpu {
-            log::info!("[export] backend: FfmpegCpu (forced by user)");
-            VideoEncoderBackend::FfmpegCpu(
+            log::info!("[export] backend: FfmpegEncoder (forced by user)");
+            VideoEncoderBackend::FfmpegEncoder(
                 VideoEncoder::open(&self.job).map_err(ExportError::EncoderOpen)?,
             )
         } else {
@@ -83,9 +83,11 @@ impl ExportEngine {
                 VideoEncoderBackend::CudaNvenc { .. } => {
                     log::info!("[export] backend: CudaNvenc (NVENC)")
                 }
-                VideoEncoderBackend::FfmpegCpu(_) => {
-                    log::info!("[export] backend: FfmpegCpu (NVENC not available, fallback)")
-                }
+                VideoEncoderBackend::FfmpegEncoder(_) => log::info!(
+                    "[export] backend: FfmpegEncoder (libavcodec; resolves \
+                     h264_nvenc/hevc_nvenc first, so this is still a GPU encode \
+                     when one opens — see the reason logged by select())"
+                ),
             }
             backend
         };
@@ -153,7 +155,7 @@ impl ExportEngine {
         let shaders_clone = Arc::clone(&shaders);
         let compute_cache_clone = Arc::clone(&compute_cache);
 
-        // Spawn encoder thread (video) if FfmpegCpu is active
+        // Spawn encoder thread (video) if FfmpegEncoder is active
         if !is_gpu {
             let video_enc = video_enc_opt.take().unwrap();
             let prog_tx_enc = prog_tx.clone();

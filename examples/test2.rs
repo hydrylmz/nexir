@@ -26,7 +26,7 @@ fn main() {
         hdr10: None,
     };
 
-    let video_enc = VideoEncoderBackend::FfmpegCpu(VideoEncoder::open(&job).unwrap());
+    let video_enc = VideoEncoderBackend::FfmpegEncoder(VideoEncoder::open(&job).unwrap());
     let audio_enc = AudioMuxEncoder::open(&job).unwrap();
 
     let enc_video_tb = AVRational { num: 1, den: 30 };
