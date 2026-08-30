@@ -229,6 +229,49 @@ impl GpuTimer {
     pub fn resolve_last(&self) -> Option<f64> {
         self.resolve_pair(0)
     }
+
+    /// The raw tick values of every timestamp recorded this frame, unpaired and
+    /// unconverted.
+    ///
+    /// WHY RAW TICKS ARE EXPOSED.  [`Self::resolve_all`] can only measure spans
+    /// *within* one timer, and the interesting question at 4K is a span BETWEEN
+    /// two frames: how much GPU-timeline time passes between one frame's graph
+    /// finishing and the next frame's graph starting. That window is where
+    /// wgpu's `write_buffer` staging copies execute — `pending_writes.pre_submit`
+    /// (wgpu-core-0.19.4 `device/queue.rs:230-242`) prepends them to the *next*
+    /// `queue.submit`, so they land in a command buffer this crate never encodes
+    /// and cannot bracket. Subtracting one frame's first tick from the previous
+    /// frame's last tick measures it.
+    ///
+    /// Ticks from different `GpuTimer`s are comparable because they come from the
+    /// same queue's counter — which is also the reason this must not be used
+    /// across two different queues.
+    pub fn resolve_raw_ticks(&self) -> Option<Vec<u64>> {
+        let i = self.inner.as_ref()?;
+        if i.written == 0 {
+            return None;
+        }
+        let mapped_len = (i.written * wgpu::QUERY_SIZE) as u64;
+        let slice = i.readback.slice(0..mapped_len);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        i.device.poll(wgpu::Maintain::Wait);
+        rx.recv().ok()?.ok()?;
+        let ticks: Vec<u64> = {
+            let view = slice.get_mapped_range();
+            bytemuck::cast_slice::<u8, u64>(&view).to_vec()
+        };
+        i.readback.unmap();
+        Some(ticks)
+    }
+
+    /// Nanoseconds per raw tick, for converting spans built from
+    /// [`Self::resolve_raw_ticks`]. `None` when this timer measures nothing.
+    pub fn period_ns(&self) -> Option<f64> {
+        self.inner.as_ref().map(|i| i.period_ns as f64)
+    }
 }
 
 #[cfg(test)]

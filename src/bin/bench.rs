@@ -239,6 +239,7 @@ fn retire_frame(
     bitstream_bytes: &mut u64,
     download_bytes: &mut u64,
     last_retire: &mut Option<std::time::Instant>,
+    last_graph_end_tick: &mut Option<u64>,
 ) {
     let InFlight {
         pts,
@@ -286,14 +287,48 @@ fn retire_frame(
     // which is the whole reason the timers are per-slot and read here rather than
     // immediately after submitting.
     //
-    // Recorded against Composite because that is the stage whose CPU time covers
-    // the same commands. The two are not alternatives: Composite is how long the
-    // CPU took to record the graph, this is how long the GPU took to run it.
-    if let Some(ns) = gpu_timers[slot].resolve_last() {
-        profile.record_gpu(
-            PipelineStage::Composite,
-            std::time::Duration::from_nanos(ns as u64),
-        );
+    // Raw ticks rather than `resolve_all`, because two spans come out of them and
+    // only one is inside this frame's bracket:
+    //
+    //   ticks[0] ─ graph begins        ticks[1] ─ graph ends
+    //   ─────────── Composite (GPU) ────────────
+    //   previous frame's ticks[1] ── to ── this frame's ticks[0]
+    //   ────────────── GPU transfer ──────────────
+    //
+    // The second span is the one Phase C could only infer. wgpu's `write_buffer`
+    // does not write the destination buffer from the CPU: it stages the bytes and
+    // records a `copy_buffer_to_buffer` into its own `pending_writes` encoder,
+    // which `pre_submit()` prepends to the NEXT `queue.submit`
+    // (wgpu-core-0.19.4 `device/queue.rs:231-242`, `:1443`). Those copies run in a
+    // command buffer this process never encodes, so no bracket of ours can contain
+    // them — but they execute on the same queue between the two frames' graphs,
+    // and the queue's own counter dates them.
+    //
+    // Both stages are recorded against the GPU column only. Neither is CPU time,
+    // and `Composite`'s CPU row is the cost of *recording* the graph.
+    if let (Some(ticks), Some(period_ns)) = (
+        gpu_timers[slot].resolve_raw_ticks(),
+        gpu_timers[slot].period_ns(),
+    ) {
+        if let [begin, end, ..] = ticks[..] {
+            profile.record_gpu(
+                PipelineStage::Composite,
+                std::time::Duration::from_nanos((end.saturating_sub(begin) as f64 * period_ns) as u64),
+            );
+            if let Some(prev_end) = *last_graph_end_tick {
+                // `saturating_sub` guards the one case that would otherwise print
+                // an astronomical figure: a driver that reports ticks out of order
+                // across a submission boundary. A zero gap is a believable claim
+                // (the copies were free or overlapped); a negative one is not, and
+                // an underflowed u64 would read as ~5 million ms.
+                let gap = begin.saturating_sub(prev_end);
+                profile.record_gpu(
+                    PipelineStage::GpuTransfer,
+                    std::time::Duration::from_nanos((gap as f64 * period_ns) as u64),
+                );
+            }
+            *last_graph_end_tick = Some(end);
+        }
     }
 
     // Stage: NVENC. A real `nvEncEncodePicture` against a real session, plus
@@ -762,6 +797,13 @@ fn run_benchmark(
     // because they are measuring the same seconds.
     let mut last_retire: Option<std::time::Instant> = Some(std::time::Instant::now());
 
+    // Closing GPU tick of the previously retired frame's graph, for the
+    // `GpuTransfer` span. Valid to carry across frames because every timer draws
+    // its ticks from the same queue counter, and frames retire in submission
+    // order — so consecutive retirements are consecutive submissions and the gap
+    // between them is real queue time, not a reordering artefact.
+    let mut last_graph_end_tick: Option<u64> = None;
+
     for f in 0..config.frame_count {
         let pts = job.as_ref().map(|j| j.frame_pts(f)).unwrap_or(f as i64);
         let mut profile = FrameProfile::new(f, pts);
@@ -923,6 +965,7 @@ fn run_benchmark(
                 &mut bitstream_bytes,
                 &mut download_bytes,
                 &mut last_retire,
+                &mut last_graph_end_tick,
             );
         }
     }
@@ -943,6 +986,7 @@ fn run_benchmark(
             &mut bitstream_bytes,
             &mut download_bytes,
             &mut last_retire,
+            &mut last_graph_end_tick,
         );
     }
 

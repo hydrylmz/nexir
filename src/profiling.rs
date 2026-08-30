@@ -23,6 +23,23 @@ pub enum PipelineStage {
     UploadPrepare,
     /// The transfer-submission half of an upload: `queue.write_buffer`.
     UploadSubmit,
+    /// GPU-timeline time between one frame's graph finishing and the next
+    /// frame's graph starting.
+    ///
+    /// **This stage has no CPU time and never will**, which is the point. wgpu's
+    /// `queue.write_buffer` does not touch the destination buffer from the CPU: it
+    /// memcpys into an internal staging buffer and records a
+    /// `copy_buffer_to_buffer` into its own `pending_writes` encoder, which
+    /// `pre_submit()` prepends to the *next* `queue.submit` (wgpu-core-0.19.4
+    /// `device/queue.rs:231-242`, `:1443`). Those copies therefore execute in a
+    /// command buffer this crate never encodes and cannot bracket — they land
+    /// between the previous frame's closing timestamp and this frame's opening
+    /// one.
+    ///
+    /// Before this stage existed, that time was known only by subtraction: 18.0 ms
+    /// of wall interval minus 8.2 ms of bracketed graph minus 5.0 ms of CPU work
+    /// left "about 9.8 ms, probably the upload". This measures it.
+    GpuTransfer,
     Scheduler,
     YuvToRgb,
     Effects,
@@ -42,6 +59,7 @@ impl PipelineStage {
             PipelineStage::Upload,
             PipelineStage::UploadPrepare,
             PipelineStage::UploadSubmit,
+            PipelineStage::GpuTransfer,
             PipelineStage::Scheduler,
             PipelineStage::YuvToRgb,
             PipelineStage::Effects,
@@ -61,6 +79,7 @@ impl PipelineStage {
             PipelineStage::Upload => "Upload",
             PipelineStage::UploadPrepare => "  ↳ prepare",
             PipelineStage::UploadSubmit => "  ↳ submit",
+            PipelineStage::GpuTransfer => "GPU transfer",
             PipelineStage::Scheduler => "Scheduler",
             PipelineStage::YuvToRgb => "YUV → RGB",
             PipelineStage::Effects => "Effects",
@@ -420,6 +439,64 @@ impl ProfileReport {
             .map(|l| 1000.0 / l.avg_ms)
     }
 
+    /// How closely the GPU-timeline spans add up to the measured frame interval,
+    /// as a percentage — or `None` without both GPU times and latency.
+    ///
+    /// **This is a consistency check, NOT evidence that the frame is understood.**
+    /// `GpuTransfer` is measured as the gap between one frame's closing timestamp
+    /// and the next frame's opening one, so `Composite + GpuTransfer` tiles the
+    /// GPU timeline by construction and ~100% is the expected reading, not an
+    /// achievement. Reporting it as coverage would be a tautology dressed as a
+    /// verification.
+    ///
+    /// What a *deviation* means is the useful part: the two figures come from
+    /// different clocks (the queue's tick counter vs `Instant`), so a gap between
+    /// them is real evidence that tick samples are missing — a dropped resolve, a
+    /// driver reordering ticks across a submission, or frames retiring out of
+    /// submission order. Any of those invalidate the `GpuTransfer` row.
+    ///
+    /// For the question this does *not* answer — whether that transfer time is
+    /// really the upload — see [`Self::transfer_bandwidth_gbps`].
+    pub fn gpu_timeline_consistency_pct(&self) -> Option<f64> {
+        let latency_avg = self.frame_latency_stats.filter(|l| l.avg_ms > 0.0)?.avg_ms;
+        let gpu_sum: f64 = self
+            .stage_stats
+            .values()
+            .filter_map(|s| s.gpu_avg_ms)
+            .sum();
+        if gpu_sum <= 0.0 {
+            return None;
+        }
+        Some(gpu_sum / latency_avg * 100.0)
+    }
+
+    /// Bytes-per-second implied by dividing the counted upload bytes by the
+    /// measured `GpuTransfer` time, in GB/s — or `None` when either is unmeasured.
+    ///
+    /// **This is the falsifiable version of "the remaining 4K cost is upload
+    /// bandwidth".** The `GpuTransfer` span on its own cannot distinguish transfer
+    /// work from an idle queue: both look like time in which no graph is running.
+    /// Dividing by bytes turns it into a claim that can be wrong — a figure near
+    /// the host's PCIe rate supports the transfer explanation, and a figure far
+    /// below it says the queue was idle and something else is pacing the frame.
+    ///
+    /// It is a lower bound on achieved bandwidth: the numerator counts only the
+    /// bytes this process handed to `write_buffer`, while the span may also contain
+    /// queue idle time and any other work wgpu prepended.
+    pub fn transfer_bandwidth_gbps(&self) -> Option<f64> {
+        let transfer_ms = self
+            .stage_stats
+            .get(&PipelineStage::GpuTransfer)?
+            .gpu_avg_ms
+            .filter(|ms| *ms > 0.0)?;
+        let total_bytes = self.system_metrics.gpu_upload_bytes?;
+        if self.total_frames == 0 {
+            return None;
+        }
+        let bytes_per_frame = total_bytes as f64 / self.total_frames as f64;
+        Some(bytes_per_frame / (transfer_ms / 1000.0) / 1e9)
+    }
+
     /// Formats the profile report into a human-readable table matching the roadmap spec.
     pub fn format_table(&self) -> String {
         /// A GPU column, or `n/a` when nothing measured it.
@@ -474,7 +551,12 @@ impl ProfileReport {
         out.push_str("------------------------------------------------------------------------\n");
 
         for (stage, stats) in &self.stage_stats {
-            if stats.count > 0 && stats.total_ms > 0.0 {
+            let has_cpu = stats.count > 0 && stats.total_ms > 0.0;
+            let has_gpu = stats.gpu_avg_ms.is_some();
+            if !has_cpu && !has_gpu {
+                continue;
+            }
+            if has_cpu {
                 out.push_str(&format!(
                     "{:<16} {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>7.1}%",
                     stage.display_name(),
@@ -484,16 +566,32 @@ impl ProfileReport {
                     stats.p99_ms,
                     stats.percentage_of_total
                 ));
-                if any_gpu {
-                    out.push_str(&format!(
-                        " {} {} {}",
-                        gpu(stats.gpu_avg_ms),
-                        gpu(stats.gpu_p95_ms),
-                        gpu(stats.gpu_p99_ms),
-                    ));
-                }
-                out.push('\n');
+            } else {
+                // A GPU-only stage — `GpuTransfer` is one by construction, since
+                // the work happens in a command buffer wgpu submits on this
+                // crate's behalf. Its CPU columns are `n/a`, not `0.00 ms`: this
+                // thread genuinely spent no time there, and printing zeros would
+                // put it in the same visual class as a stage that was measured
+                // and found free.
+                out.push_str(&format!(
+                    "{:<16} {:>11} {:>11} {:>11} {:>11} {:>8}",
+                    stage.display_name(),
+                    "n/a",
+                    "n/a",
+                    "n/a",
+                    "n/a",
+                    "n/a"
+                ));
             }
+            if any_gpu {
+                out.push_str(&format!(
+                    " {} {} {}",
+                    gpu(stats.gpu_avg_ms),
+                    gpu(stats.gpu_p95_ms),
+                    gpu(stats.gpu_p99_ms),
+                ));
+            }
+            out.push('\n');
         }
 
         out.push_str("------------------------------------------------------------------------\n");
@@ -550,6 +648,34 @@ impl ProfileReport {
                 "  (CPU per frame sums the CPU stages; GPU columns are concurrent GPU \
                  execution, not additive)\n",
             );
+            // Whether the tick series is self-consistent. ~100% is expected, not
+            // an achievement — `Composite` and `GpuTransfer` tile the GPU timeline
+            // by construction — so only a DEVIATION carries information, and it
+            // means tick samples are missing.
+            if let Some(pct) = self.gpu_timeline_consistency_pct() {
+                if (pct - 100.0).abs() > 10.0 {
+                    out.push_str(&format!(
+                        "  WARNING: GPU spans sum to {pct:.0}% of the {:.2} ms frame \
+                         interval, not ~100%.\n   The tick series is incomplete — the \
+                         GPU transfer row is not trustworthy.\n",
+                        self.frame_latency_stats.map_or(0.0, |l| l.avg_ms),
+                    ));
+                }
+            }
+            // What the transfer span means, stated as a falsifiable rate rather
+            // than as an assumption. An idle queue and a saturated bus look
+            // identical in the span alone; dividing by counted bytes separates
+            // them.
+            if let Some(gbps) = self.transfer_bandwidth_gbps() {
+                out.push_str(&format!(
+                    "  GPU transfer implies {gbps:.2} GB/s for the {:.1} MB/frame this run \
+                     uploaded\n   (lower bound: the span may also hold queue idle time).\n",
+                    self.system_metrics
+                        .gpu_upload_bytes
+                        .map_or(0.0, |b| b as f64 / self.total_frames.max(1) as f64
+                            / (1024.0 * 1024.0)),
+                ));
+            }
         }
         out.push_str("------------------------------------------------------------------------\n");
         out.push_str(&self.system_metrics.format_block());
@@ -1163,6 +1289,161 @@ mod tests {
             report.average_fps,
             report.latency_implied_fps().unwrap_or(0.0),
         );
+    }
+
+    /// A GPU-only stage must appear in the table even with no CPU time, and its
+    /// CPU columns must read `n/a` rather than `0.00 ms`.
+    ///
+    /// `GpuTransfer` is GPU-only by construction: wgpu's `write_buffer` staging
+    /// copies execute in a command buffer this crate never encodes, so no CPU
+    /// stage covers them. The old row filter was `count > 0 && total_ms > 0.0`,
+    /// which dropped such a stage from the report entirely — the 10.24 ms that
+    /// dominates the 4K frame would have been measured and then not printed.
+    #[test]
+    fn a_gpu_only_stage_is_printed_with_na_cpu_columns() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..10 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Composite, Duration::from_millis(1));
+            // No CPU time for GpuTransfer, ever.
+            fp.record_gpu(PipelineStage::GpuTransfer, Duration::from_millis(10));
+            fp.record_latency(Duration::from_millis(19));
+            session.push_frame(fp);
+        }
+        let report = session.generate_report();
+        assert_eq!(report.stage_stats[&PipelineStage::GpuTransfer].total_ms, 0.0);
+        assert_eq!(
+            report.stage_stats[&PipelineStage::GpuTransfer].gpu_avg_ms,
+            Some(10.0)
+        );
+
+        let table = report.format_table();
+        let row = table
+            .lines()
+            .find(|l| l.contains("GPU transfer"))
+            .expect("a measured GPU-only stage must still appear in the table");
+        assert!(
+            row.contains("n/a"),
+            "its CPU columns must be n/a, not zeros: {row}"
+        );
+        // Split off the GPU columns before checking for zeros: "10.00 ms" in the
+        // GPU column contains "0.00 ms" as a substring.
+        let cpu_part = &row[..row.find("10.00 ms").unwrap_or(row.len())];
+        assert!(
+            !cpu_part.contains("0.00 ms"),
+            "a zero CPU reading would claim this thread was measured there: {row}"
+        );
+        assert!(row.contains("10.00 ms"), "the GPU reading must be shown: {row}");
+    }
+
+    /// An incomplete tick series must be flagged rather than presented as a
+    /// finding.
+    ///
+    /// `Composite` and `GpuTransfer` tile the GPU timeline by construction, so
+    /// they must sum to the frame interval. When they do not, tick samples are
+    /// missing — a dropped resolve, a driver reordering ticks, frames retiring out
+    /// of order — and the `GPU transfer` row is then an arbitrary number. The
+    /// fixture here measures 9 ms of graph inside a 19 ms interval with no
+    /// transfer span at all: 47%, i.e. half the timeline unaccounted.
+    #[test]
+    fn an_incomplete_gpu_tick_series_is_flagged() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..20 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Composite, Duration::from_millis(1));
+            fp.record_gpu(PipelineStage::Composite, Duration::from_millis(9));
+            fp.record_latency(Duration::from_millis(19));
+            session.push_frame(fp);
+        }
+        let report = session.generate_report();
+        let pct = report
+            .gpu_timeline_consistency_pct()
+            .expect("GPU time and latency were both measured");
+        assert!(
+            (pct - 9.0 / 19.0 * 100.0).abs() < 0.1,
+            "9 ms of 19 ms is ~47%, got {pct:.1}%"
+        );
+        let table = report.format_table();
+        assert!(
+            table.contains("tick series is incomplete"),
+            "a GPU timeline that does not add up must be flagged:\n{table}"
+        );
+    }
+
+    /// ...and a complete one must not carry that warning.
+    #[test]
+    fn a_complete_gpu_tick_series_is_not_flagged() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..20 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Composite, Duration::from_millis(1));
+            fp.record_gpu(PipelineStage::Composite, Duration::from_millis(9));
+            fp.record_gpu(PipelineStage::GpuTransfer, Duration::from_millis(10));
+            fp.record_latency(Duration::from_millis(19));
+            session.push_frame(fp);
+        }
+        let report = session.generate_report();
+        let pct = report.gpu_timeline_consistency_pct().expect("both measured");
+        assert!((pct - 100.0).abs() < 0.1, "19 of 19 ms is 100%, got {pct:.1}%");
+        assert!(
+            !report.format_table().contains("tick series is incomplete"),
+            "a complete timeline must not be flagged"
+        );
+    }
+
+    /// The transfer span must be reported as a bandwidth, because that is the form
+    /// in which the claim "the bottleneck is the upload" can be wrong.
+    ///
+    /// The span alone cannot tell a saturated bus from an idle queue — both are
+    /// time with no graph running. 47.5 MB in 10 ms is ~5 GB/s, a plausible PCIe
+    /// figure; the same span with 1 MB/frame would be 0.1 GB/s and would refute the
+    /// transfer explanation outright. Without this division, Phase C's mistake is
+    /// available again in a new place: a measured number attributed to a cause
+    /// nobody checked.
+    #[test]
+    fn the_transfer_span_is_reported_as_a_falsifiable_bandwidth() {
+        let session = ProfilingSession::new(60.0);
+        const MB: u64 = 1024 * 1024;
+        for i in 0..20 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Composite, Duration::from_millis(1));
+            fp.record_gpu(PipelineStage::GpuTransfer, Duration::from_millis(10));
+            fp.record_latency(Duration::from_millis(19));
+            session.push_frame(fp);
+        }
+        // 47.5 MB per frame, counted as the bench counts it.
+        session.update_system_metrics(SystemMetrics {
+            gpu_upload_bytes: Some(20 * 475 * MB / 10),
+            ..Default::default()
+        });
+        let report = session.generate_report();
+        let gbps = report
+            .transfer_bandwidth_gbps()
+            .expect("bytes and transfer time were both measured");
+        // 47.5 MiB / 10 ms = 4.98 GB/s.
+        assert!(
+            (gbps - 4.98).abs() < 0.05,
+            "47.5 MB in 10 ms is ~4.98 GB/s, got {gbps:.2}"
+        );
+        assert!(
+            report.format_table().contains("GB/s"),
+            "the bandwidth must be printed, not just computable"
+        );
+    }
+
+    /// No counted bytes means no bandwidth claim — not a zero.
+    #[test]
+    fn transfer_bandwidth_is_absent_without_counted_bytes() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..5 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_gpu(PipelineStage::GpuTransfer, Duration::from_millis(10));
+            fp.record_latency(Duration::from_millis(19));
+            session.push_frame(fp);
+        }
+        let report = session.generate_report();
+        assert!(report.transfer_bandwidth_gbps().is_none());
+        assert!(!report.format_table().contains("GB/s"));
     }
 
     #[test]
