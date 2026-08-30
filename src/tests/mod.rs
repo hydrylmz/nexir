@@ -16,6 +16,7 @@ pub mod render_integration;
 // pub mod lut_tests;
 pub mod playback_smoke;
 pub mod av_sync;
+pub mod colour_plumbing;
 pub mod interop_correctness;
 pub mod abgr10_repack;
 pub mod nv12_encode;
