@@ -300,6 +300,18 @@ impl ExportEngine {
         use crate::export::progress::ExportPhase;
         let mut frames_encoded = 0;
 
+        // Whether the encode ran to completion, as opposed to being cancelled.
+        //
+        // `Done` is NOT reported inside the loop: the file has no trailer until
+        // `finalise_sync` below, and mp4 keeps the `moov` atom until then, so a
+        // caller that opens the path the moment it sees `Done` finds
+        // "Invalid data found when processing input". That is exactly what
+        // `tests::export_validation` does, and it only surfaced as a flake under
+        // parallel load — the window is the few milliseconds between the two.
+        // The NVENC dispatch thread in `start()` already finalises before
+        // reporting; this is the CPU path being brought in line.
+        let mut completed = false;
+
         let mut run = || -> Result<(), String> {
             loop {
                 if prog_tx.control().is_cancelled() {
@@ -337,7 +349,7 @@ impl ExportEngine {
                             };
                             video_enc.flush(&mut sink)
                                 .map_err(|e| format!("flush failed: {e:?}"))?;
-                            prog_tx.report(frames_encoded, ExportPhase::Done);
+                            completed = true;
                         }
                         break;
                     }
@@ -346,13 +358,31 @@ impl ExportEngine {
             Ok(())
         };
 
-        if let Err(e) = run() {
-            log::error!("[export] encoder_thread error: {e}");
-            prog_tx.report(frames_encoded, ExportPhase::Failed(e));
+        let outcome = run();
+
+        // Finalise before reporting anything terminal, so `Done` means "the file
+        // on disk is complete and readable".
+        let finalise = muxer.finalise_sync();
+        if let Err(e) = &finalise {
+            log::error!("[export] encoder_thread: muxer finalise failed: {e:?}");
         }
 
-        if let Err(e) = muxer.finalise_sync() {
-            log::error!("[export] encoder_thread: muxer finalise failed: {e:?}");
+        match outcome {
+            Err(e) => {
+                log::error!("[export] encoder_thread error: {e}");
+                prog_tx.report(frames_encoded, ExportPhase::Failed(e));
+            }
+            // A trailer that failed to write leaves an unplayable file, so it is a
+            // failed export rather than a `Done` with a warning in the log.
+            Ok(()) if completed => match finalise {
+                Ok(()) => prog_tx.report(frames_encoded, ExportPhase::Done),
+                Err(e) => prog_tx.report(
+                    frames_encoded,
+                    ExportPhase::Failed(format!("muxer finalise failed: {e:?}")),
+                ),
+            },
+            // Cancelled: the phase was already reported inside the loop.
+            Ok(()) => {}
         }
     }
 
