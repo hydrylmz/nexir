@@ -14,6 +14,15 @@ pub enum PipelineStage {
     /// pre-made sample data is measuring an upload, and recording that under
     /// `Decode` would report a decode cost for work no decoder did.
     Upload,
+    /// The CPU-side half of an upload: building row-padded staging buffers.
+    ///
+    /// Split out from [`Self::Upload`] because the two have completely different
+    /// cures. At 4K this was the majority of a 20 ms upload stage — heap
+    /// allocation and memcpy, not PCIe transfer — and no amount of transfer
+    /// tuning would have touched it.
+    UploadPrepare,
+    /// The transfer-submission half of an upload: `queue.write_buffer`.
+    UploadSubmit,
     Scheduler,
     YuvToRgb,
     Effects,
@@ -31,6 +40,8 @@ impl PipelineStage {
         &[
             PipelineStage::Decode,
             PipelineStage::Upload,
+            PipelineStage::UploadPrepare,
+            PipelineStage::UploadSubmit,
             PipelineStage::Scheduler,
             PipelineStage::YuvToRgb,
             PipelineStage::Effects,
@@ -48,6 +59,8 @@ impl PipelineStage {
         match self {
             PipelineStage::Decode => "Decode",
             PipelineStage::Upload => "Upload",
+            PipelineStage::UploadPrepare => "  ↳ prepare",
+            PipelineStage::UploadSubmit => "  ↳ submit",
             PipelineStage::Scheduler => "Scheduler",
             PipelineStage::YuvToRgb => "YUV → RGB",
             PipelineStage::Effects => "Effects",
@@ -59,6 +72,20 @@ impl PipelineStage {
             PipelineStage::AudioDecode => "Audio Decode",
             PipelineStage::AudioMix => "Audio Mix",
         }
+    }
+
+    /// Whether this stage is a **breakdown** of another one rather than a
+    /// distinct slice of the frame.
+    ///
+    /// `UploadPrepare` + `UploadSubmit` decompose `Upload`; all three are
+    /// recorded, so summing every stage would count the upload twice and report
+    /// a frame time longer than the frame. [`FrameProfile::total_time`] skips
+    /// these, and the report indents them under their parent.
+    pub fn is_breakdown(&self) -> bool {
+        matches!(
+            self,
+            PipelineStage::UploadPrepare | PipelineStage::UploadSubmit
+        )
     }
 }
 
@@ -117,8 +144,16 @@ impl FrameProfile {
     }
 
     /// Total measured time for this frame across all recorded stages.
+    ///
+    /// Breakdown stages are excluded — see [`PipelineStage::is_breakdown`].
+    /// Counting `UploadPrepare` alongside the `Upload` it decomposes would
+    /// double-count and report a frame longer than the frame took.
     pub fn total_time(&self) -> Duration {
-        self.stage_durations.values().copied().sum()
+        self.stage_durations
+            .iter()
+            .filter(|(stage, _)| !stage.is_breakdown())
+            .map(|(_, d)| *d)
+            .sum()
     }
 
     /// Total measured time in milliseconds.
@@ -723,6 +758,30 @@ mod tests {
             table.contains("not additive"),
             "the table must say GPU and CPU columns do not sum:\n{table}"
         );
+    }
+
+    /// A breakdown stage must not be counted twice.
+    ///
+    /// `UploadPrepare` + `UploadSubmit` decompose `Upload`; all three get
+    /// recorded. Summing everything would report a 8 ms frame as 16 ms and every
+    /// derived FPS would be halved.
+    #[test]
+    fn breakdown_stages_do_not_double_count_the_frame() {
+        let mut fp = FrameProfile::new(0, 0);
+        fp.record_stage(PipelineStage::Upload, Duration::from_millis(5));
+        fp.record_stage(PipelineStage::UploadPrepare, Duration::from_millis(4));
+        fp.record_stage(PipelineStage::UploadSubmit, Duration::from_millis(1));
+        fp.record_stage(PipelineStage::Composite, Duration::from_millis(3));
+
+        assert_eq!(
+            fp.total_time_ms(),
+            8.0,
+            "the frame is Upload + Composite = 8 ms; the prepare/submit split is \
+             inside the 5 ms upload, not additional to it"
+        );
+        // The breakdown is still readable on its own.
+        assert_eq!(fp.stage_time_ms(PipelineStage::UploadPrepare), 4.0);
+        assert_eq!(fp.stage_time_ms(PipelineStage::UploadSubmit), 1.0);
     }
 
     #[test]

@@ -574,17 +574,45 @@ fn run_benchmark(
 
         // Stage: upload. Named Upload rather than Decode because no decoder ran —
         // the pattern frames were all built before the loop.
-        profile.measure(PipelineStage::Upload, || {
+        //
+        // Recorded as three stages: `Upload` is the total, and prepare/submit
+        // decompose it. They are breakdown stages, so `total_time` counts only
+        // the parent — see `PipelineStage::is_breakdown`.
+        let upload_start = std::time::Instant::now();
+        let mut upload_cost = nexir::render::nodes::yuv_upload::UploadCost::zero();
+        {
             let frame_bytes = &nv12_frames[f % PATTERN_FRAMES];
             for &u_idx in &uploader_indices {
                 if let Some(u) = graph.nodes_mut()[u_idx]
                     .as_any_mut()
                     .and_then(|n| n.downcast_mut::<YuvUploadNode>())
                 {
-                    u.upload_frame(frame_bytes, true, config.canvas_w, config.canvas_h);
+                    upload_cost.add(u.upload_frame(
+                        frame_bytes,
+                        true,
+                        config.canvas_w,
+                        config.canvas_h,
+                    ));
                 }
             }
-        });
+        }
+        profile.record_stage(PipelineStage::Upload, upload_start.elapsed());
+        profile.record_stage(PipelineStage::UploadPrepare, upload_cost.prepare);
+        profile.record_stage(PipelineStage::UploadSubmit, upload_cost.submit);
+        if f == 0 {
+            // Printed once per benchmark, because which path the upload took is
+            // the difference between a memcpy and a no-op and is not otherwise
+            // visible in the table.
+            println!(
+                "    Upload path: {} ({:.1} MB/frame handed to the queue)",
+                if upload_cost.contiguous {
+                    "contiguous — source rows already at the staging stride, no repack"
+                } else {
+                    "re-strided — rows repacked into reused scratch"
+                },
+                upload_cost.bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
 
         // Stage: effects + composite (the whole graph), plus whichever
         // per-frame consumer this path attaches to FINAL_COLOR.

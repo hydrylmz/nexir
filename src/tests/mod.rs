@@ -15,6 +15,7 @@ pub mod render_integration;
 // pub mod delta_e_tests;
 // pub mod lut_tests;
 pub mod playback_smoke;
+pub mod yuv_upload;
 pub mod av_sync;
 pub mod colour_plumbing;
 pub mod media_compat;
