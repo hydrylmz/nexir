@@ -105,6 +105,20 @@ pub struct FrameProfile {
     /// Empty when the device lacks `TIMESTAMP_QUERY`, or for any stage nobody
     /// bracketed. An absent entry reports as `n/a`, never as `0.00 ms`.
     pub gpu_durations: BTreeMap<PipelineStage, Duration>,
+    /// Wall-clock interval between this frame retiring and the one before it.
+    ///
+    /// **This is the quantity a "P95 ≤ 16.67 ms" target is about**, and it is not
+    /// [`Self::total_time`]. Once frames are in flight the CPU's per-frame work
+    /// stops being a frame duration: the 4K row reads 5.0 ms of CPU stages while
+    /// frames actually arrive 18.0 ms apart, so a percentile over the CPU sum
+    /// answers a question nobody asked. It also cuts the other way — a pipeline
+    /// deep enough to absorb a 50 ms CPU hiccup still delivers every frame on
+    /// time, and reporting that hiccup as the frame's P99 claims a stall the
+    /// viewer never saw.
+    ///
+    /// `None` on the first frame (there is no interval before it) and whenever
+    /// nobody stamped it; absent reports as `n/a`, never as `0.00 ms`.
+    pub latency: Option<Duration>,
     pub frame_pts: i64,
 }
 
@@ -114,6 +128,7 @@ impl FrameProfile {
             frame_index,
             stage_durations: BTreeMap::new(),
             gpu_durations: BTreeMap::new(),
+            latency: None,
             frame_pts,
         }
     }
@@ -185,6 +200,20 @@ impl FrameProfile {
     /// Whether this frame carries any GPU measurement at all.
     pub fn has_gpu_times(&self) -> bool {
         !self.gpu_durations.is_empty()
+    }
+
+    /// Record the wall-clock interval since the previous frame retired.
+    ///
+    /// See [`Self::latency`]: this is the frame *interval*, the quantity the
+    /// P95/P99 targets are stated in, and it is deliberately not derived from the
+    /// stage timings.
+    pub fn record_latency(&mut self, interval: Duration) {
+        self.latency = Some(interval);
+    }
+
+    /// Frame interval in milliseconds, or `None` when unmeasured.
+    pub fn latency_ms(&self) -> Option<f64> {
+        self.latency.map(|d| d.as_secs_f64() * 1000.0)
     }
 }
 
@@ -361,11 +390,36 @@ pub struct ProfileReport {
     pub p99_fps: f64,
     pub realtime_factor: f64,
     pub stage_stats: BTreeMap<PipelineStage, StageStats>,
+    /// Distribution of the CPU's per-frame work: the sum of one frame's CPU
+    /// stages.
+    ///
+    /// **Not a frame duration once frames overlap.** For the interval frames
+    /// actually arrive at — and therefore for any P95/P99 target — use
+    /// [`Self::frame_latency_stats`].
     pub total_frame_stats: StageStats,
+    /// Distribution of the wall-clock interval between frames retiring.
+    ///
+    /// `None` when nothing recorded a latency, which is the honest answer for a
+    /// caller that never stamped one: a P95 of `0.00 ms` and "we did not measure
+    /// the frame interval" are different claims.
+    pub frame_latency_stats: Option<StageStats>,
     pub system_metrics: SystemMetrics,
 }
 
 impl ProfileReport {
+    /// The frame rate the measured mean latency implies, or `None` when latency
+    /// was not measured.
+    ///
+    /// Exists to be compared against [`Self::average_fps`]: the two are computed
+    /// from independent clocks over the same run, so a disagreement means the
+    /// latency series has gaps and its percentiles cover less than the whole run.
+    /// [`Self::format_table`] prints a warning when they diverge by more than 10%.
+    pub fn latency_implied_fps(&self) -> Option<f64> {
+        self.frame_latency_stats
+            .filter(|l| l.avg_ms > 0.0)
+            .map(|l| 1000.0 / l.avg_ms)
+    }
+
     /// Formats the profile report into a human-readable table matching the roadmap spec.
     pub fn format_table(&self) -> String {
         /// A GPU column, or `n/a` when nothing measured it.
@@ -443,21 +497,57 @@ impl ProfileReport {
         }
 
         out.push_str("------------------------------------------------------------------------\n");
+        // "CPU per frame", not "Total Frame". It is the sum of one frame's CPU
+        // stages, which stopped being a frame duration the moment frames began
+        // overlapping — and a row labelled "Total Frame" invites exactly the
+        // misreading the latency row below exists to prevent.
         out.push_str(&format!(
             "{:<16} {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>7.1}%\n",
-            "Total Frame",
+            "CPU per frame",
             self.total_frame_stats.avg_ms,
             self.total_frame_stats.min_ms,
             self.total_frame_stats.p95_ms,
             self.total_frame_stats.p99_ms,
             100.0
         ));
+        // The frame interval, and the only row a "P95 ≤ 16.67 ms" target can be
+        // read off. Omitted entirely when unmeasured rather than printed as zeros.
+        if let Some(lat) = &self.frame_latency_stats {
+            out.push_str(&format!(
+                "{:<16} {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>8}\n",
+                "Frame latency", lat.avg_ms, lat.min_ms, lat.p95_ms, lat.p99_ms, "—"
+            ));
+            out.push_str(
+                "  (Frame latency is wall-clock spacing between frames retiring — the \
+                 quantity\n   P95/P99 targets are about. CPU per frame is the CPU's \
+                 share of one frame and\n   is smaller once frames overlap; it is not a \
+                 frame duration.)\n",
+            );
+            // SELF-CHECK, printed rather than asserted. Mean latency and
+            // throughput measure the same seconds two different ways, so they
+            // must agree; when they do not, the latency series is missing samples
+            // (an unstamped fill or drain) and its percentiles are being read off
+            // a different run length than the FPS. Printing the disagreement is
+            // what keeps a plausible-looking P95 from being trusted.
+            if let Some(implied) = self.latency_implied_fps() {
+                if self.average_fps > 0.0
+                    && (implied - self.average_fps).abs() > self.average_fps * 0.1
+                {
+                    out.push_str(&format!(
+                        "  WARNING: mean latency implies {implied:.1} FPS but throughput \
+                         is {:.1} FPS.\n   The latency series does not cover the whole \
+                         run — treat its percentiles with suspicion.\n",
+                        self.average_fps,
+                    ));
+                }
+            }
+        }
         if any_gpu {
             // Stated explicitly because the columns invite the addition: the CPU
             // total and the GPU column measure overlapping wall time once frames
             // are in flight, so they do not sum to a frame duration.
             out.push_str(
-                "  (CPU stages sum to Total Frame; GPU columns are concurrent GPU \
+                "  (CPU per frame sums the CPU stages; GPU columns are concurrent GPU \
                  execution, not additive)\n",
             );
         }
@@ -602,6 +692,17 @@ impl ProfilingSession {
             0.0
         };
 
+        // Frame latency: the interval frames actually arrived at, gathered only
+        // from the frames that carry one. Defaulting a missing stamp to 0.0 would
+        // drag the mean toward zero and report a pipeline faster than the clock.
+        let mut latency_samples: Vec<f64> =
+            inner.frames.iter().filter_map(|f| f.latency_ms()).collect();
+        let frame_latency_stats = if latency_samples.is_empty() {
+            None
+        } else {
+            Some(compute_distribution_stats(&mut latency_samples))
+        };
+
         ProfileReport {
             total_frames: frame_count,
             total_wall_time: wall_time,
@@ -611,6 +712,7 @@ impl ProfilingSession {
             realtime_factor,
             stage_stats,
             total_frame_stats,
+            frame_latency_stats,
             system_metrics: inner.system_metrics,
         }
     }
@@ -913,6 +1015,153 @@ mod tests {
             report.realtime_factor > 1.0 && report.realtime_factor < 4.0,
             "expected ~2x realtime from 1 s of content in ~0.5 s, got {:.2}x",
             report.realtime_factor
+        );
+    }
+
+    /// Frame latency is wall-clock spacing between retirements, and its mean must
+    /// agree with throughput.
+    ///
+    /// This is the quantity the audit's "P95 <= 16.67 ms" criterion is about.
+    /// After frames-in-flight, the CPU-stage sum is NOT that quantity — it reads
+    /// 5 ms on a pipeline delivering a frame every 18 ms — so a percentile taken
+    /// over it answers a question nobody asked.
+    #[test]
+    fn frame_latency_mean_agrees_with_throughput() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..30 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Upload, Duration::from_micros(200));
+            fp.record_latency(Duration::from_millis(10));
+            session.push_frame(fp);
+        }
+        let report = session.generate_report();
+        let lat = report.frame_latency_stats.expect("latency was recorded");
+        assert!((lat.avg_ms - 10.0).abs() < 0.01, "got {}", lat.avg_ms);
+        // 10 ms/frame is 100 FPS, and that must be what the latency implies —
+        // not the 5000 FPS the 0.2 ms CPU sum would.
+        assert!((1000.0 / lat.avg_ms - 100.0).abs() < 1.0);
+
+        // And the table must name the two quantities differently, so nobody reads
+        // the CPU's share of a frame as the frame interval.
+        let table = report.format_table();
+        assert!(
+            table.contains("CPU per frame"),
+            "the CPU stage sum must not be labelled as a frame duration:\n{table}"
+        );
+        assert!(
+            table.contains("Frame latency"),
+            "measured latency must be reported:\n{table}"
+        );
+    }
+
+    /// Unrecorded latency reports as absent, not as zero.
+    #[test]
+    fn latency_is_absent_when_not_recorded() {
+        let session = ProfilingSession::new(60.0);
+        session.push_frame(FrameProfile::new(0, 0));
+        let report = session.generate_report();
+        assert!(report.frame_latency_stats.is_none());
+        assert!(
+            !report.format_table().contains("Frame latency"),
+            "an unmeasured latency must not print a row at all"
+        );
+    }
+
+    /// Latency percentiles must come from the latency series, not the CPU one.
+    ///
+    /// The failure this pins is subtle and was the actual state of the code: a
+    /// pipeline that absorbs a 50 ms CPU hiccup delivers frames on time, and a
+    /// P99 taken over CPU sums would report a spike the viewer never saw. The
+    /// reverse is worse — a smooth CPU hiding a stalled presentation.
+    #[test]
+    fn latency_percentiles_are_independent_of_cpu_stage_times() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..100 {
+            let mut fp = FrameProfile::new(i, 0);
+            // One frame costs the CPU 50 ms; every frame still retires 10 ms apart
+            // because the pipeline had the depth to absorb it.
+            fp.record_stage(
+                PipelineStage::Upload,
+                if i == 50 {
+                    Duration::from_millis(50)
+                } else {
+                    Duration::from_millis(1)
+                },
+            );
+            fp.record_latency(Duration::from_millis(10));
+            session.push_frame(fp);
+        }
+        let report = session.generate_report();
+        let lat = report.frame_latency_stats.expect("latency was recorded");
+        assert!(
+            (lat.max_ms - 10.0).abs() < 0.01,
+            "no frame arrived late — the worst latency must still be 10 ms, got {}",
+            lat.max_ms
+        );
+        assert!(
+            report.total_frame_stats.max_ms > 40.0,
+            "the CPU spike must still be visible in the CPU row, got {}",
+            report.total_frame_stats.max_ms
+        );
+    }
+
+    /// A latency series that does not cover the whole run must announce itself.
+    ///
+    /// The bug this pins is one the bench actually had: `last_retire` started as
+    /// `None`, so the pipeline-fill interval before the first retirement was never
+    /// stamped, and the 4K row printed an 18.25 ms mean latency on a run
+    /// delivering a frame every 21.1 ms. Nothing in the table contradicted it —
+    /// the percentiles looked entirely plausible while being taken over less time
+    /// than the run took. Mean latency and throughput measure the same seconds, so
+    /// a disagreement is a defect in the instrument, and the report has to say so
+    /// rather than leave the reader to divide two numbers themselves.
+    #[test]
+    fn a_latency_series_that_disagrees_with_throughput_is_flagged() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..40 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Upload, Duration::from_micros(100));
+            // 1 ms apart, i.e. 1000 FPS — nowhere near what the sleep below allows.
+            fp.record_latency(Duration::from_millis(1));
+            session.push_frame(fp);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        let report = session.generate_report();
+        let implied = report.latency_implied_fps().expect("latency was recorded");
+        assert!(
+            implied > report.average_fps * 1.5,
+            "fixture is wrong: implied {implied:.1} should far exceed throughput {:.1}",
+            report.average_fps
+        );
+        let table = report.format_table();
+        assert!(
+            table.contains("WARNING") && table.contains("latency series"),
+            "a latency series inconsistent with throughput must be flagged:\n{table}"
+        );
+    }
+
+    /// ...and a consistent one must NOT be flagged, or the warning is noise.
+    #[test]
+    fn a_consistent_latency_series_is_not_flagged() {
+        let session = ProfilingSession::new(60.0);
+        // 20 frames × 10 ms of real sleep = 200 ms of wall time, stamped as 10 ms
+        // intervals. Throughput and implied FPS should agree within 10%.
+        for i in 0..20 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Upload, Duration::from_micros(100));
+            fp.record_latency(Duration::from_millis(10));
+            session.push_frame(fp);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let report = session.generate_report();
+        let table = report.format_table();
+        assert!(
+            !table.contains("WARNING"),
+            "throughput {:.1} FPS vs latency-implied {:.1} FPS agree; no warning \
+             expected:\n{table}",
+            report.average_fps,
+            report.latency_implied_fps().unwrap_or(0.0),
         );
     }
 

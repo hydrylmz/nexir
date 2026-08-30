@@ -238,6 +238,7 @@ fn retire_frame(
     packets_out: &mut usize,
     bitstream_bytes: &mut u64,
     download_bytes: &mut u64,
+    last_retire: &mut Option<std::time::Instant>,
 ) {
     let InFlight {
         pts,
@@ -302,6 +303,26 @@ fn retire_frame(
         let packets = packets.expect("NVENC encode_frame failed mid-benchmark");
         *packets_out += packets.len();
         *bitstream_bytes += packets.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
+    }
+
+    // ── Frame latency ─────────────────────────────────────────────────────────
+    // Stamped HERE, at the retire point, because this is where the frame is
+    // actually finished: waited on, read back or encoded, done. The interval
+    // between consecutive stamps is the rate frames are delivered at, and it is
+    // the only quantity a "P95 ≤ 16.67 ms" target can be checked against.
+    //
+    // It is deliberately not the sum of this frame's CPU stages. Since frames
+    // went in flight those two diverged by a factor of three at 4K — 5.0 ms of
+    // CPU work per frame on a pipeline delivering one every 18.0 ms — so a
+    // percentile over the CPU sum reports a frame rate nothing achieved.
+    //
+    // The `gpu_lookahead` frames retired in the drain loop retire back-to-back
+    // rather than at the loop's pace, so they read near zero — that is why the
+    // `Min` column on this row is ~0.00 ms and why the **mean** is the figure to
+    // read, cross-checked against `frames / wall time` by the report itself.
+    let now = std::time::Instant::now();
+    if let Some(prev) = last_retire.replace(now) {
+        profile.record_latency(now.duration_since(prev));
     }
 
     session.push_frame(profile);
@@ -728,6 +749,19 @@ fn run_benchmark(
     let mut inflight: std::collections::VecDeque<InFlight> =
         std::collections::VecDeque::with_capacity(gpu_lookahead + 1);
 
+    // Last retirement instant, for the frame-latency interval. Owned by the loop
+    // rather than by the session so that the drain below continues the same
+    // series.
+    //
+    // SEEDED at the loop's start, not left `None`, so frame 0's interval covers
+    // the pipeline fill — the submit work for the first `gpu_lookahead` frames
+    // that happens before anything retires. Leaving it unseeded drops that time
+    // from the series entirely, and the mean then reads below `frames / wall
+    // time` for no reason a reader could see: the 4K row reported an 18.25 ms
+    // mean latency on a run delivering a frame every 21.1 ms. The two must agree,
+    // because they are measuring the same seconds.
+    let mut last_retire: Option<std::time::Instant> = Some(std::time::Instant::now());
+
     for f in 0..config.frame_count {
         let pts = job.as_ref().map(|j| j.frame_pts(f)).unwrap_or(f as i64);
         let mut profile = FrameProfile::new(f, pts);
@@ -888,6 +922,7 @@ fn run_benchmark(
                 &mut packets_out,
                 &mut bitstream_bytes,
                 &mut download_bytes,
+                &mut last_retire,
             );
         }
     }
@@ -907,6 +942,7 @@ fn run_benchmark(
             &mut packets_out,
             &mut bitstream_bytes,
             &mut download_bytes,
+            &mut last_retire,
         );
     }
 
