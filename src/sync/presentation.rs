@@ -48,8 +48,14 @@ impl PresentationDecider {
     }
 
     /// Compute the expected PTS of the next frame that should be presented.
+    ///
+    /// P1.8 — the frame duration must include `frame_rate.den`.  The old
+    /// `project_tb.den / frame_rate.num` is correct for every integer rate and
+    /// wrong by a factor of 1001 for an NTSC one (3 ticks instead of 3003 at
+    /// 30000/1001), which would make the playback loop ask for a frame 11 µs
+    /// ahead instead of 33 ms ahead and present the same frame forever.
     pub fn next_frame_pts(&self) -> i64 {
-        let frame_dur_pts = self.project_tb.den / self.frame_rate.num;
-        self.clock.pts() + frame_dur_pts
+        self.clock.pts()
+            + crate::timeline::rational::frame_to_pts(1, self.frame_rate, self.project_tb)
     }
 }

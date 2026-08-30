@@ -211,9 +211,28 @@ impl ExportJob {
         numer.div_ceil(denom) as usize
     }
 
+    /// Timeline PTS of the job's `n`-th frame.
+    ///
+    /// P1.8 — this used to be `pts_in + n * (project_tb.den / frame_rate.num)`,
+    /// which silently DROPS `frame_rate.den`.  For every integer rate (24, 25, 30,
+    /// 60, 120) `den == 1` and the two agree, which is why it survived; for an
+    /// NTSC rate it is catastrophic rather than subtly wrong.  At 30000/1001 the
+    /// old expression is `90000 / 30000 = 3` ticks per frame instead of 3003 — a
+    /// factor of 1001 — so every frame of the export resolved to roughly the same
+    /// timeline position and `SegmentPartitioner` handed all its threads the same
+    /// few ticks.  `total_frames` above already divided by `frame_rate.den`, so
+    /// the count was right while the timestamps were not.
+    ///
+    /// `frame_to_pts` is the shared conversion (rounding, 128-bit intermediate)
+    /// that `FrameScheduler` and the timeline already use; going through it means
+    /// there is one formula rather than three transcriptions of it.
     pub fn frame_pts(&self, n: usize) -> i64 {
-        let frame_dur = self.project_tb.den / self.frame_rate.num;
-        self.pts_in + n as i64 * frame_dur
+        self.pts_in
+            + crate::timeline::rational::frame_to_pts(
+                n as i64,
+                self.frame_rate,
+                self.project_tb,
+            )
     }
 
     /// True when this job asks for an HDR (PQ or HLG) output.
