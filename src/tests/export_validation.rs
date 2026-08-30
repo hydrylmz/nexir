@@ -84,28 +84,47 @@ mod export_validation {
     /// if the range handling regresses.
     const TOLERANCE: i32 = 16;
 
-    /// Expected RGB at a given output row, from the pattern definition.
-    fn expected_rgb_at_row(y: u32) -> [u8; 3] {
-        let idx = ((y / PATCH_H) as usize).min(PATCHES.len() - 1);
+    /// Height of one band for a frame of `height` rows.
+    ///
+    /// Split out of the `PATCH_H` constant so the resolution-matrix test can use
+    /// the same pattern at 1080p/1440p/2160p without duplicating the geometry.
+    fn patch_height(height: u32) -> u32 {
+        height / PATCHES.len() as u32
+    }
+
+    /// Expected RGB at output row `y` of a frame `height` rows tall.
+    fn expected_rgb_at_row_of(y: u32, height: u32) -> [u8; 3] {
+        let idx = ((y / patch_height(height)) as usize).min(PATCHES.len() - 1);
         PATCHES[idx].1
     }
 
-    /// Write the test pattern to `path` as a PNG.
+    /// Expected RGB at a given output row, from the pattern definition.
+    #[allow(dead_code)]
+    fn expected_rgb_at_row(y: u32) -> [u8; 3] {
+        expected_rgb_at_row_of(y, H)
+    }
+
+    /// Write the test pattern to `path` as a PNG, at an arbitrary size.
     ///
     /// A still image is used as the source rather than a synthesised video file
     /// because it exercises the export path with a known, exact ground truth: the
     /// still-image upload node stores the PNG's 8-bit values as f16 in [0,1] with
     /// no colour conversion, so the RGB that reaches the encoder is bit-for-bit
     /// the PNG's own.
-    fn write_test_pattern(path: &Path) {
-        let mut img = image::RgbaImage::new(W, H);
-        for y in 0..H {
-            let [r, g, b] = expected_rgb_at_row(y);
-            for x in 0..W {
+    fn write_test_pattern_sized(path: &Path, width: u32, height: u32) {
+        let mut img = image::RgbaImage::new(width, height);
+        for y in 0..height {
+            let [r, g, b] = expected_rgb_at_row_of(y, height);
+            for x in 0..width {
                 img.put_pixel(x, y, image::Rgba([r, g, b, 255]));
             }
         }
         img.save(path).expect("failed to write test pattern PNG");
+    }
+
+    /// [`write_test_pattern_sized`] at the default `W`x`H`.
+    fn write_test_pattern(path: &Path) {
+        write_test_pattern_sized(path, W, H);
     }
 
     /// Limited-range YUV → RGB for the matrix the file is tagged with.
@@ -319,6 +338,139 @@ mod export_validation {
         (frames, pts_list)
     }
 
+    /// One demuxed packet's container timing, for the P1.5 timestamp assertions.
+    #[derive(Debug, Clone, Copy)]
+    struct PacketTiming {
+        pts:      i64,
+        dts:      i64,
+        keyframe: bool,
+    }
+
+    /// Demux `path` without decoding and return every video packet's timing.
+    ///
+    /// Separate from [`decode_file`] on purpose. That helper reports the PTS of
+    /// DECODED FRAMES, which the decoder hands back in presentation order — so it
+    /// can never observe a non-monotonic DTS, which is a property of the packets
+    /// in the container. This reads the packets themselves, in the order the
+    /// muxer wrote them, which is the only place a reordering encoder's decode
+    /// timestamps are visible.
+    fn probe_packet_timing(path: &Path) -> Vec<PacketTiming> {
+        let mut demuxer = crate::io::demuxer::Demuxer::open(path)
+            .expect("failed to open the exported file for packet timing");
+        assert!(
+            demuxer.video_stream.is_some(),
+            "exported file has no video stream"
+        );
+
+        let mut out = Vec::new();
+        loop {
+            match demuxer.next_video_packet() {
+                Ok(Some(p)) => out.push(PacketTiming {
+                    pts:      p.pts,
+                    dts:      p.dts,
+                    keyframe: p.is_keyframe(),
+                }),
+                Ok(None) => break,
+                Err(e) => panic!("demuxing the exported file for timing failed: {e:?}"),
+            }
+        }
+        out
+    }
+
+    /// The P1.5 timestamp contract, asserted against a real container.
+    ///
+    /// Four properties, each with its own failure mode:
+    ///
+    /// 1. **DTS is strictly increasing.** This is what mp4/matroska index on, and
+    ///    what `dts = pts` breaks the moment the encoder reorders. `DtsQueue`
+    ///    exists for it.
+    /// 2. **DTS never exceeds its own PTS.** A packet cannot be decoded after it
+    ///    is displayed. `DtsQueue::pop_output` guarantees this by popping
+    ///    submission timestamps in output order.
+    /// 3. **PTS is a complete, evenly spaced grid** — the sorted timestamps step
+    ///    by one constant amount with no gap and no repeat, so no frame was
+    ///    dropped, duplicated, or stamped off-grid. PTS ORDER is deliberately not
+    ///    asserted: a reordering encoder writes packets out of presentation order
+    ///    and that is correct.
+    /// 4. **The first packet is a keyframe**, so the file is seekable from zero.
+    ///
+    /// The step is DERIVED from the packets rather than asserted against a
+    /// constant: the muxer rescales into the container's own timebase (mp4 picks
+    /// one from the stream's), so the numeric spacing is a property of the file,
+    /// not of the job. What matters is that it is uniform.
+    fn assert_packet_timing_is_sane(
+        packets: &[PacketTiming],
+        expected_frames: usize,
+        label: &str,
+    ) {
+        assert_eq!(
+            packets.len(), expected_frames,
+            "{label}: the container holds {} video packet(s), expected {expected_frames}",
+            packets.len()
+        );
+
+        // 1 + 2.
+        let mut prev_dts: Option<i64> = None;
+        for (i, p) in packets.iter().enumerate() {
+            if let Some(prev) = prev_dts {
+                assert!(
+                    p.dts > prev,
+                    "{label}: packet {i} has DTS {} after DTS {prev} — the decode \
+                     timestamps are not strictly increasing, which is what \
+                     `dts = pts` produces once the encoder reorders. Full \
+                     sequence: {:?}",
+                    p.dts,
+                    packets.iter().map(|q| (q.pts, q.dts)).collect::<Vec<_>>()
+                );
+            }
+            prev_dts = Some(p.dts);
+            assert!(
+                p.dts <= p.pts,
+                "{label}: packet {i} has DTS {} > PTS {} — a frame cannot be \
+                 decoded after it is presented",
+                p.dts, p.pts
+            );
+        }
+
+        // 3.
+        let mut seen: Vec<i64> = packets.iter().map(|p| p.pts).collect();
+        seen.sort_unstable();
+        assert_eq!(seen[0], 0, "{label}: the earliest PTS is {} , expected 0", seen[0]);
+        if expected_frames > 1 {
+            let step = seen[1] - seen[0];
+            assert!(
+                step > 0,
+                "{label}: two packets share PTS {} — a frame was duplicated",
+                seen[0]
+            );
+            for (i, w) in seen.windows(2).enumerate() {
+                assert_eq!(
+                    w[1] - w[0], step,
+                    "{label}: the PTS grid steps by {} between frames {i} and {} \
+                     but by {step} elsewhere — a frame was dropped, duplicated, or \
+                     stamped off-grid. Sorted PTS: {seen:?}",
+                    w[1] - w[0], i + 1
+                );
+            }
+        }
+
+        // 4.
+        assert!(
+            packets[0].keyframe,
+            "{label}: the first packet is not flagged AV_PKT_FLAG_KEY, so the mp4 \
+             `stss` table has no entry at zero and the file cannot be seeked from \
+             its start"
+        );
+
+        let reordered = packets.windows(2).any(|w| w[1].pts < w[0].pts);
+        eprintln!(
+            "[export_validation] {label}: {} packet(s), DTS strictly increasing, \
+             reordering {}",
+            packets.len(),
+            if reordered { "PRESENT (B-frames)" } else { "absent" }
+        );
+    }
+
     /// Everything the export engine needs, built around one still-image clip
     /// holding the test pattern.
     struct Harness {
@@ -334,6 +486,20 @@ mod export_validation {
     }
 
     fn build_harness(pattern_path: &Path, duration_pts: i64) -> Harness {
+        build_harness_sized(pattern_path, duration_pts, W, H)
+    }
+
+    /// [`build_harness`] for an arbitrary canvas size.
+    ///
+    /// The source is registered at the same size as the canvas, so the still
+    /// image maps 1:1 onto the output and a patch centre is a patch centre in
+    /// both — no resampling between the ground truth and the encoded pixels.
+    fn build_harness_sized(
+        pattern_path: &Path,
+        duration_pts: i64,
+        width:  u32,
+        height: u32,
+    ) -> Harness {
         let device = Arc::new(
             pollster::block_on(GpuDevice::new_headless()).expect("headless GpuDevice"),
         );
@@ -344,8 +510,8 @@ mod export_validation {
             reg.register(
                 pattern_path.to_path_buf(),
                 Some(VideoStreamInfo {
-                    width:        W,
-                    height:       H,
+                    width,
+                    height,
                     frame_rate:   FPS,
                     pixel_fmt:    PixelFormat::Rgba8,
                     color_info:   ColorInfo::srgb(),
@@ -401,7 +567,7 @@ mod export_validation {
         );
         let _ = crate::io::prefetch::spawn_prefetch_worker(worker);
 
-        let scheduler = Arc::new(FrameScheduler::new(io_layer, W, H));
+        let scheduler = Arc::new(FrameScheduler::new(io_layer, width, height));
 
         let shaders = Arc::new(
             ShaderRegistry::compile_all(&device).expect("shader compilation failed"),
@@ -421,6 +587,16 @@ mod export_validation {
     }
 
     fn make_job(output: PathBuf, duration_pts: i64) -> ExportJob {
+        make_job_sized(output, duration_pts, W, H)
+    }
+
+    /// [`make_job`] at an arbitrary output resolution.
+    fn make_job_sized(
+        output: PathBuf,
+        duration_pts: i64,
+        width:  u32,
+        height: u32,
+    ) -> ExportJob {
         ExportJob {
             output_path:    output,
             container:      Container::Mp4,
@@ -432,8 +608,8 @@ mod export_validation {
             audio_bitrate:  128_000,
             pts_in:         0,
             pts_out:        duration_pts,
-            width:          W,
-            height:         H,
+            width,
+            height,
             frame_rate:     FPS,
             project_tb:     TB,
             // One segment: keeps frame order and the encoder's GOP simple.
@@ -632,15 +808,20 @@ mod export_validation {
     }
 
     /// Assert that every patch centre in `frame` matches the pattern.
+    ///
+    /// Geometry is taken from the DECODED frame rather than the module constants,
+    /// so the same assertion covers the 320x240 round-trip tests and the
+    /// 1080p/1440p/2160p resolution matrix.
     fn assert_frame_matches_pattern(frame: &DecodedFrame, label: &str) {
-        // Sample the horizontal centre of each band, which is at least 19 rows
-        // away from any colour boundary — far outside the reach of 4:2:0 chroma
+        // Sample the horizontal centre of each band, which is half a band away
+        // from any colour boundary — far outside the reach of 4:2:0 chroma
         // subsampling, so this measures the codec and not the resampler.
-        let x = W / 2;
+        let x = frame.width / 2;
+        let ph = patch_height(frame.height);
         let mut worst = 0i32;
 
         for (i, (name, expected)) in PATCHES.iter().enumerate() {
-            let y = i as u32 * PATCH_H + PATCH_H / 2;
+            let y = i as u32 * ph + ph / 2;
             let got = frame.rgb_at(x, y);
             for c in 0..3 {
                 let delta = (got[c] as i32 - expected[c] as i32).abs();
@@ -656,17 +837,17 @@ mod export_validation {
         // Channel-order check independent of the tolerance above: a red patch
         // must be dominated by red, and so on.  A swapped R/B anywhere in the
         // chain passes no tolerance test but would be caught here too.
-        let red = frame.rgb_at(x, 2 * PATCH_H + PATCH_H / 2);
+        let red = frame.rgb_at(x, 2 * ph + ph / 2);
         assert!(
             red[0] > red[1] + 60 && red[0] > red[2] + 60,
             "{label}: the red patch is not red-dominant: {red:?} — channels are swapped"
         );
-        let green = frame.rgb_at(x, 3 * PATCH_H + PATCH_H / 2);
+        let green = frame.rgb_at(x, 3 * ph + ph / 2);
         assert!(
             green[1] > green[0] + 60 && green[1] > green[2] + 60,
             "{label}: the green patch is not green-dominant: {green:?}"
         );
-        let blue = frame.rgb_at(x, 4 * PATCH_H + PATCH_H / 2);
+        let blue = frame.rgb_at(x, 4 * ph + ph / 2);
         assert!(
             blue[2] > blue[0] + 60 && blue[2] > blue[1] + 60,
             "{label}: the blue patch is not blue-dominant: {blue:?} — channels are swapped"
@@ -745,15 +926,25 @@ mod export_validation {
             frames.len(), expected_frames
         );
 
-        // Container timestamps must be strictly increasing.  A non-monotonic DTS
-        // is what a reordering encoder produces when its packets are stamped with
-        // dts = pts (see DtsQueue in src/interop/encode_interop.rs).
+        // Decoded frames arrive in presentation order, so this only says the
+        // decoder produced a sane sequence.  The container's own DTS ordering is
+        // a different property and is asserted below from the raw packets.
         for w in pts_list.windows(2) {
             assert!(
                 w[1] > w[0],
                 "decoded PTS sequence is not strictly increasing: {pts_list:?}"
             );
         }
+
+        // P1.5 — the packet-level timestamp contract: monotonic DTS, DTS <= PTS,
+        // a complete PTS grid, and a keyframe first.  `decode_file` above cannot
+        // see any of that, because the decoder reorders before handing frames
+        // back.
+        assert_packet_timing_is_sane(
+            &probe_packet_timing(&mp4),
+            expected_frames,
+            "cpu export",
+        );
 
         // Every frame shows the same static pattern, so check the first, a middle
         // one and the last: that also catches a pipeline that only gets the first
@@ -961,6 +1152,17 @@ mod export_validation {
                 "GPU export PTS sequence is not strictly increasing: {pts_list:?}"
             );
         }
+
+        // P1.5 — the packet-level contract, and it means more here than on the
+        // CPU path: libavcodec stamps its own DTS, whereas these packets were
+        // built by hand in `write_nvenc_packet` from `DtsQueue`.  A regression to
+        // `dts = pts` shows up here and nowhere else.
+        assert_packet_timing_is_sane(
+            &probe_packet_timing(&mp4),
+            expected_frames,
+            "gpu export",
+        );
+
         assert_frame_matches_pattern(&frames[0], "gpu frame 0");
         assert_frame_matches_pattern(&frames[frames.len() - 1], "gpu last frame");
 
@@ -977,6 +1179,231 @@ mod export_validation {
         } else {
             let _ = std::fs::remove_file(&mp4);
         }
+    }
+
+    /// Whether this machine can run the zero-copy NVENC path at all.
+    ///
+    /// Returns `false` (and explains why on stderr) when CUDA interop is absent —
+    /// the one condition that is a property of the host rather than of this code.
+    /// `NEXIR_REQUIRE_NVENC=1` turns that skip into a failure, for a CI machine
+    /// that is supposed to have the hardware.
+    fn nvenc_available_or_skip(device: &GpuDevice, test: &str) -> bool {
+        let capability = InteropCapability::probe(device);
+        if capability.is_available() {
+            return true;
+        }
+        let reason = format!(
+            "CUDA interop is unavailable on this machine (transport={:?})",
+            capability.transport
+        );
+        let require = std::env::var("NEXIR_REQUIRE_NVENC")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
+        assert!(!require, "NEXIR_REQUIRE_NVENC is set but {reason}");
+        eprintln!(
+            "[export_validation] SKIP {test}: {reason}. The GPU export path was \
+             NOT exercised."
+        );
+        false
+    }
+
+    /// Run one zero-copy NVENC export at `width`x`height` with `codec` and verify
+    /// the decoded pixels, the frame count, the packet timing and the colour tags.
+    ///
+    /// Shared by the resolution/codec matrix below so every case asserts exactly
+    /// the same properties. Returns `false` when the case was skipped because the
+    /// engine did not select NVENC for reasons the caller decides how to treat.
+    fn run_nvenc_case(
+        label:  &str,
+        width:  u32,
+        height: u32,
+        codec:  VideoCodec,
+        frames_wanted: usize,
+    ) -> bool {
+        let tag = format!("{label}_{width}x{height}");
+        let png = scratch(&tag).with_extension("png");
+        let out = scratch(&tag).with_extension("mp4");
+        write_test_pattern_sized(&png, width, height);
+
+        let duration_pts = frames_wanted as i64 * (TB.den / FPS.num);
+        let harness = build_harness_sized(&png, duration_pts, width, height);
+
+        if !nvenc_available_or_skip(&harness.device, label) {
+            let _ = std::fs::remove_file(&png);
+            return false;
+        }
+
+        let mut job = make_job_sized(out.clone(), duration_pts, width, height);
+        job.video_codec = codec;
+        assert!(
+            job.nvenc_zero_copy_is_colour_safe(),
+            "{tag}: the job must be eligible for zero-copy or this case tests \
+             the FFmpeg path under a GPU name"
+        );
+
+        let (phase, was_nvenc) = run_export(
+            &harness,
+            job.clone(),
+            false,
+            std::time::Duration::from_secs(300),
+        );
+
+        assert!(
+            was_nvenc,
+            "{tag}: the export engine selected the FFmpeg backend even though CUDA \
+             interop is available — the zero-copy path was not exercised for this \
+             resolution/codec. The [export] log lines above say why \
+             EncodeInterop::open was rejected."
+        );
+        assert_eq!(phase, ExportPhase::Done, "{tag}: export did not finish cleanly: {phase:?}");
+        assert!(out.exists(), "{tag}: export reported Done but produced no file");
+
+        let expected_frames = job.total_frames();
+        let (decoded, _) = decode_file(&out, expected_frames + 4);
+        assert_eq!(
+            decoded.len(), expected_frames,
+            "{tag}: decoded {} frame(s), expected {expected_frames} — a frame was \
+             lost between the encoder and the container",
+            decoded.len()
+        );
+        assert_eq!(
+            (decoded[0].width, decoded[0].height), (width, height),
+            "{tag}: the decoded frame is {}x{}, not the requested size — the \
+             encoder or the registration used the wrong dimensions",
+            decoded[0].width, decoded[0].height
+        );
+
+        // First and last: the first catches a wrong pitch or matrix, the last
+        // catches a dropped tail.
+        assert_frame_matches_pattern(&decoded[0], &format!("{tag} frame 0"));
+        assert_frame_matches_pattern(
+            &decoded[decoded.len() - 1],
+            &format!("{tag} last frame"),
+        );
+        assert_packet_timing_is_sane(&probe_packet_timing(&out), expected_frames, &tag);
+        assert_container_color(&out, &job.output_color, &tag);
+
+        let _ = std::fs::remove_file(&png);
+        if std::env::var("NEXIR_KEEP_EXPORT").is_ok() {
+            eprintln!("[export_validation] kept {tag} export at {}", out.display());
+        } else {
+            let _ = std::fs::remove_file(&out);
+        }
+        true
+    }
+
+    /// P1.2 / P1.3 — the zero-copy NVENC path at production resolutions, on both
+    /// codecs, including widths the pitch alignment cannot leave alone.
+    ///
+    /// WHY THIS EXISTS SEPARATELY from `nvenc_export_matches_pattern`. That test
+    /// runs one 320x240 H.264 export. 320 is a multiple of 4 but not of 256, and
+    /// `Nv12EncodeNode::aligned_pitch` rounds to 256 — so it happens to exercise
+    /// `pitch != width`, but only at one size, and it says nothing about H.265 or
+    /// about a frame large enough for the encoder's own tiling to matter.
+    ///
+    /// The cases here are chosen so each can fail on its own:
+    ///
+    /// * **1920x1080 H.264** — `aligned_pitch(1920) == 1920`, so `pitch * height`
+    ///   and `width * height` are the same number. A chroma plane sited off the
+    ///   wrong one is INVISIBLE here, which is exactly why the unaligned cases
+    ///   below are also needed rather than this alone.
+    /// * **2560x1440 H.265** — `aligned_pitch(2560) == 2560`, again equal, but a
+    ///   different codec: HEVC takes a different `NV_ENC_CONFIG` union and a
+    ///   different preset GUID inside `EncodeInterop::open`.
+    /// * **3840x2160 H.264** — `aligned_pitch(3840) == 3840`. The largest buffer,
+    ///   so a size or offset computed in 32-bit arithmetic that overflows at 4K
+    ///   fails here and passes everywhere else.
+    /// * **1918x1080** and **1282x722** — `aligned_pitch` rounds these UP (to 2048
+    ///   and 1536), so `pitch > width` and the chroma plane no longer starts at
+    ///   `width * height`. A shader or a registration that used `width` as the
+    ///   stride shears the image or reads chroma out of the luma plane. These are
+    ///   the cases the audit's "widths not aligned to common GPU pitch boundaries"
+    ///   asks for.
+    ///
+    /// Six frames per case rather than ten: the pixel content is identical in
+    /// every frame, and six is still more than the encoder's reorder depth, so the
+    /// tail assertion keeps its meaning while 4K stays quick.
+    ///
+    /// Skips as a whole when CUDA interop is absent; `NEXIR_REQUIRE_NVENC=1` makes
+    /// that a failure.
+    #[test]
+    fn nvenc_export_is_correct_across_resolutions_and_codecs() {
+        init_logging();
+        let _guard = export_lock();
+
+        // (label, width, height, codec).  Widths chosen for the pitch reasoning in
+        // the doc comment above; heights are all multiples of 6 so the six bands
+        // divide evenly, and even so 4:2:0 chroma is legal.
+        let cases: [(&str, u32, u32, VideoCodec); 5] = [
+            ("res_1080p_h264",    1920, 1080, VideoCodec::H264),
+            ("res_1440p_h265",    2560, 1440, VideoCodec::H265),
+            ("res_2160p_h264",    3840, 2160, VideoCodec::H264),
+            ("res_unaligned_hd",  1918, 1080, VideoCodec::H264),
+            ("res_unaligned_sd",  1282,  722, VideoCodec::H264),
+        ];
+
+        let mut ran = 0usize;
+        for (label, w, h, codec) in cases {
+            eprintln!("[export_validation] === {label}: {w}x{h} {codec:?} ===");
+            if run_nvenc_case(label, w, h, codec, 6) {
+                ran += 1;
+            } else {
+                // Interop is absent for the whole process, so the remaining cases
+                // would skip identically.
+                break;
+            }
+        }
+        eprintln!("[export_validation] resolution matrix: {ran}/{} case(s) ran", cases.len());
+    }
+
+    /// P1.4 — the NVENC EOS flush, at the lengths that can lose a frame.
+    ///
+    /// The property under test is narrow and specific: **every frame handed to the
+    /// encoder must reach the container.** NVENC buffers pictures internally, so
+    /// the last one is only emitted after the EOS picture is submitted and the
+    /// output queue drained (`EncodeInterop::flush`, called from
+    /// `ExportEngine`'s dispatch thread after the final segment).
+    ///
+    /// Short exports are where a missing or truncated flush actually shows:
+    ///
+    /// * **One frame.** Nothing has been emitted before the flush, so if the flush
+    ///   is skipped the file has ZERO video packets — a total failure rather than a
+    ///   subtle one, and the case a longer test cannot produce.
+    /// * **Two frames**, and **`NVENC_INFLIGHT_SLOTS` frames** — exactly the
+    ///   pipeline depth, so the render loop's drain and the EOS flush meet at the
+    ///   boundary rather than in the middle.
+    /// * **`NVENC_INFLIGHT_SLOTS + 1`** — one past the depth, so the slot-reclaim
+    ///   path has run at least once before the flush and the two have to agree
+    ///   about what is still outstanding.
+    ///
+    /// Each case asserts the decoded frame count, that the LAST decoded frame
+    /// still carries the pattern (a truncated final packet decodes to garbage or
+    /// vanishes), and the packet timing — a flush that emits a packet with a stale
+    /// DTS breaks monotonicity even when the count is right.
+    #[test]
+    fn nvenc_flush_emits_every_frame_for_short_exports() {
+        use crate::interop::encode_interop::NVENC_INFLIGHT_SLOTS;
+
+        init_logging();
+        let _guard = export_lock();
+
+        // 1 and 2 are the degenerate lengths; the slot count and one past it are
+        // where the pipeline's own drain and the EOS flush meet.
+        let lengths = [1usize, 2, NVENC_INFLIGHT_SLOTS, NVENC_INFLIGHT_SLOTS + 1];
+
+        let mut ran = 0usize;
+        for n in lengths {
+            eprintln!("[export_validation] === EOS flush: {n} frame(s) ===");
+            if run_nvenc_case("flush", W, H, VideoCodec::H264, n) {
+                ran += 1;
+            } else {
+                break;
+            }
+        }
+        eprintln!(
+            "[export_validation] EOS flush: {ran}/{} length(s) ran",
+            lengths.len()
+        );
     }
 
     /// Decode a 10-bit export and return each frame's LUMA plane as 10-bit codes.
