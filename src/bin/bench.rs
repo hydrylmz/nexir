@@ -528,6 +528,14 @@ fn run_benchmark(
         test_textures: vec![],
     };
 
+    // ── GPU timing ────────────────────────────────────────────────────────────
+    // One bracket around the whole graph submission. This is the measurement
+    // that makes `GPU wait` interpretable: that stage is CPU wall time spent
+    // blocked in `poll`, which is an upper bound on GPU execution and says
+    // nothing about how much of it the GPU was busy for. Disabled devices report
+    // nothing rather than zero.
+    let mut gpu_timer = nexir::render::gpu_timer::GpuTimer::new(device, 1);
+
     // ── Warm-up: 3 frames, untimed ────────────────────────────────────────────
     // Shader/pipeline creation and the first bind-group cache miss would
     // otherwise land in frame 0 and skew its P99.
@@ -595,6 +603,14 @@ fn run_benchmark(
             bitstream_bytes += reclaimed.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
         }
 
+        // Open the GPU bracket before the graph records anything, and close it
+        // after. Both calls sit OUTSIDE the `measure` closure because that
+        // closure borrows `encoder` mutably and the timer needs it too — the
+        // timestamps are two encoder commands, so their CPU cost is negligible
+        // and their placement in the command stream is what matters.
+        gpu_timer.reset();
+        gpu_timer.begin(&mut encoder);
+
         profile.measure(PipelineStage::Composite, || {
             match (&mut nvenc, &readback_buffer) {
                 (Some((interop, nv12)), _) => {
@@ -649,6 +665,9 @@ fn run_benchmark(
             }
         });
 
+        gpu_timer.end(&mut encoder);
+        gpu_timer.record_resolve(&mut encoder);
+
         let submission_id = profile.measure(PipelineStage::GpuSubmit, || device.submit(encoder));
 
         // Stage: GPU wait / readback.
@@ -679,6 +698,21 @@ fn run_benchmark(
         });
         if readback_buffer.is_some() {
             download_bytes += readback_size;
+        }
+
+        // Read the GPU bracket. The `GpuWait` stage above has already polled this
+        // submission to completion, so the resolved timestamps are ready and this
+        // adds no stall of its own.
+        //
+        // Recorded against Composite because that is the stage whose CPU time
+        // covers the same commands. The two are NOT alternatives: Composite is
+        // how long the CPU took to record the graph, this is how long the GPU
+        // took to run it.
+        if let Some(ns) = gpu_timer.resolve_last() {
+            profile.record_gpu(
+                PipelineStage::Composite,
+                std::time::Duration::from_nanos(ns as u64),
+            );
         }
 
         // Stage: NVENC. A real `nvEncEncodePicture` against a real session,
