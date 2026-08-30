@@ -67,6 +67,17 @@ impl PipelineStage {
 pub struct FrameProfile {
     pub frame_index: usize,
     pub stage_durations: BTreeMap<PipelineStage, Duration>,
+    /// GPU **execution** time per stage, from timestamp queries
+    /// ([`crate::render::gpu_timer::GpuTimer`]).
+    ///
+    /// Deliberately a separate map, and deliberately NOT part of
+    /// [`Self::total_time`]: CPU and GPU time overlap by construction once
+    /// frames are in flight — the CPU records frame N+1 while the GPU executes
+    /// frame N — so a sum of the two is a number no clock ever saw.
+    ///
+    /// Empty when the device lacks `TIMESTAMP_QUERY`, or for any stage nobody
+    /// bracketed. An absent entry reports as `n/a`, never as `0.00 ms`.
+    pub gpu_durations: BTreeMap<PipelineStage, Duration>,
     pub frame_pts: i64,
 }
 
@@ -75,6 +86,7 @@ impl FrameProfile {
         Self {
             frame_index,
             stage_durations: BTreeMap::new(),
+            gpu_durations: BTreeMap::new(),
             frame_pts,
         }
     }
@@ -82,6 +94,15 @@ impl FrameProfile {
     /// Record the elapsed time for a given stage.
     pub fn record_stage(&mut self, stage: PipelineStage, duration: Duration) {
         *self.stage_durations.entry(stage).or_default() += duration;
+    }
+
+    /// Record GPU execution time for a stage, as measured by timestamp queries.
+    ///
+    /// Accumulates like [`Self::record_stage`], so a stage spanning several
+    /// nodes (four LUT passes, say) can be recorded per node and read as a
+    /// total.
+    pub fn record_gpu(&mut self, stage: PipelineStage, duration: Duration) {
+        *self.gpu_durations.entry(stage).or_default() += duration;
     }
 
     /// Execute a closure and measure its duration under the specified stage.
@@ -113,6 +134,22 @@ impl FrameProfile {
             .unwrap_or(Duration::ZERO)
             .as_secs_f64()
             * 1000.0
+    }
+
+    /// GPU execution time for a stage in milliseconds, or `None` when it was not
+    /// measured.
+    ///
+    /// `Option` rather than a defaulted zero on purpose — see
+    /// [`Self::gpu_durations`].
+    pub fn gpu_time_ms(&self, stage: PipelineStage) -> Option<f64> {
+        self.gpu_durations
+            .get(&stage)
+            .map(|d| d.as_secs_f64() * 1000.0)
+    }
+
+    /// Whether this frame carries any GPU measurement at all.
+    pub fn has_gpu_times(&self) -> bool {
+        !self.gpu_durations.is_empty()
     }
 }
 
@@ -147,6 +184,13 @@ pub struct StageStats {
     pub p99_ms: f64,
     pub total_ms: f64,
     pub percentage_of_total: f64,
+    /// GPU execution time for this stage, when timestamp queries measured it.
+    ///
+    /// `None` means unmeasured — no `TIMESTAMP_QUERY` on the device, or nothing
+    /// bracketed this stage. It does not mean the GPU did no work.
+    pub gpu_avg_ms: Option<f64>,
+    pub gpu_p95_ms: Option<f64>,
+    pub gpu_p99_ms: Option<f64>,
 }
 
 /// Resource counters that accompany a [`ProfileReport`].
@@ -270,6 +314,21 @@ pub struct ProfileReport {
 impl ProfileReport {
     /// Formats the profile report into a human-readable table matching the roadmap spec.
     pub fn format_table(&self) -> String {
+        /// A GPU column, or `n/a` when nothing measured it.
+        ///
+        /// The same rule as [`SystemMetrics::format_block`]: an unmeasured stage
+        /// prints `n/a`, never `0.00 ms`, because "the GPU was idle" and "we did
+        /// not look" are different claims.
+        fn gpu(v: Option<f64>) -> String {
+            v.map(|x| format!("{x:>8.2} ms"))
+                .unwrap_or_else(|| format!("{:>11}", "n/a"))
+        }
+
+        let any_gpu = self
+            .stage_stats
+            .values()
+            .any(|s| s.gpu_avg_ms.is_some());
+
         let mut out = String::new();
         out.push_str("========================================================================\n");
         out.push_str("                        NEXIR PROFILING REPORT                          \n");
@@ -283,15 +342,22 @@ impl ProfileReport {
         ));
         out.push_str("------------------------------------------------------------------------\n");
         out.push_str(&format!(
-            "{:<16} {:>9} {:>9} {:>9} {:>9} {:>8}\n",
+            "{:<16} {:>9} {:>9} {:>9} {:>9} {:>8}",
             "Stage", "Avg (ms)", "Min (ms)", "P95 (ms)", "P99 (ms)", "Share %"
         ));
+        if any_gpu {
+            out.push_str(&format!(
+                " {:>11} {:>11} {:>11}",
+                "GPU Avg", "GPU P95", "GPU P99"
+            ));
+        }
+        out.push('\n');
         out.push_str("------------------------------------------------------------------------\n");
 
         for (stage, stats) in &self.stage_stats {
             if stats.count > 0 && stats.total_ms > 0.0 {
                 out.push_str(&format!(
-                    "{:<16} {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>7.1}%\n",
+                    "{:<16} {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>7.1}%",
                     stage.display_name(),
                     stats.avg_ms,
                     stats.min_ms,
@@ -299,6 +365,15 @@ impl ProfileReport {
                     stats.p99_ms,
                     stats.percentage_of_total
                 ));
+                if any_gpu {
+                    out.push_str(&format!(
+                        " {} {} {}",
+                        gpu(stats.gpu_avg_ms),
+                        gpu(stats.gpu_p95_ms),
+                        gpu(stats.gpu_p99_ms),
+                    ));
+                }
+                out.push('\n');
             }
         }
 
@@ -312,6 +387,15 @@ impl ProfileReport {
             self.total_frame_stats.p99_ms,
             100.0
         ));
+        if any_gpu {
+            // Stated explicitly because the columns invite the addition: the CPU
+            // total and the GPU column measure overlapping wall time once frames
+            // are in flight, so they do not sum to a frame duration.
+            out.push_str(
+                "  (CPU stages sum to Total Frame; GPU columns are concurrent GPU \
+                 execution, not additive)\n",
+            );
+        }
         out.push_str("------------------------------------------------------------------------\n");
         out.push_str(&self.system_metrics.format_block());
         out.push_str("========================================================================\n");
@@ -395,6 +479,23 @@ impl ProfilingSession {
             if sum_total_ms > 0.0 {
                 stats.percentage_of_total = (stats.total_ms / sum_total_ms) * 100.0;
             }
+
+            // GPU times are gathered only from the frames that actually carry a
+            // reading for this stage. Defaulting a missing frame to 0.0 the way
+            // the CPU series does would drag the average toward zero and report
+            // a fast GPU where there was simply no measurement.
+            let mut gpu_samples: Vec<f64> = inner
+                .frames
+                .iter()
+                .filter_map(|f| f.gpu_time_ms(stage))
+                .collect();
+            if !gpu_samples.is_empty() {
+                let gpu = compute_distribution_stats(&mut gpu_samples);
+                stats.gpu_avg_ms = Some(gpu.avg_ms);
+                stats.gpu_p95_ms = Some(gpu.p95_ms);
+                stats.gpu_p99_ms = Some(gpu.p99_ms);
+            }
+
             stage_stats.insert(stage, stats);
         }
 
@@ -455,6 +556,11 @@ fn compute_distribution_stats(samples: &mut [f64]) -> StageStats {
         p99_ms: samples[p99_idx],
         total_ms: sum,
         percentage_of_total: 0.0,
+        // Filled by `generate_report` from the frames' `gpu_durations`; this
+        // function only sees one series at a time.
+        gpu_avg_ms: None,
+        gpu_p95_ms: None,
+        gpu_p99_ms: None,
     }
 }
 
@@ -539,6 +645,84 @@ mod tests {
         assert!(block.contains("Frame=3"), "measured queue depth missing:\n{block}");
         // The ones still unmeasured stay honest in the same block.
         assert!(block.contains("n/a"), "unset fields must still say n/a:\n{block}");
+    }
+
+    /// GPU time is stored separately and must NEVER be summed into the frame's
+    /// CPU total.
+    ///
+    /// The two overlap by construction — the CPU records frame N+1 while the GPU
+    /// executes frame N — so adding them reports a frame time no clock ever saw.
+    #[test]
+    fn gpu_time_does_not_inflate_the_cpu_total() {
+        let mut fp = FrameProfile::new(0, 0);
+        fp.record_stage(PipelineStage::Upload, Duration::from_millis(4));
+        fp.record_gpu(PipelineStage::Composite, Duration::from_millis(9));
+
+        assert_eq!(fp.total_time_ms(), 4.0, "GPU time must not enter the CPU total");
+        assert_eq!(fp.gpu_time_ms(PipelineStage::Composite), Some(9.0));
+        assert_eq!(
+            fp.gpu_time_ms(PipelineStage::Upload),
+            None,
+            "a stage nobody bracketed must report None, not 0.0"
+        );
+        assert!(fp.has_gpu_times());
+    }
+
+    /// A run without timestamp support must print `n/a` for GPU columns — or omit
+    /// them — and must never print a zero that reads as a measurement.
+    #[test]
+    fn a_run_without_gpu_timing_prints_no_gpu_zeros() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..10 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Upload, Duration::from_millis(2));
+            fp.record_stage(PipelineStage::Composite, Duration::from_millis(3));
+            session.push_frame(fp);
+        }
+        let report = session.generate_report();
+        assert!(
+            report.stage_stats[&PipelineStage::Composite].gpu_avg_ms.is_none(),
+            "no GPU samples were recorded, so there must be no GPU average"
+        );
+        let table = report.format_table();
+        assert!(
+            !table.contains("GPU Avg"),
+            "with nothing measured the GPU columns should not appear at all:\n{table}"
+        );
+    }
+
+    /// A stage measured on only some frames must average over those frames, not
+    /// over all of them.
+    ///
+    /// The bug this pins: treating a missing GPU reading as 0.0 the way the CPU
+    /// series does. With 2 of 10 frames measured at 8 ms each, that would report
+    /// 1.6 ms — a fast GPU that was never observed — instead of 8 ms.
+    #[test]
+    fn partial_gpu_samples_average_over_measured_frames_only() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..10 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Composite, Duration::from_millis(3));
+            if i < 2 {
+                fp.record_gpu(PipelineStage::Composite, Duration::from_millis(8));
+            }
+            session.push_frame(fp);
+        }
+        let report = session.generate_report();
+        let gpu_avg = report.stage_stats[&PipelineStage::Composite]
+            .gpu_avg_ms
+            .expect("two frames carried a GPU reading");
+        assert!(
+            (gpu_avg - 8.0).abs() < 1e-9,
+            "expected 8.0 ms (the mean of the frames that were measured), got {gpu_avg} \
+             — unmeasured frames are being counted as zero"
+        );
+        let table = report.format_table();
+        assert!(table.contains("GPU Avg"), "measured GPU time must be shown:\n{table}");
+        assert!(
+            table.contains("not additive"),
+            "the table must say GPU and CPU columns do not sum:\n{table}"
+        );
     }
 
     #[test]
