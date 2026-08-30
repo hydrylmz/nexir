@@ -8,6 +8,7 @@ pub mod frame_state;
 pub mod nodes;
 pub mod shader;
 pub mod compute;
+pub mod gpu_timer;
 pub mod effect_chain;
 pub mod still_image;
 pub mod text_renderer;
