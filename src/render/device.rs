@@ -16,6 +16,13 @@ pub struct GpuDevice {
     pub surface_format: Mutex<wgpu::TextureFormat>,
     /// Whether the device supports TEXTURE_BINDING_ARRAY and SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
     pub has_binding_arrays: bool,
+    /// Whether the device was created with `TIMESTAMP_QUERY`, i.e. whether
+    /// `CommandEncoder::write_timestamp` may be called at all.
+    ///
+    /// Requested opportunistically: it is a profiling feature, so a device that
+    /// lacks it must still work — every GPU-time column then prints `n/a`
+    /// rather than a CPU-side number wearing a GPU label.
+    pub has_timestamp_queries: bool,
 }
 
 impl GpuDevice {
@@ -132,6 +139,13 @@ impl GpuDevice {
             required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         }
 
+        // Profiling only, so it is requested when offered and never required:
+        // `GpuTimer` degrades to reporting nothing when this is false.
+        let has_timestamp_queries = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
+        if has_timestamp_queries {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+
         // Step 3: Request device and queue
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -164,6 +178,7 @@ impl GpuDevice {
             hdr_format,
             surface_format: Mutex::new(surface_format),
             has_binding_arrays,
+            has_timestamp_queries,
         })
     }
 
@@ -210,6 +225,15 @@ impl GpuDevice {
             required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         }
 
+        // Same opportunistic request as `new_headless` — the two constructors
+        // build `required_features` independently, so a feature added to one and
+        // not the other is a bug that only shows up in the UI or only in the
+        // bench.
+        let has_timestamp_queries = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
+        if has_timestamp_queries {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("video_engine_device"),
@@ -238,6 +262,7 @@ impl GpuDevice {
             hdr_format,
             surface_format: Mutex::new(wgpu::TextureFormat::Bgra8UnormSrgb),
             has_binding_arrays,
+            has_timestamp_queries,
         };
 
         gpu_device.configure_surface(&surface, window_width, window_height);

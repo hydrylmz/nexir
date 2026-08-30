@@ -800,6 +800,14 @@ fn main() {
     println!("GPU Adapter : {} ({:?})", info.name, info.backend);
     println!("Driver Info : {}", info.driver_info);
     println!("Binding arrays : {}", device.has_binding_arrays);
+    println!(
+        "Timestamp queries : {}",
+        if device.has_timestamp_queries {
+            "available"
+        } else {
+            "UNAVAILABLE (GPU execution times print n/a)"
+        }
+    );
     let capability = InteropCapability::probe(&device);
     println!(
         "CUDA interop   : {} (transport={:?})",
