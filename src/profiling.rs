@@ -338,7 +338,26 @@ impl SystemMetrics {
 pub struct ProfileReport {
     pub total_frames: usize,
     pub total_wall_time: Duration,
+    /// Throughput: frames divided by elapsed wall time.
+    ///
+    /// **This is the honest answer to "how fast is it".** It counts real elapsed
+    /// seconds, so it cannot be improved by moving work off the measured path.
+    ///
+    /// Use this, not [`Self::cpu_bound_fps`], for any claim about performance.
     pub average_fps: f64,
+    /// What the frame rate would be if the CPU's own per-frame work were the only
+    /// limit: `1000 / (sum of CPU stages)`.
+    ///
+    /// Equal to [`Self::average_fps`] in a serial pipeline, and **far higher than
+    /// it** once frames overlap — because then the CPU finishes its part of frame
+    /// N+1 while the GPU is still executing frame N, so the CPU sum stops being a
+    /// frame duration.
+    ///
+    /// Kept because the gap between the two is the useful diagnostic: it says how
+    /// much headroom the CPU has. But it is a ceiling, not a throughput, and
+    /// reporting it as the latter is how a pipelined benchmark claims 237 FPS on a
+    /// machine delivering 58.
+    pub cpu_bound_fps: f64,
     pub p99_fps: f64,
     pub realtime_factor: f64,
     pub stage_stats: BTreeMap<PipelineStage, StageStats>,
@@ -375,6 +394,17 @@ impl ProfileReport {
             self.average_fps,
             self.realtime_factor
         ));
+        // The CPU ceiling, and how far throughput sits below it. Printed on its
+        // own line and labelled, because a reader who sees only one FPS number
+        // must see the one that counts elapsed seconds.
+        if self.cpu_bound_fps > self.average_fps * 1.05 {
+            out.push_str(&format!(
+                "  Avg FPS above is THROUGHPUT (frames / wall time). CPU-bound ceiling: \
+                 {:.1} FPS\n  — the CPU finishes its share of a frame in {:.2} ms; the \
+                 gap is GPU/encoder-bound headroom.\n",
+                self.cpu_bound_fps, self.total_frame_stats.avg_ms,
+            ));
+        }
         out.push_str("------------------------------------------------------------------------\n");
         out.push_str(&format!(
             "{:<16} {:>9} {:>9} {:>9} {:>9} {:>8}",
@@ -534,7 +564,25 @@ impl ProfilingSession {
             stage_stats.insert(stage, stats);
         }
 
-        let avg_fps = if total_frame_stats.avg_ms > 0.0 {
+        // THROUGHPUT, from the clock on the wall.
+        //
+        // This used to be `1000 / mean(CPU stage sum)`, which is the same number
+        // only while the pipeline is serial. Once frames overlap, the CPU's
+        // per-frame work stops being a frame duration — it finishes frame N+1's
+        // share while the GPU is still on frame N — and that formula reports a
+        // rate the machine never achieved. Measured here: the 4K row's CPU sum
+        // implied 237 FPS on a run that delivered 58.
+        //
+        // Frames divided by elapsed seconds cannot be gamed that way.
+        let avg_fps = if wall_time.as_secs_f64() > 0.0 {
+            frame_count as f64 / wall_time.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        // The CPU-bound ceiling, kept as a diagnostic rather than as the headline:
+        // the gap between it and `avg_fps` is how much CPU headroom exists.
+        let cpu_bound_fps = if total_frame_stats.avg_ms > 0.0 {
             1000.0 / total_frame_stats.avg_ms
         } else {
             0.0
@@ -546,9 +594,10 @@ impl ProfilingSession {
             0.0
         };
 
-        let target_frame_dur_ms = 1000.0 / inner.target_fps;
-        let realtime_factor = if total_frame_stats.avg_ms > 0.0 {
-            target_frame_dur_ms / total_frame_stats.avg_ms
+        // Realtime multiplier against throughput, for the same reason: "we export
+        // 4x faster than realtime" is a claim about elapsed time.
+        let realtime_factor = if wall_time.as_secs_f64() > 0.0 {
+            (frame_count as f64 / inner.target_fps) / wall_time.as_secs_f64()
         } else {
             0.0
         };
@@ -557,6 +606,7 @@ impl ProfilingSession {
             total_frames: frame_count,
             total_wall_time: wall_time,
             average_fps: avg_fps,
+            cpu_bound_fps,
             p99_fps,
             realtime_factor,
             stage_stats,
@@ -782,6 +832,88 @@ mod tests {
         // The breakdown is still readable on its own.
         assert_eq!(fp.stage_time_ms(PipelineStage::UploadPrepare), 4.0);
         assert_eq!(fp.stage_time_ms(PipelineStage::UploadSubmit), 1.0);
+    }
+
+    /// Reported FPS must be throughput, not the inverse of the CPU's own work.
+    ///
+    /// THE BUG THIS PINS. `average_fps` was `1000 / mean(sum of CPU stages)`,
+    /// which is correct only while the pipeline is serial. Once frames overlap,
+    /// the CPU records frame N+1 while the GPU executes frame N, so the CPU sum is
+    /// no longer a frame duration — and the formula reports a rate the machine
+    /// never reached. Observed for real: a 4K run whose CPU sum implied 237 FPS
+    /// took 1.54 s for 90 frames, i.e. 58 FPS.
+    ///
+    /// A benchmark that reports the first number gets faster every time work moves
+    /// off the CPU's measured path, whether or not any frame arrives sooner.
+    #[test]
+    fn reported_fps_is_throughput_not_the_inverse_of_cpu_work() {
+        let session = ProfilingSession::new(60.0);
+        // 60 frames, each costing the CPU 1 ms — but the loop below takes real
+        // time, so wall-clock throughput is far below 1000 FPS.
+        for i in 0..60 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Upload, Duration::from_millis(1));
+            session.push_frame(fp);
+        }
+        std::thread::sleep(Duration::from_millis(120));
+
+        let report = session.generate_report();
+
+        // 60 frames in >= 120 ms is <= 500 FPS. The CPU-sum formula would say 1000.
+        assert!(
+            report.average_fps < 600.0,
+            "average_fps must be frames/wall-time; got {:.1}, which is the inverse of \
+             the 1 ms CPU sum rather than a throughput",
+            report.average_fps
+        );
+        assert!(
+            report.average_fps > 100.0,
+            "sanity: 60 frames in ~0.12 s is a few hundred FPS, got {:.1}",
+            report.average_fps
+        );
+
+        // The CPU ceiling is still available, and is much higher.
+        assert!(
+            report.cpu_bound_fps > report.average_fps * 1.5,
+            "the CPU ceiling ({:.1}) should far exceed throughput ({:.1}) here",
+            report.cpu_bound_fps,
+            report.average_fps
+        );
+
+        // And the table must say which is which, so no reader mistakes the ceiling
+        // for the result.
+        let table = report.format_table();
+        assert!(
+            table.contains("THROUGHPUT"),
+            "the report must label its FPS as throughput when a ceiling is also \
+             shown:\n{table}"
+        );
+        assert!(
+            table.contains("CPU-bound ceiling"),
+            "the CPU ceiling must be labelled as such:\n{table}"
+        );
+    }
+
+    /// The realtime multiplier is a claim about elapsed time and must be computed
+    /// from it.
+    #[test]
+    fn realtime_factor_is_measured_against_wall_time() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..60 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Upload, Duration::from_micros(100));
+            session.push_frame(fp);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+
+        let report = session.generate_report();
+        // 60 frames at a 60 FPS target is 1.0 s of content, produced in ~0.5 s,
+        // so roughly 2x realtime — NOT the 10x the 0.1 ms CPU sum would imply.
+        assert!(
+            report.realtime_factor > 1.0 && report.realtime_factor < 4.0,
+            "expected ~2x realtime from 1 s of content in ~0.5 s, got {:.2}x",
+            report.realtime_factor
+        );
     }
 
     #[test]

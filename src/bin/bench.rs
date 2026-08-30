@@ -164,6 +164,15 @@ fn make_nv12(w: u32, h: u32, phase: u32) -> Vec<u8> {
 /// measures `queue.write_texture` and nothing else.
 const PATTERN_FRAMES: usize = 8;
 
+/// How many frames the benchmark keeps in flight when there is no encoder to set
+/// the depth for it.
+///
+/// Bounded rather than unbounded on purpose: with no limit the CPU can run
+/// arbitrarily far ahead of the GPU and the reported FPS stops being "how fast
+/// frames complete" and becomes "how fast this loop records commands" — a number
+/// that improves when you make the pipeline worse.
+const DEFAULT_PIPELINE_DEPTH: usize = 4;
+
 /// The export job an NVENC session is opened against: H.264, BT.709 limited
 /// 8-bit, at the benchmark's own canvas size and frame rate.
 fn nvenc_job(config: &BenchmarkConfig) -> ExportJob {
@@ -190,6 +199,112 @@ fn nvenc_job(config: &BenchmarkConfig) -> ExportJob {
         output_color: ColorInfo::bt709(),
         hdr10: None,
     }
+}
+
+/// One frame the GPU is working on but which has not been retired yet.
+///
+/// The [`FrameProfile`] travels with the frame rather than being pushed to the
+/// session at submit time: its NVENC cost and its GPU execution time are only
+/// known once the submission has completed, and a profile pushed early would
+/// report a frame whose encode had not happened.
+struct InFlight {
+    pts: i64,
+    submission: wgpu::SubmissionIndex,
+    slot: usize,
+    profile: FrameProfile,
+}
+
+/// Wait for one in-flight frame, read what it cost, hand it to the encoder and
+/// record it.
+///
+/// This is where the two genuinely unavoidable synchronisations live:
+///
+///   * The GPU must have finished writing the NV12 buffer before NVENC reads it
+///     through CUDA. That is a real ordering requirement across two APIs that
+///     share no timeline, not a benchmark artefact.
+///   * A CPU readback is a synchronisation point by definition.
+///
+/// Everything else about a frame — upload, recording, submission — now happens
+/// while earlier frames are still executing.
+#[allow(clippy::too_many_arguments)]
+fn retire_frame(
+    frame: InFlight,
+    device: &Arc<GpuDevice>,
+    nvenc: &mut Option<(EncodeInterop, Nv12EncodeNode)>,
+    readback_buffer: &Option<wgpu::Buffer>,
+    readback_size: u64,
+    gpu_timers: &mut [nexir::render::gpu_timer::GpuTimer],
+    session: &ProfilingSession,
+    packets_out: &mut usize,
+    bitstream_bytes: &mut u64,
+    download_bytes: &mut u64,
+) {
+    let InFlight {
+        pts,
+        submission,
+        slot,
+        mut profile,
+    } = frame;
+
+    // Stage: GPU wait / readback. Named for what it measures — this thread
+    // blocked — and it is CPU time, not GPU execution time. The GPU column
+    // reports the latter separately.
+    profile.measure(PipelineStage::GpuWait, || {
+        if let Some(buf) = readback_buffer {
+            device
+                .device
+                .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
+            let slice = buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res);
+            });
+            device.device.poll(wgpu::Maintain::Wait);
+            let _ = rx.recv();
+            let mapped = slice.get_mapped_range();
+            // Touch the mapping so the read is not optimised away.
+            std::hint::black_box(mapped[0]);
+            drop(mapped);
+            buf.unmap();
+        } else {
+            // NVENC reads the NV12 buffer through CUDA, so the conversion pass
+            // must have completed before the picture is submitted. For the
+            // render-only path nothing consumes the texture, but the wait is
+            // still what makes this frame's timestamps readable below.
+            device
+                .device
+                .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
+        }
+    });
+    if readback_buffer.is_some() {
+        *download_bytes += readback_size;
+    }
+
+    // Read this frame's GPU bracket. Its submission has just been waited on, so
+    // the resolve is already in the readback buffer and this adds no stall —
+    // which is the whole reason the timers are per-slot and read here rather than
+    // immediately after submitting.
+    //
+    // Recorded against Composite because that is the stage whose CPU time covers
+    // the same commands. The two are not alternatives: Composite is how long the
+    // CPU took to record the graph, this is how long the GPU took to run it.
+    if let Some(ns) = gpu_timers[slot].resolve_last() {
+        profile.record_gpu(
+            PipelineStage::Composite,
+            std::time::Duration::from_nanos(ns as u64),
+        );
+    }
+
+    // Stage: NVENC. A real `nvEncEncodePicture` against a real session, plus
+    // whatever bitstream the driver handed back.
+    if let Some((interop, _)) = nvenc {
+        let packets = profile.measure(PipelineStage::Nvenc, || interop.encode_frame(pts, slot));
+        let packets = packets.expect("NVENC encode_frame failed mid-benchmark");
+        *packets_out += packets.len();
+        *bitstream_bytes += packets.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
+    }
+
+    session.push_frame(profile);
 }
 
 fn run_benchmark(
@@ -528,13 +643,37 @@ fn run_benchmark(
         test_textures: vec![],
     };
 
+    // ── Pipeline depth ────────────────────────────────────────────────────────
+    // How many frames may be in flight. With an encoder this is the session's own
+    // slot count, because that is what bounds it in reality: rendering into a
+    // slot NVENC is still reading is the one thing `reclaim_slot` exists to
+    // prevent. Without one, a fixed bound — see `DEFAULT_PIPELINE_DEPTH`.
+    let pipeline_depth = nvenc
+        .as_ref()
+        .map(|(interop, _)| interop.slot_count())
+        .unwrap_or(DEFAULT_PIPELINE_DEPTH);
+
+    // How many submissions may be outstanding without having been retired.
+    //
+    // Strictly below `pipeline_depth` so the slot about to be rendered into is
+    // never one still sitting in `inflight` — the same reasoning as
+    // `src/export/renderer.rs:864-869`, which this loop deliberately mirrors
+    // rather than reinventing.
+    let gpu_lookahead = pipeline_depth.saturating_sub(2).max(1);
+
     // ── GPU timing ────────────────────────────────────────────────────────────
-    // One bracket around the whole graph submission. This is the measurement
-    // that makes `GPU wait` interpretable: that stage is CPU wall time spent
-    // blocked in `poll`, which is an upper bound on GPU execution and says
-    // nothing about how much of it the GPU was busy for. Disabled devices report
-    // nothing rather than zero.
-    let mut gpu_timer = nexir::render::gpu_timer::GpuTimer::new(device, 1);
+    // One timer per in-flight frame, NOT one shared timer.
+    //
+    // A shared timer would have frame N+1 overwrite the query set before frame
+    // N's timestamps were read, and the resulting number would be the difference
+    // between two unrelated frames' clocks — plausible-looking and meaningless.
+    // Per-slot timers also mean the resolve is read at the retire point, where
+    // the submission has already been waited on, so reading it adds no stall of
+    // its own. Getting that wrong is how a pipelined benchmark measures no
+    // improvement: the profiler serialises what the pipeline parallelised.
+    let mut gpu_timers: Vec<nexir::render::gpu_timer::GpuTimer> = (0..pipeline_depth)
+        .map(|_| nexir::render::gpu_timer::GpuTimer::new(device, 1))
+        .collect();
 
     // ── Warm-up: 3 frames, untimed ────────────────────────────────────────────
     // Shader/pipeline creation and the first bind-group cache miss would
@@ -562,15 +701,49 @@ fn run_benchmark(
     }
 
     // ── Measurement loop ──────────────────────────────────────────────────────
+    //
+    // FRAMES IN FLIGHT (P0.2/P0.5). The loop is split into a submit half and a
+    // retire half so the CPU records frame N+1 while the GPU executes frame N.
+    // Before this, every frame ended in `poll(WaitForSubmissionIndex)`, which put
+    // the CPU's upload work and the GPU's render work strictly end-to-end: the
+    // 4K row spent 12.66 ms — 71% of the frame — blocked, of which only 8.4 ms
+    // was the GPU actually busy.
+    //
+    // Structure mirrors `src/export/renderer.rs:856-988`, which already does this
+    // correctly for real exports, rather than being a second design:
+    //
+    //   submit:  reclaim slot -> upload -> record -> submit -> push to inflight
+    //   retire:  while inflight > lookahead: wait oldest -> read GPU time ->
+    //            encode -> push profile
+    //
+    // The FrameProfile travels WITH the frame in `inflight`. Pushing it to the
+    // session at submit time would report a frame whose encode had not happened
+    // yet and whose GPU time was unknown.
     let session = ProfilingSession::new(config.target_fps);
     let job = nvenc.as_ref().map(|_| nvenc_job(config));
     let mut bitstream_bytes: u64 = 0;
     let mut packets_out: usize = 0;
     let mut download_bytes: u64 = 0;
 
+    let mut inflight: std::collections::VecDeque<InFlight> =
+        std::collections::VecDeque::with_capacity(gpu_lookahead + 1);
+
     for f in 0..config.frame_count {
         let pts = job.as_ref().map(|j| j.frame_pts(f)).unwrap_or(f as i64);
         let mut profile = FrameProfile::new(f, pts);
+        let slot = f % pipeline_depth;
+
+        // ── Backpressure ──────────────────────────────────────────────────────
+        // NVENC must be finished reading this slot's NV12 buffer before anything
+        // records into it again. A no-op until the pipeline is full; after that it
+        // blocks on the oldest outstanding picture, which is the correct thing to
+        // wait for. Timed under Nvenc: it is encoder wait, not render time.
+        if let Some((interop, _)) = &mut nvenc {
+            let reclaimed = profile.measure(PipelineStage::Nvenc, || interop.reclaim_slot(slot));
+            let reclaimed = reclaimed.expect("NVENC reclaim_slot failed mid-benchmark");
+            packets_out += reclaimed.len();
+            bitstream_bytes += reclaimed.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
+        }
 
         // Stage: upload. Named Upload rather than Decode because no decoder ran —
         // the pattern frames were all built before the loop.
@@ -617,25 +790,13 @@ fn run_benchmark(
         // Stage: effects + composite (the whole graph), plus whichever
         // per-frame consumer this path attaches to FINAL_COLOR.
         let mut encoder = device.begin_frame();
-        let slot = nvenc
-            .as_ref()
-            .map(|(interop, _)| f % interop.slot_count())
-            .unwrap_or(0);
-
-        // Backpressure before recording into a slot's buffer: NVENC must be done
-        // reading it. Timed under Nvenc — it is encoder wait, not render time.
-        if let Some((interop, _)) = &mut nvenc {
-            let reclaimed = profile.measure(PipelineStage::Nvenc, || interop.reclaim_slot(slot));
-            let reclaimed = reclaimed.expect("NVENC reclaim_slot failed mid-benchmark");
-            packets_out += reclaimed.len();
-            bitstream_bytes += reclaimed.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
-        }
 
         // Open the GPU bracket before the graph records anything, and close it
         // after. Both calls sit OUTSIDE the `measure` closure because that
         // closure borrows `encoder` mutably and the timer needs it too — the
         // timestamps are two encoder commands, so their CPU cost is negligible
         // and their placement in the command stream is what matters.
+        let gpu_timer = &mut gpu_timers[slot];
         gpu_timer.reset();
         gpu_timer.begin(&mut encoder);
 
@@ -696,63 +857,57 @@ fn run_benchmark(
         gpu_timer.end(&mut encoder);
         gpu_timer.record_resolve(&mut encoder);
 
-        let submission_id = profile.measure(PipelineStage::GpuSubmit, || device.submit(encoder));
+        let submission = profile.measure(PipelineStage::GpuSubmit, || device.submit(encoder));
 
-        // Stage: GPU wait / readback.
-        profile.measure(PipelineStage::GpuWait, || {
-            if let Some(buf) = &readback_buffer {
-                device
-                    .device
-                    .poll(wgpu::Maintain::WaitForSubmissionIndex(submission_id));
-                let slice = buf.slice(..);
-                let (tx, rx) = std::sync::mpsc::channel();
-                slice.map_async(wgpu::MapMode::Read, move |res| {
-                    let _ = tx.send(res);
-                });
-                device.device.poll(wgpu::Maintain::Wait);
-                let _ = rx.recv();
-                let mapped = slice.get_mapped_range();
-                // Touch the mapping so the read is not optimised away.
-                std::hint::black_box(mapped[0]);
-                drop(mapped);
-                buf.unmap();
-            } else {
-                // NVENC reads the NV12 buffer through CUDA, so the conversion
-                // pass must have completed before the picture is submitted.
-                device
-                    .device
-                    .poll(wgpu::Maintain::WaitForSubmissionIndex(submission_id));
-            }
+        // Non-blocking: lets the driver make progress without stalling this
+        // thread. `Maintain::Poll` is explicitly NOT a wait.
+        device.device.poll(wgpu::Maintain::Poll);
+
+        inflight.push_back(InFlight {
+            pts,
+            submission,
+            slot,
+            profile,
         });
-        if readback_buffer.is_some() {
-            download_bytes += readback_size;
-        }
 
-        // Read the GPU bracket. The `GpuWait` stage above has already polled this
-        // submission to completion, so the resolved timestamps are ready and this
-        // adds no stall of its own.
-        //
-        // Recorded against Composite because that is the stage whose CPU time
-        // covers the same commands. The two are NOT alternatives: Composite is
-        // how long the CPU took to record the graph, this is how long the GPU
-        // took to run it.
-        if let Some(ns) = gpu_timer.resolve_last() {
-            profile.record_gpu(
-                PipelineStage::Composite,
-                std::time::Duration::from_nanos(ns as u64),
+        // ── Retire ────────────────────────────────────────────────────────────
+        // Only once more than `gpu_lookahead` frames are outstanding, so the CPU
+        // stays ahead of the GPU rather than being paced by it.
+        while inflight.len() > gpu_lookahead {
+            let frame = inflight
+                .pop_front()
+                .expect("inflight is non-empty: len > gpu_lookahead >= 1");
+            retire_frame(
+                frame,
+                device,
+                &mut nvenc,
+                &readback_buffer,
+                readback_size,
+                &mut gpu_timers,
+                &session,
+                &mut packets_out,
+                &mut bitstream_bytes,
+                &mut download_bytes,
             );
         }
+    }
 
-        // Stage: NVENC. A real `nvEncEncodePicture` against a real session,
-        // plus whatever bitstream the driver handed back.
-        if let Some((interop, _)) = &mut nvenc {
-            let packets = profile.measure(PipelineStage::Nvenc, || interop.encode_frame(pts, slot));
-            let packets = packets.expect("NVENC encode_frame failed mid-benchmark");
-            packets_out += packets.len();
-            bitstream_bytes += packets.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
-        }
-
-        session.push_frame(profile);
+    // ── Drain ─────────────────────────────────────────────────────────────────
+    // Every frame still in flight, retired the same way. Skipping this would drop
+    // the last `gpu_lookahead` frames from both the report and the encoder.
+    while let Some(frame) = inflight.pop_front() {
+        retire_frame(
+            frame,
+            device,
+            &mut nvenc,
+            &readback_buffer,
+            readback_size,
+            &mut gpu_timers,
+            &session,
+            &mut packets_out,
+            &mut bitstream_bytes,
+            &mut download_bytes,
+        );
     }
 
     // Drain whatever the encoder was still holding. Deliberately outside the
