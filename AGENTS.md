@@ -14,6 +14,19 @@ cargo run -p ui               # launch the desktop app
 
 **Run tests with GPU** (integration tests need headless wgpu): `cargo test`
 
+**Benchmarks** (`src/bin/bench.rs`) — see gotchas 9, 12 and 13 for what its numbers do and do not claim:
+
+```bash
+cargo build -p nexir --bin bench --release
+cp target/debug/*.dll target/release/   # cuda.dll must sit beside the binary
+./target/release/bench.exe              # all 6, median of 3 repeats each
+./target/release/bench.exe 5 6          # only benchmarks 5 and 6
+NEXIR_BENCH_REPEATS=1 ./target/release/bench.exe    # smoke run; prints that it is a sample
+NEXIR_UPLOAD_PATH=write_texture ./target/release/bench.exe   # force one upload mechanism
+```
+
+A single run of the 4K row spans ~40% between repeats, so **quote the median with its spread, never one run.**
+
 ## Build Dependencies (Windows)
 
 - **FFmpeg dev libs** at `C:/ffmpeg/` (set `VE_FFMPEG_LIB_DIR` to override)
@@ -109,6 +122,12 @@ Hardcoded dark theme in `NexirApp::new()`. No theme switching. Window size: 1280
 11. **Colour-metadata tests must use BT.601 sources, not BT.709.** BT.709 limited is simultaneously the commonest real input *and* every fallback in the chain — `ColorInfo::default()`, `from_ffmpeg`'s heuristic for an HD frame, and `luma_coefficients`' `Unknown` arm — so a test whose fixture is BT.709 passes even when the frame's metadata is dropped entirely and never reaches `YuvToRgbNode`. `tests::colour_plumbing` (P1.6) therefore tags its fixtures BT.601, where a mix-up is a ~24-level error on red. Two supporting rules:
     - **The fixtures are written by this crate's own `VideoEncoder` + `Muxer`,** not an external ffmpeg binary, because `VideoEncoder::open` pins swscale to `job.sws_colorspace()` — so the samples genuinely carry the matrix the VUI is tagged with. `the_two_matrices_are_not_interchangeable` asserts that the two fixtures actually differ (28 luma levels on saturated colour, 0 on grey); if `sws_setColorspaceDetails` ever silently fails, that test is the one that catches it and every other assertion in the file becomes vacuous.
     - **Each pixel assertion needs a mis-tagged control.** `node_decodes_the_pattern_using_the_signalled_matrix` re-renders the same decoded bytes with `matrix` forced to BT.709 and requires the result to move by MORE than the tolerance. Without it, a shader ignoring its push constants and hardcoding one matrix would pass, because one of the two would be right by accident.
+
+12. **`YuvUploadNode` has two upload mechanisms, and `record` must branch on the DATA, not on the configured path.** `UploadPath::Auto` (the default) resolves per node: `WriteTexture` when the staging path would repack rows (1080p 8-bit luma pads 1920 → 2048), `StagingBuffer` when it would not (3840 is already aligned). Both earn their place — measured 3× each, `write_texture` wins every 1080p row by 25-40% and loses 4K by ~7%, so deleting either costs real performance. Force one with `NEXIR_UPLOAD_PATH=staging|write_texture`; that is how the comparison is reproduced from one binary. Two coupled invariants:
+    - **`record` branches on whether a deferred frame is pending, never on `self.upload_path`.** `write_texture` needs the destination texture, which only exists during `record`, so `upload_frame_shared` parks an `Arc` and `record` completes it. But a `WriteTexture`-configured node still serves callers that lend a borrowed slice (`ui/src/app.rs`, `src/export/renderer.rs`) or hand over planar chroma — both of which route to the staging buffers. Branching on the configured path made `record` return early and skip the `copy_buffer_to_texture` for data already sitting in staging: **a black frame, with no error, no warning and no failing test**, on every 1080p preview frame. `upload_frame` therefore clears `pending_frame`, and `record` peeks rather than takes it so a re-record without a new upload still draws. Pinned by `a_write_texture_node_still_serves_the_borrowed_slice_api` and `a_borrowed_upload_supersedes_a_pending_deferred_one`.
+    - **Adding a layout to the `write_texture` path means adding it to `upload_frame_shared`'s guard.** It accepts semi-planar only and falls back to staging otherwise, because planar U/V must be interleaved first and `upload_frame` already does that correctly — a second interleaver is a second thing to keep in step. `bytes_per_row` there is the UNPADDED source stride; passing the 256-aligned one shears the picture exactly like a wrong NVENC pitch (gotcha 6).
+
+13. **A percentile over `CPU per frame` is not a frame time.** Since frames went in flight, the sum of one frame's CPU stages is the CPU's *share* of a frame (6.7 ms at 4K) while frames arrive 20.0 ms apart — so the report carries a separate measured `Frame latency` row, and that is the only row a "P95 ≤ 16.67 ms" target can be read off. `average_fps` is likewise frames ÷ wall time, never `1000 / CPU sum`: the old formula reported 237 FPS on a run delivering 58. Three rules follow, each with a test: unrecorded latency prints nothing rather than `0.00 ms`; the latency series must cover the WHOLE run (an unseeded `last_retire` silently dropped the pipeline-fill interval and printed 18.25 ms mean on a 21.1 ms/frame run); and because mean latency and throughput measure the same seconds two ways, `format_table` prints a `WARNING` when they disagree by >10%.
 
 ## Style Notes
 
