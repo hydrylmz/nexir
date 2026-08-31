@@ -53,6 +53,90 @@ impl UploadCost {
     }
 }
 
+/// Which mechanism an upload uses to get pixels into the GPU texture.
+///
+/// Two are viable, they win on different inputs, and the measurement below is why
+/// neither was deleted:
+///
+/// * [`UploadPath::StagingBuffer`] - `queue.write_buffer` into a persistent buffer,
+///   then `copy_buffer_to_texture` inside the graph. wgpu allocates its own
+///   internal staging buffer per `write_buffer` call
+///   (wgpu-core-0.19.4 `device/queue.rs:405-431`), so the bytes are copied on the
+///   CPU once here and once by wgpu, then moved on the GPU twice (into our buffer,
+///   then into the texture). **`copy_buffer_to_texture` demands a 256-aligned row
+///   stride, so an unaligned width forces a CPU repack first.**
+/// * [`UploadPath::WriteTexture`] - `queue.write_texture` straight to the texture.
+///   One CPU copy into wgpu's staging buffer and one GPU copy, and **wgpu does the
+///   re-striding itself, row by row, inside its own staging allocation**
+///   (`queue.rs:815-830`) — so an unaligned width costs no repack of ours.
+///
+/// MEASURED, 3 repeats each, RTX 3050 / DX12 (`target/bench_I3_*.txt`):
+///
+/// | Benchmark | staging | write_texture |
+/// |---|---:|---:|
+/// | 1080p 1 layer, render only | 577 FPS | **920** |
+/// | 1080p 1 layer, NVENC | 325 | **402** |
+/// | 1080p 1 layer, readback | 318 | **404** |
+/// | 1080p 3 layers + CC | 196 | **231** |
+/// | 4K 4 distinct sources | **49.7** | 46.4 |
+/// | 4K 4 layers sharing 1 source | 75.7 | 76.4 (tie) |
+///
+/// The pattern is exactly the alignment: 1080p 8-bit luma pads 1920 → 2048, so the
+/// staging path repacks every row on the CPU and `write_texture` does not. At 4K,
+/// 3840 is already aligned, the staging path is a straight memcpy, and the extra
+/// GPU hop costs less than `write_texture`'s per-row handling — 4K CPU-per-frame
+/// went 6.7 → 8.7 ms on the `write_texture` run.
+///
+/// Hence [`UploadPath::Auto`], which is the default: pick per node from the
+/// arithmetic that decides it. Deleting the "loser" would have made every 1080p row
+/// 25-40% slower or every 4K row ~7% slower, depending on which was kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadPath {
+    /// Choose per node: `WriteTexture` when the staging path would have to repack
+    /// rows, `StagingBuffer` when it would not. Resolved once in the constructor.
+    Auto,
+    /// `write_buffer` + `copy_buffer_to_texture`. Works for every caller.
+    StagingBuffer,
+    /// `write_texture` at record time. Needs [`YuvUploadNode::upload_frame_shared`]
+    /// and semi-planar chroma; falls back to staging otherwise.
+    WriteTexture,
+}
+
+impl UploadPath {
+    /// Read the path from `NEXIR_UPLOAD_PATH`, defaulting to [`Self::Auto`].
+    ///
+    /// An environment override rather than a constant so both paths can be
+    /// measured from one binary - the point of having two is to compare them, and
+    /// a rebuild between the two runs would change more than the path.
+    pub fn from_env() -> Self {
+        match std::env::var("NEXIR_UPLOAD_PATH").as_deref() {
+            Ok("write_texture") => Self::WriteTexture,
+            Ok("staging") => Self::StagingBuffer,
+            _ => Self::Auto,
+        }
+    }
+
+    /// Resolve [`Self::Auto`] for a node whose staging stride is `dst_row_bytes`
+    /// and whose source rows are `src_row_bytes` wide.
+    ///
+    /// `Auto` picks `WriteTexture` exactly when the staging path would repack, i.e.
+    /// when the two disagree. That is the condition the measurement in this type's
+    /// docs splits on, so the rule is the measurement rather than an intuition
+    /// about which API is cheaper.
+    pub fn resolve(self, src_row_bytes: u32, dst_row_bytes: u32) -> Self {
+        match self {
+            Self::Auto => {
+                if src_row_bytes == dst_row_bytes {
+                    Self::StagingBuffer
+                } else {
+                    Self::WriteTexture
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 /// Uploads CPU YUV data into a pair of GPU textures (Y plane + UV plane).
 ///
 /// Staging buffers are written via `queue.write_buffer` (non-blocking, no
@@ -99,6 +183,27 @@ pub struct YuvUploadNode {
     y_scratch:        std::sync::Mutex<Vec<u8>>,
     uv_scratch:       std::sync::Mutex<Vec<u8>>,
     queue:            std::sync::Arc<wgpu::Queue>,
+    /// Which upload mechanism this node uses. See [`UploadPath`].
+    upload_path:      UploadPath,
+    /// On the `WriteTexture` path: the frame bytes handed to the most recent
+    /// `upload_frame_shared`, held until `record` can write them to the texture.
+    ///
+    /// An `Arc` rather than a copy, because copying here would reintroduce exactly
+    /// the per-frame 12 MB memcpy the contiguous path exists to avoid — and the
+    /// bench's pattern frames are immutable and shared anyway. `None` on the
+    /// staging path, and on the first frame before anything has been uploaded.
+    pending_frame:    std::sync::Mutex<Option<PendingFrame>>,
+}
+
+/// One frame's bytes, waiting for `record` to write them into the texture.
+///
+/// Always semi-planar: [`YuvUploadNode::upload_frame_shared`] routes planar input
+/// to the staging path, so nothing here has to carry a layout flag or decide
+/// between two chroma arrangements at record time.
+struct PendingFrame {
+    data: std::sync::Arc<Vec<u8>>,
+    width: u32,
+    height: u32,
 }
 
 impl YuvUploadNode {
@@ -167,7 +272,26 @@ impl YuvUploadNode {
             y_scratch:  std::sync::Mutex::new(vec![0u8; y_size as usize]),
             uv_scratch: std::sync::Mutex::new(vec![0u8; uv_size as usize]),
             queue: std::sync::Arc::clone(&device.queue),
+            // Resolved HERE, not per frame: the decision is pure arithmetic on the
+            // node's own dimensions, so re-deciding it per upload would give the
+            // same answer at a per-frame cost — and a node that changed mechanism
+            // mid-run would make its own `UploadCost` figures incomparable.
+            upload_path: UploadPath::from_env().resolve(width * bpp, y_bytes_per_row),
+            pending_frame: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Which upload mechanism this node will use.
+    pub fn upload_path(&self) -> UploadPath {
+        self.upload_path
+    }
+
+    /// Force a specific upload path, overriding the environment default.
+    ///
+    /// For tests that must exercise both paths in one process, and for callers
+    /// that cannot satisfy `WriteTexture`'s requirement of shared frame bytes.
+    pub fn set_upload_path(&mut self, path: UploadPath) {
+        self.upload_path = path;
     }
 
     /// Legacy constructor kept for the benchmark harness: builds a layout from a
@@ -191,6 +315,70 @@ impl YuvUploadNode {
         )
     }
 
+    /// Upload a YUV frame whose bytes the caller can SHARE, allowing the
+    /// `write_texture` path.
+    ///
+    /// Identical to [`Self::upload_frame`] on [`UploadPath::StagingBuffer`]. On
+    /// [`UploadPath::WriteTexture`] it stores the `Arc` and defers the actual
+    /// transfer to [`RenderNode::record`], because `write_texture` needs the
+    /// destination texture and the graph only produces that during recording.
+    ///
+    /// The deferral is why this takes an `Arc` rather than a slice: the bytes have
+    /// to outlive this call, and copying them here would put back the per-frame
+    /// 12 MB memcpy the contiguous path exists to remove - the copy would then be
+    /// charged to `prepare` and the comparison between the two paths would be
+    /// measuring the copy rather than the transfer.
+    ///
+    /// The reported `submit` time on the deferred path is the time spent storing a
+    /// handle, i.e. ~0. The transfer lands in the `GpuTransfer` span, exactly as
+    /// `write_buffer`'s does: both are prepended to the next submission by wgpu's
+    /// `pending_writes`.
+    ///
+    /// **Planar chroma always falls back to staging.** `write_texture_planes` can
+    /// hand a semi-planar UV plane straight to wgpu, but planar U and V have to be
+    /// woven together first — that is CPU work `upload_frame` already does
+    /// correctly, and duplicating it here would be a second interleaver to keep in
+    /// step with the first.
+    pub fn upload_frame_shared(
+        &self,
+        yuv_data: std::sync::Arc<Vec<u8>>,
+        semi_planar: bool,
+        frame_width: u32,
+        frame_height: u32,
+    ) -> UploadCost {
+        if self.upload_path != UploadPath::WriteTexture || !semi_planar {
+            return self.upload_frame(&yuv_data, semi_planar, frame_width, frame_height);
+        }
+
+        let t = Instant::now();
+        let bpp = self.layout.bytes_per_sample();
+        // Counted the same way as the staging path: luma plus the interleaved
+        // chroma plane, i.e. what actually crosses the bus. NOT the padded stride -
+        // `write_texture` re-strides internally only when it must, and at 4K the
+        // source rows already match.
+        let y_bytes = (frame_width as u64) * (frame_height as u64) * bpp as u64;
+        let uv_bytes = (frame_width as u64) * ((frame_height / 2) as u64) * bpp as u64;
+
+        *self.pending_frame.lock().unwrap() = Some(PendingFrame {
+            data: yuv_data,
+            width: frame_width,
+            height: frame_height,
+        });
+        self.current_width
+            .store(frame_width.min(self.width), Ordering::Relaxed);
+        self.current_height
+            .store(frame_height.min(self.height), Ordering::Relaxed);
+
+        UploadCost {
+            prepare: std::time::Duration::ZERO,
+            submit: t.elapsed(),
+            bytes: y_bytes + uv_bytes,
+            // No repack happens on this path at all - wgpu decides internally
+            // whether the rows need re-striding.
+            contiguous: true,
+        }
+    }
+
     /// Upload a YUV frame into the staging buffers using the wgpu queue's
     /// internal upload ring (**non-blocking, no poll(Wait)**).
     ///
@@ -207,6 +395,12 @@ impl YuvUploadNode {
         frame_width:  u32,
         frame_height: u32,
     ) -> UploadCost {
+        // Clear any deferred `write_texture` frame: this upload supersedes it, and
+        // `record` branches on whether one is pending. Leaving a stale one behind
+        // would have `record` re-upload the previous frame's pixels and silently
+        // drop these — see the comment in `record`.
+        *self.pending_frame.lock().unwrap() = None;
+
         // Clamp to what we actually allocated
         let w = frame_width.min(self.width);
         let h = frame_height.min(self.height);
@@ -233,10 +427,13 @@ impl YuvUploadNode {
         // every row to the byte offset it already occupies — a full-plane memcpy
         // into a freshly allocated, freshly zeroed buffer, for nothing.
         //
-        // This is not a rare case: `round_up_256(width * 1)` is 1920 at 1080p and
-        // 3840 at 4K, both already 256-aligned, so 8-bit NV12 at either standard
-        // resolution takes this path. Measured at 4K with four layers, the repack
-        // was ~18 of a 20.6 ms upload stage.
+        // This is not a rare case, but it is narrower than it looks:
+        // `round_up_256(width * bpp)` is 3840 at 4K (aligned, contiguous) and
+        // 2048 at 1080p — 8-bit luma at 1920 pads, so 1080p still repacks and only
+        // gains from the scratch reuse. `which_widths_can_skip_the_repack` pins the
+        // real arithmetic, because loosening this guard to cover 1920 would ship a
+        // sheared picture with no error anywhere. Measured at 4K with four layers,
+        // the repack was ~18 of a 20.6 ms upload stage.
         //
         // The three conditions are all cheap, and any one of them failing falls
         // through to the general path unchanged — a non-aligned width, a partial
@@ -365,6 +562,87 @@ impl YuvUploadNode {
 
         cost
     }
+
+    /// Write both planes straight to their textures with `queue.write_texture`.
+    ///
+    /// Split out of `record` so the `pending_frame` borrow stays short and the
+    /// slicing arithmetic lives in one place.
+    ///
+    /// `bytes_per_row` here is the SOURCE stride (unpadded), not the 256-aligned
+    /// one: wgpu re-strides internally when the destination needs it
+    /// (wgpu-core-0.19.4 `device/queue.rs:815-830`), and misreporting the source
+    /// stride shears the picture exactly the way a wrong staging pitch does.
+    fn write_texture_planes(&self, ctx: &RenderContext, frame: &PendingFrame) {
+        let bpp = self.layout.bytes_per_sample();
+        let w = frame.width.min(self.width);
+        let h = frame.height.min(self.height);
+        let y_size = (frame.width as usize) * (frame.height as usize) * bpp;
+
+        if y_size > frame.data.len() {
+            log::warn!(
+                "[upload] slot={} write_texture: Y data too small ({} < {}), skipping",
+                self.clip_slot,
+                frame.data.len(),
+                y_size
+            );
+            return;
+        }
+
+        let y_res = ctx.get(self.out_y);
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: y_res.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &frame.data[..y_size],
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(frame.width * bpp as u32),
+                rows_per_image: Some(frame.height),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Chroma. Semi-planar by construction — `upload_frame_shared` routes planar
+        // input to the staging path rather than reimplementing its U/V interleave
+        // here, so there is no layout branch at this point.
+        let uv_len = (frame.width as usize) * ((frame.height / 2) as usize) * bpp;
+        if frame.data.len() < y_size + uv_len {
+            log::warn!(
+                "[upload] slot={} write_texture: UV data too small, skipping UV",
+                self.clip_slot
+            );
+            return;
+        }
+
+        let uv_res = ctx.get(self.out_uv);
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: uv_res.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &frame.data[y_size..y_size + uv_len],
+            wgpu::ImageDataLayout {
+                offset: 0,
+                // One row of interleaved UV spans the full luma width in bytes.
+                bytes_per_row: Some(frame.width * bpp as u32),
+                rows_per_image: Some(frame.height / 2),
+            },
+            wgpu::Extent3d {
+                width: w / 2,
+                height: h / 2,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
 }
 
 impl RenderNode for YuvUploadNode {
@@ -405,6 +683,40 @@ impl RenderNode for YuvUploadNode {
         ctx:     &RenderContext,
         _frame:  &FrameState,
     ) {
+        // WRITE_TEXTURE PATH.  The transfer happens here rather than at upload
+        // time because `queue.write_texture` needs the destination texture, and the
+        // graph only hands that over during recording — it comes from the transient
+        // pool and may be a different texture each frame.
+        //
+        // Note what gets recorded into `encoder`: nothing. `write_texture` is a
+        // queue operation, so wgpu appends it to its own `pending_writes` encoder
+        // and prepends that to the next `queue.submit` — the same mechanism
+        // `write_buffer` uses. That is why both paths' transfer cost lands in the
+        // `GpuTransfer` span between two frames' graphs, and why neither can be
+        // bracketed directly.
+        //
+        // THE BRANCH IS ON `pending_frame`, NOT ON `self.upload_path`, and that
+        // distinction is load-bearing. A node configured for `WriteTexture` still
+        // serves callers that hand over a borrowed slice (`ui/src/app.rs`,
+        // `export/renderer.rs`) or planar chroma — both of which
+        // `upload_frame_shared` routes to the staging buffers. Branching on the
+        // configured path would then skip the `copy_buffer_to_texture` for data that
+        // is sitting in staging waiting for it, and the frame would render BLACK
+        // with no error anywhere. `upload_frame` clears `pending_frame` for exactly
+        // this reason, so whichever upload ran most recently is the one `record`
+        // completes.
+        //
+        // Peeked rather than taken: a `record` with no new upload behind it (a graph
+        // recompile, a paused playhead) then re-writes the last frame it was given,
+        // which is what the staging path does too — its buffer still holds the last
+        // upload. Taking it would make that case a black frame.
+        let pending = self.pending_frame.lock().unwrap();
+        if let Some(frame) = pending.as_ref() {
+            self.write_texture_planes(ctx, frame);
+            return;
+        }
+        drop(pending);
+
         // Use the dimensions from the most recent upload_frame call.
         let cw = self.current_width.load(Ordering::Relaxed);
         let ch = self.current_height.load(Ordering::Relaxed);

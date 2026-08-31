@@ -808,6 +808,24 @@ fn run_benchmark(
         .compile(config.canvas_w, config.canvas_h)
         .expect("Graph compile failed");
 
+    // Which upload mechanism the nodes are using, read once from the first
+    // uploader rather than re-read per frame.
+    //
+    // `UploadPath::from_env` is per-node, so every node in a run agrees by
+    // construction; asserting that here would be asserting that `std::env::var`
+    // is deterministic. What matters is that the printed banner names the
+    // mechanism the numbers were produced by — a bench run whose upload path is
+    // invisible is a bench run whose FPS cannot be compared to another.
+    let upload_mechanism = uploaders
+        .first()
+        .and_then(|up| {
+            graph.nodes_mut()[up.node_idx]
+                .as_any_mut()
+                .and_then(|n| n.downcast_mut::<YuvUploadNode>())
+        })
+        .map(|u| u.upload_path())
+        .unwrap_or(nexir::render::nodes::yuv_upload::UploadPath::Auto);
+
     // ── Buffers this benchmark allocates itself ───────────────────────────────
     // Counted, not estimated: these are the sizes actually requested.
     let mut allocated_gpu_bytes: u64 = 0;
@@ -836,13 +854,13 @@ fn run_benchmark(
     // Built up front, outside every timed region: synthesising NV12 inside the
     // loop would land in the Upload stage, which exists to measure
     // `queue.write_texture` and nothing else.
-    let nv12_frames: Vec<Vec<u8>> = (0..PATTERN_FRAMES)
+    let nv12_frames: Vec<std::sync::Arc<Vec<u8>>> = (0..PATTERN_FRAMES)
         .map(|i| {
             // Shift by a whole number of chroma samples so the two planes stay in
             // step, and by enough per frame that motion estimation cannot treat
             // successive frames as identical.
             let phase = (i as u32 * 16) % config.canvas_w;
-            make_nv12(config.canvas_w, config.canvas_h, phase)
+            std::sync::Arc::new(make_nv12(config.canvas_w, config.canvas_h, phase))
         })
         .collect();
 
@@ -950,8 +968,10 @@ fn run_benchmark(
                 .as_any_mut()
                 .and_then(|n| n.downcast_mut::<YuvUploadNode>())
             {
-                u.upload_frame(
-                    &nv12_frames[(w + source_phase_offset(up.source_idx)) % PATTERN_FRAMES],
+                u.upload_frame_shared(
+                    std::sync::Arc::clone(
+                        &nv12_frames[(w + source_phase_offset(up.source_idx)) % PATTERN_FRAMES],
+                    ),
                     true,
                     config.canvas_w,
                     config.canvas_h,
@@ -1062,8 +1082,14 @@ fn run_benchmark(
                     .as_any_mut()
                     .and_then(|n| n.downcast_mut::<YuvUploadNode>())
                 {
-                    upload_cost.add(u.upload_frame(
-                        frame_bytes,
+                    // `_shared` rather than `upload_frame` so the node can take the
+                    // `write_texture` path when configured to: that path needs the
+                    // bytes to survive until `record`, and an `Arc` is how they do
+                    // that without a copy. On the default staging path this is
+                    // exactly `upload_frame` — pinned by
+                    // `tests::yuv_upload::shared_upload_on_the_staging_path_is_the_ordinary_upload`.
+                    upload_cost.add(u.upload_frame_shared(
+                        std::sync::Arc::clone(frame_bytes),
                         true,
                         config.canvas_w,
                         config.canvas_h,
@@ -1083,12 +1109,29 @@ fn run_benchmark(
             // visible in the table — and because the layer:source ratio is the
             // single most important caveat on any FPS figure below it.
             println!(
-                "    Upload path: {} ({:.1} MB/frame handed to the queue; {} layer(s) over \
+                "    Upload: {} ({:.1} MB/frame handed to the queue; {} layer(s) over \
                  {} distinct source(s))",
-                if upload_cost.contiguous {
-                    "contiguous — source rows already at the staging stride, no repack"
-                } else {
-                    "re-strided — rows repacked into reused scratch"
+                match upload_mechanism {
+                    nexir::render::nodes::yuv_upload::UploadPath::WriteTexture =>
+                        "write_texture direct to texture (wgpu re-strides internally)"
+                            .to_string(),
+                    nexir::render::nodes::yuv_upload::UploadPath::StagingBuffer =>
+                        format!(
+                            "write_buffer staging, {}",
+                            if upload_cost.contiguous {
+                                "contiguous — source rows already at the staging stride, \
+                                 no repack"
+                            } else {
+                                "re-strided — rows repacked into reused scratch"
+                            }
+                        ),
+                    // Unreachable in practice: `YuvUploadNode::new_with_layout`
+                    // resolves `Auto` from its own dimensions, so a live node never
+                    // reports it. Printed rather than `unreachable!()` because a
+                    // benchmark should not panic over a label.
+                    nexir::render::nodes::yuv_upload::UploadPath::Auto =>
+                        "UNRESOLVED Auto (a node did not resolve its path — report this)"
+                            .to_string(),
                 },
                 upload_cost.bytes as f64 / (1024.0 * 1024.0),
                 layer_count,

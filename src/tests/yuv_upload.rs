@@ -365,4 +365,270 @@ mod yuv_upload {
         );
         eprintln!("steady-state repack: {per_call:?}/frame for 1000x512 NV12");
     }
+
+    /// The `write_texture` path must land the same pixels as the staging path.
+    ///
+    /// The two mechanisms are genuinely different — `write_buffer` +
+    /// `copy_buffer_to_texture` through a persistent buffer at the 256-aligned
+    /// stride, versus `queue.write_texture` straight to the texture at the SOURCE
+    /// stride, with wgpu re-striding internally. Which is faster is a measurement
+    /// (Task I3), but neither is allowed to be wrong, and a stride mix-up in
+    /// `write_texture_planes` is the same silent shear the staging guard protects
+    /// against: `bytes_per_row` there is the unpadded source stride, and passing
+    /// the padded one would offset every row.
+    ///
+    /// 1000 is deliberately NOT 256-aligned, so this also covers the case where
+    /// wgpu must re-stride and the staging path must repack — the two arrive at
+    /// the same texture by different routes.
+    #[test]
+    fn write_texture_path_matches_the_staging_path() {
+        use crate::render::nodes::yuv_upload::UploadPath;
+
+        let Ok(device) = pollster::block_on(GpuDevice::new_headless()) else {
+            eprintln!("SKIP: no GPU on this machine");
+            return;
+        };
+
+        for (w, h) in [(512u32, 64u32), (1000, 32)] {
+            let src = std::sync::Arc::new(nv12_pattern(w, h));
+
+            let staging = YuvUploadNode::new_with_layout(
+                &device,
+                0,
+                w,
+                h,
+                ResourceId(2),
+                ResourceId(3),
+                FrameLayout::NV12,
+            );
+            staging.upload_frame(&src, true, w, h);
+            let staging_luma = read_luma(&device, &staging, w, h);
+
+            let mut wt = YuvUploadNode::new_with_layout(
+                &device,
+                0,
+                w,
+                h,
+                ResourceId(2),
+                ResourceId(3),
+                FrameLayout::NV12,
+            );
+            wt.set_upload_path(UploadPath::WriteTexture);
+            let cost = wt.upload_frame_shared(std::sync::Arc::clone(&src), true, w, h);
+            assert_eq!(
+                cost.prepare,
+                std::time::Duration::ZERO,
+                "the write_texture path performs no CPU repack of its own"
+            );
+            assert_eq!(
+                cost.bytes,
+                (w as u64 * h as u64) + (w as u64 * (h / 2) as u64),
+                "bytes must count the unpadded planes actually handed to wgpu"
+            );
+            let wt_luma = read_luma(&device, &wt, w, h);
+
+            for row in 0..h as usize {
+                let lo = row * w as usize;
+                let hi = lo + w as usize;
+                assert_eq!(
+                    &wt_luma[lo..hi],
+                    &src[lo..hi],
+                    "{w}x{h} row {row}: write_texture did not match the source"
+                );
+                assert_eq!(
+                    &wt_luma[lo..hi],
+                    &staging_luma[lo..hi],
+                    "{w}x{h} row {row}: the two upload paths disagree"
+                );
+            }
+        }
+    }
+
+    /// `upload_frame_shared` on the staging path must behave exactly like
+    /// `upload_frame`, so a caller can hand over an `Arc` unconditionally and let
+    /// the node decide.
+    ///
+    /// Without this, the shared entry point is a second code path that only the
+    /// `write_texture` configuration ever exercises, and the default build would
+    /// stop covering it.
+    #[test]
+    fn shared_upload_on_the_staging_path_is_the_ordinary_upload() {
+        use crate::render::nodes::yuv_upload::UploadPath;
+
+        let Ok(device) = pollster::block_on(GpuDevice::new_headless()) else {
+            eprintln!("SKIP: no GPU on this machine");
+            return;
+        };
+
+        let (w, h) = (512u32, 64u32);
+        let src = std::sync::Arc::new(nv12_pattern(w, h));
+        let mut node = YuvUploadNode::new_with_layout(
+            &device,
+            0,
+            w,
+            h,
+            ResourceId(2),
+            ResourceId(3),
+            FrameLayout::NV12,
+        );
+        node.set_upload_path(UploadPath::StagingBuffer);
+
+        let cost = node.upload_frame_shared(std::sync::Arc::clone(&src), true, w, h);
+        assert!(
+            cost.contiguous,
+            "a 512-wide full-size frame still takes the contiguous staging path"
+        );
+        let luma = read_luma(&device, &node, w, h);
+        assert_eq!(&luma[..w as usize], &src[..w as usize]);
+    }
+
+    /// `Auto` must pick the path the measurement says wins for that node.
+    ///
+    /// The measurement (recorded on `UploadPath`) splits exactly on whether the
+    /// staging path would have to repack: `write_texture` won every 1080p row, where
+    /// 1920 pads to 2048, and lost the 4K row, where 3840 does not pad. So the rule
+    /// is "repack ⇒ write_texture", and this test states it in terms of real
+    /// resolutions so a future edit cannot quietly invert it.
+    #[test]
+    fn auto_picks_write_texture_exactly_when_staging_would_repack() {
+        use crate::render::nodes::yuv_upload::UploadPath;
+
+        // 1080p 8-bit luma: 1920 → 2048, staging repacks, so write_texture wins.
+        assert_eq!(
+            UploadPath::Auto.resolve(1920, round_up_256(1920)),
+            UploadPath::WriteTexture,
+            "1080p pads, so Auto must avoid the CPU repack"
+        );
+        // 4K 8-bit luma: already aligned, staging is a plain memcpy and wins.
+        assert_eq!(
+            UploadPath::Auto.resolve(3840, round_up_256(3840)),
+            UploadPath::StagingBuffer,
+            "4K needs no repack, and staging measured faster there"
+        );
+        // An explicit choice is never overridden — that is what makes the
+        // NEXIR_UPLOAD_PATH comparison runs valid.
+        assert_eq!(
+            UploadPath::StagingBuffer.resolve(1920, 2048),
+            UploadPath::StagingBuffer
+        );
+        assert_eq!(
+            UploadPath::WriteTexture.resolve(3840, 3840),
+            UploadPath::WriteTexture
+        );
+    }
+
+    /// A node configured for `write_texture` must still render correctly when a
+    /// caller uses the borrowed-slice API.
+    ///
+    /// THE BUG THIS PINS. `record` originally branched on `self.upload_path`, so a
+    /// `WriteTexture` node returned early and never recorded the
+    /// `copy_buffer_to_texture` — while `upload_frame` had faithfully filled the
+    /// staging buffer. The result is a BLACK frame with no error, no warning and no
+    /// failing assertion anywhere else in the suite, because every other test
+    /// exercises one API or the other but never a node that serves both. The UI
+    /// (`ui/src/app.rs`) and the export renderer both take the borrowed path, so on
+    /// a 1080p timeline — where `Auto` selects `WriteTexture` — this would have been
+    /// every preview frame.
+    #[test]
+    fn a_write_texture_node_still_serves_the_borrowed_slice_api() {
+        use crate::render::nodes::yuv_upload::UploadPath;
+
+        let Ok(device) = pollster::block_on(GpuDevice::new_headless()) else {
+            eprintln!("SKIP: no GPU on this machine");
+            return;
+        };
+
+        let (w, h) = (512u32, 64u32);
+        let src = nv12_pattern(w, h);
+        let mut node = YuvUploadNode::new_with_layout(
+            &device,
+            0,
+            w,
+            h,
+            ResourceId(2),
+            ResourceId(3),
+            FrameLayout::NV12,
+        );
+        node.set_upload_path(UploadPath::WriteTexture);
+
+        // The borrowed API, on a node configured for the deferred path.
+        node.upload_frame(&src, true, w, h);
+        let luma = read_luma(&device, &node, w, h);
+        for row in 0..h as usize {
+            let lo = row * w as usize;
+            assert_eq!(
+                &luma[lo..lo + w as usize],
+                &src[lo..lo + w as usize],
+                "row {row} is wrong — a write_texture-configured node dropped a \
+                 staging upload"
+            );
+        }
+
+        // And planar chroma, which `upload_frame_shared` must also route to staging
+        // rather than handing to `write_texture_planes`.
+        let mut planar = YuvUploadNode::new_with_layout(
+            &device,
+            0,
+            w,
+            h,
+            ResourceId(2),
+            ResourceId(3),
+            FrameLayout::YUV420P8,
+        );
+        planar.set_upload_path(UploadPath::WriteTexture);
+        planar.upload_frame_shared(std::sync::Arc::new(src.clone()), false, w, h);
+        let planar_luma = read_luma(&device, &planar, w, h);
+        assert_eq!(
+            &planar_luma[..w as usize],
+            &src[..w as usize],
+            "planar input must fall back to the staging path and still upload"
+        );
+    }
+
+    /// A later borrowed upload must supersede an earlier deferred one.
+    ///
+    /// The mirror of the test above: with a stale `pending_frame` left in place,
+    /// `record` would re-upload the OLD pixels and silently discard the new ones —
+    /// a one-frame-stale picture, which looks like a sync bug rather than an upload
+    /// bug and would be hunted in the wrong module.
+    #[test]
+    fn a_borrowed_upload_supersedes_a_pending_deferred_one() {
+        use crate::render::nodes::yuv_upload::UploadPath;
+
+        let Ok(device) = pollster::block_on(GpuDevice::new_headless()) else {
+            eprintln!("SKIP: no GPU on this machine");
+            return;
+        };
+
+        let (w, h) = (512u32, 64u32);
+        let first = std::sync::Arc::new(nv12_pattern(w, h));
+        // A visibly different second frame: every luma sample inverted.
+        let second: Vec<u8> = first.iter().map(|b| 255 - b).collect();
+
+        let mut node = YuvUploadNode::new_with_layout(
+            &device,
+            0,
+            w,
+            h,
+            ResourceId(2),
+            ResourceId(3),
+            FrameLayout::NV12,
+        );
+        node.set_upload_path(UploadPath::WriteTexture);
+
+        node.upload_frame_shared(std::sync::Arc::clone(&first), true, w, h);
+        node.upload_frame(&second, true, w, h);
+
+        let luma = read_luma(&device, &node, w, h);
+        assert_eq!(
+            &luma[..w as usize],
+            &second[..w as usize],
+            "the most recent upload must be the one that reaches the texture"
+        );
+        assert_ne!(
+            &luma[..w as usize],
+            &first[..w as usize],
+            "fixture is wrong: the two frames must differ for this to test anything"
+        );
+    }
 }
