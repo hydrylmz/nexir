@@ -34,9 +34,14 @@
 // `SystemMetrics` field. Do not fill one in from arithmetic.
 // ─────────────────────────────────────────────────────────────────────────────
 
+use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use nexir::bench_media::{self, MediaClass};
 use nexir::colour::lut_parser::Lut3D;
+use nexir::io::decoder::Decoder;
+use nexir::io::demuxer::Demuxer;
 use nexir::export::job::{
     AudioCodec, Container, CpuPreset, ExportJob, VideoCodec, VideoQuality,
 };
@@ -63,7 +68,8 @@ use nexir::render::shader::registry::ShaderRegistry;
 use nexir::timeline::ids::SourceId;
 use nexir::timeline::rational::Rational;
 use nexir::timeline::source::{
-    ColorInfo, ColorPrimaries, ColorRange, MatrixCoefficients, TransferFunction,
+    ColorInfo, ColorPrimaries, ColorRange, DecodedFrameMeta, FrameLayout, MatrixCoefficients,
+    TransferFunction,
 };
 use nexir::timeline::store::ClipKind;
 use nexir::timeline::transform::ClipTransform;
@@ -290,9 +296,22 @@ const DEFAULT_REPEATS: usize = 3;
 /// One measured run's headline figures.
 struct RunReading {
     fps: f64,
+    /// Mean frame interval over the WHOLE run, including the pipeline fill — the
+    /// figure that must agree with `fps`, since both cover the same seconds.
     lat_avg: f64,
+    /// Percentiles over the STEADY-STATE intervals, i.e. after the pipeline has
+    /// filled.
+    ///
+    /// Read off `steady_latency_stats` rather than the whole-run series because a
+    /// 90-frame run has ~90 intervals, so the P99 index lands on the largest
+    /// sample — and at 4K the largest sample is the 67-91 ms pipeline fill. The
+    /// 54.6 ms "latency P99" this plan opened with was that: the first frame
+    /// waiting for a cold pipeline, reported as a frame arriving late.
     lat_p95: f64,
     lat_p99: f64,
+    /// The pipeline-fill interval itself, printed beside the percentiles so it is
+    /// separated rather than hidden.
+    fill: f64,
 }
 
 /// Every reading for one benchmark, plus what workload produced them.
@@ -325,8 +344,23 @@ fn median(values: impl Iterator<Item = f64>) -> f64 {
 /// The export job an NVENC session is opened against: H.264, BT.709 limited
 /// 8-bit, at the benchmark's own canvas size and frame rate.
 fn nvenc_job(config: &BenchmarkConfig) -> ExportJob {
+    nvenc_job_for(
+        config.canvas_w,
+        config.canvas_h,
+        config.target_fps,
+        config.frame_count,
+    )
+}
+
+/// The same job, from bare dimensions.
+///
+/// Split out because the real-media profile (`--media`) needs one too and has no
+/// [`BenchmarkConfig`] — its geometry comes from the fixture. One constructor so
+/// the two profiles cannot drift into opening sessions with different settings and
+/// then having their NVENC figures compared.
+fn nvenc_job_for(width: u32, height: u32, target_fps: f64, frame_count: usize) -> ExportJob {
     let tb = Rational::TIMEBASE_90K;
-    let fps = Rational::new(config.target_fps.round() as i64, 1);
+    let fps = Rational::new(target_fps.round() as i64, 1);
     let frame_dur = tb.den / fps.num;
     ExportJob {
         // Nothing is muxed here — `EncodeInterop` never opens the file — but
@@ -338,9 +372,9 @@ fn nvenc_job(config: &BenchmarkConfig) -> ExportJob {
         quality: VideoQuality::Crf(23),
         audio_bitrate: 128_000,
         pts_in: 0,
-        pts_out: frame_dur * config.frame_count as i64,
-        width: config.canvas_w,
-        height: config.canvas_h,
+        pts_out: frame_dur * frame_count as i64,
+        width,
+        height,
         frame_rate: fps,
         project_tb: tb,
         render_threads: 1,
@@ -510,6 +544,49 @@ fn retire_frame(
     }
 
     session.push_frame(profile);
+}
+
+/// Print what the graph's transient texture pool did over a run.
+///
+/// Printed because a pool that evicts is allocating a canvas-sized texture per
+/// eviction per frame — 66 MB at 4K — inside the frame's own recording, and
+/// nothing else in a report would show it. Counted by the pool itself, not
+/// inferred from timings.
+///
+/// Shared by both profiles: the real-media path (`--media`) compiles a DIFFERENT
+/// graph shape from the synthetic benchmarks, so it is exactly the caller whose
+/// `peak bucket` reading might disagree with `POOL_BUCKET_CAPACITY` (AGENTS.md
+/// gotcha 14). A second copy of this print that drifted from the first is how one
+/// profile keeps warning and the other stops.
+fn print_pool_stats(pool: nexir::render::resource::PoolStats) {
+    println!(
+        "    Texture pool: {} hit / {} miss ({}), {} evicted, {} bucket(s), {} pooled, \
+         peak bucket {}/{}",
+        pool.hits,
+        pool.misses,
+        pool.miss_rate()
+            .map(|r| format!("{:.1}% miss", r * 100.0))
+            .unwrap_or_else(|| "n/a".into()),
+        pool.evicted,
+        pool.buckets,
+        pool.pooled,
+        // The measured high-water mark of one bucket, against the cap. This is the
+        // pair that decides whether the cap is right — a peak equal to the cap
+        // means the real peak is unknown and at least this, which is what
+        // `evicted > 0` then reports.
+        pool.peak_bucket,
+        nexir::render::resource::POOL_BUCKET_CAPACITY,
+    );
+    if pool.evicted > 0 {
+        // Loud, because it is a per-frame allocation with no other symptom. The
+        // measured one alternated the 4K frame interval 17.6/25.4 ms.
+        println!(
+            "    WARNING: the pool evicted {} texture(s) — its per-key cap is below \
+             this graph's\n    simultaneous peak, so those are re-allocated every \
+             frame (66 MB each at 4K).",
+            pool.evicted
+        );
+    }
 }
 
 fn run_benchmark(
@@ -936,7 +1013,27 @@ fn run_benchmark(
     // never one still sitting in `inflight` — the same reasoning as
     // `src/export/renderer.rs:864-869`, which this loop deliberately mirrors
     // rather than reinventing.
-    let gpu_lookahead = pipeline_depth.saturating_sub(2).max(1);
+    //
+    // `NEXIR_GPU_LOOKAHEAD` lowers it, and only lowers it: 1 is a serial pipeline.
+    // That exists because the 4K row's intervals alternate (17.6 / 25.4 ms
+    // measured), and the two candidate explanations — a device property vs. an
+    // artefact of how two in-flight frames' uploads interleave on the queue — are
+    // told apart by running the same code with the pipeline collapsed. Clamped from
+    // above rather than replacing the derivation, because exceeding the encoder's
+    // slot count is the one thing `reclaim_slot` exists to prevent.
+    let derived_lookahead = pipeline_depth.saturating_sub(2).max(1);
+    let gpu_lookahead = std::env::var("NEXIR_GPU_LOOKAHEAD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .map(|n| n.min(derived_lookahead))
+        .unwrap_or(derived_lookahead);
+    if gpu_lookahead != derived_lookahead {
+        println!(
+            "    Pipeline: {gpu_lookahead} frame(s) outstanding (overridden from \
+             {derived_lookahead})"
+        );
+    }
 
     // ── GPU timing ────────────────────────────────────────────────────────────
     // One timer per in-flight frame, NOT one shared timer.
@@ -1032,6 +1129,12 @@ fn run_benchmark(
     // mean latency on a run delivering a frame every 21.1 ms. The two must agree,
     // because they are measuring the same seconds.
     let mut last_retire: Option<std::time::Instant> = Some(std::time::Instant::now());
+
+    // CPU utilisation and RSS are read from the OS across the measured loop only,
+    // never from arithmetic over the stage timings (AGENTS.md gotcha 9). Started
+    // here rather than before the warm-up so the interval it divides by is the
+    // same interval the FPS and latency rows cover.
+    let cpu_sampler = nexir::profiling::sysinfo::CpuSampler::start();
 
     // Closing GPU tick of the previously retired frame's graph, for the
     // `GpuTransfer` span. Valid to carry across frames because every timer draws
@@ -1281,14 +1384,34 @@ fn run_benchmark(
         bitstream_bytes += tail.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
     }
 
+    // ── What the texture pool did ─────────────────────────────────────────────
+    print_pool_stats(graph.pool_stats());
+
+    // NVML, read once here rather than per frame: the driver samples utilisation
+    // over its own window (200 ms on this card, per nvchk/nvml_probe.c), so polling
+    // it per frame would return the same window repeatedly and cost a driver call
+    // per frame for it. Taken before the loop's textures are dropped, so the VRAM
+    // figure is one taken while this workload was resident.
+    //
+    // `unwrap_or_default` because every field of `GpuMetrics` is already `Option`:
+    // "no nvml.dll on this machine" and "the driver declined this query" both end
+    // as `None`, which the report prints as `n/a`. Never a zero row.
+    let gpu = nexir::profiling::ffi::nvml::read_device_0().unwrap_or_default();
+
     session.update_system_metrics(SystemMetrics {
-        // Unmeasured: these need NVML, `cuMemGetInfo`, and an OS RSS query
-        // respectively. Left as None so the report says so.
-        gpu_utilization: None,
-        cpu_utilization: None,
-        nvenc_utilization: None,
-        vram_used_bytes: None,
-        ram_used_bytes: None,
+        // Measured from OS queries over the timed loop — `GetProcessTimes` and
+        // `GetProcessMemoryInfo`, not arithmetic over the stage timings. `None` on
+        // a platform without the query, which prints `n/a`.
+        cpu_utilization: cpu_sampler.utilisation(),
+        ram_used_bytes: nexir::profiling::sysinfo::process_rss_bytes(),
+        // Measured from NVML, read at the end of the timed loop. Instantaneous by
+        // nature — NVML reports a sampling window, not an average over our run — so
+        // it is a reading taken while the workload was still resident, not a
+        // characterisation of the whole run, and the report labels the row plainly.
+        // `None` on a machine without `nvml.dll`, which prints `n/a` rather than 0.
+        gpu_utilization: gpu.gpu_utilization,
+        nvenc_utilization: gpu.encoder_utilization,
+        vram_used_bytes: gpu.vram_used_bytes,
         // Measured/counted.
         allocated_gpu_bytes: Some(allocated_gpu_bytes),
         gpu_upload_bytes: Some(upload_bytes_per_frame * config.frame_count as u64),
@@ -1318,6 +1441,737 @@ fn run_benchmark(
     }
 
     Ok(session)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TASK F1b — THE REAL-MEDIA EXECUTION PATH (`bench --media`)
+//
+// Every figure in the six benchmarks above was measured on `make_nv12`'s eight
+// vertical bars with a rigid horizontal pan — the easiest motion a motion
+// estimator can face, with no grain and no coded frames at all. Until this path
+// runs, "4K at 56.8 FPS" means "4K at 56.8 FPS on synthetic bars".
+//
+// So this profile drives the SAME graph and the SAME upload/NVENC machinery from
+// real H.264 files (`bench_media::MEDIA_CLASSES`, generated once with the ffmpeg
+// binary), and reports four separately-measured rates per class:
+//
+//   decode      demux + decode only, nothing else running
+//   render      upload + graph, fed from frames this decoder produced
+//   encode      the same plus a real NVENC session
+//   end-to-end  all of it in one loop, which is what a user experiences
+//
+// The four are measured in four passes rather than derived from one another: the
+// end-to-end rate is NOT `1/(1/decode + 1/render)`, because the passes overlap
+// differently, and printing a computed figure next to measured ones is exactly
+// what gotcha 9 forbids.
+//
+// A missing `ffmpeg`, an unencodable class, or absent NVENC is a printed skip
+// with its reason. `NEXIR_REQUIRE_MEDIA=1` turns a skip into a non-zero exit.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How many decoded frames are kept in RAM to feed the render and encode passes.
+///
+/// Small on purpose: a 2-second 4K60 class is 120 frames and one 4K NV12 frame is
+/// 12.4 MB, so caching the clip would be 1.5 GB of host RAM and the measurement
+/// would be of the allocator. Eight real frames cycled is the same shape as
+/// `PATTERN_FRAMES` in the synthetic path — the difference this profile exists to
+/// make is that these eight came out of a decoder.
+const MEDIA_CACHE_FRAMES: usize = 8;
+
+/// How many frames the render/encode/end-to-end passes measure per class.
+///
+/// Enough that the pipeline-fill interval is a small share of the run (gotcha 15)
+/// without making a five-class sweep take minutes.
+const MEDIA_PASS_FRAMES: usize = 90;
+
+/// Real decoded frames, plus what the decoder said they are.
+///
+/// `layout`/`color` come from the DecodedFrame rather than from the container, so
+/// the upload node and `YuvToRgbNode` are built from what the decoder actually
+/// wrote — the same rule `src/io/io_layer.rs` follows, and the reason gotcha 11
+/// exists.
+struct DecodedCache {
+    frames: Vec<Arc<Vec<u8>>>,
+    meta: DecodedFrameMeta,
+    width: u32,
+    height: u32,
+}
+
+/// What one pass measured. `frames / elapsed` and nothing else.
+struct PassReading {
+    frames: usize,
+    elapsed: Duration,
+}
+
+impl PassReading {
+    fn fps(&self) -> Option<f64> {
+        let secs = self.elapsed.as_secs_f64();
+        if self.frames == 0 || secs <= 0.0 {
+            // Zero frames is not zero FPS. Gotcha 9's rule, applied to a rate.
+            None
+        } else {
+            Some(self.frames as f64 / secs)
+        }
+    }
+}
+
+/// Decode `path` from the start, timing the decode and keeping the first few
+/// frames.
+///
+/// Hardware decode is left ENABLED (`Decoder::open(.., true)`) because that is
+/// what `IoLayer` does in production: on this machine NVDEC is selected and the
+/// frame is then transferred to host memory, which is precisely the CPU
+/// round-trip Task G2 is about. Forcing `open_sw` here would report a cost no
+/// user pays.
+fn media_decode_pass(path: &Path, max_frames: usize) -> Result<(PassReading, DecodedCache), String> {
+    let mut demuxer = Demuxer::open(path).map_err(|e| format!("Demuxer::open failed: {e:?}"))?;
+    let stream = demuxer
+        .video_stream
+        .clone()
+        .ok_or_else(|| "the container reports no video stream".to_string())?;
+    let cw = stream.width.ok_or("the stream has no width")? as usize;
+    let ch = stream.height.ok_or("the stream has no height")? as usize;
+    let mut decoder = Decoder::open(&stream, stream.codecpar, true)
+        .map_err(|e| format!("Decoder::open failed: {e:?}"))?;
+
+    // Room for 4:4:4 16-bit, so no decoder choice can overflow it.
+    let mut buf = vec![0u8; cw * ch * 6 + 256];
+    let mut cache: Vec<Arc<Vec<u8>>> = Vec::with_capacity(MEDIA_CACHE_FRAMES);
+    let mut last: Option<(DecodedFrameMeta, u32, u32)> = None;
+    let mut decoded = 0usize;
+
+    // Accumulated per-call, so the frame COPY into the cache below is excluded:
+    // that copy exists for the later passes and charging it to decode would
+    // overstate the decoder's cost on exactly the first eight frames.
+    let mut decode_time = Duration::ZERO;
+
+    while decoded < max_frames {
+        let pkt = match demuxer.next_video_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            Err(e) => return Err(format!("next_video_packet failed: {e:?}")),
+        };
+        let t = Instant::now();
+        let got = decoder.decode_into(&pkt, &mut buf, None);
+        let dt = t.elapsed();
+        match got {
+            Ok(Some(frame)) => {
+                decode_time += dt;
+                decoded += 1;
+                let plane_bytes = frame_bytes_for(frame.meta.layout, frame.width, frame.height);
+                if cache.len() < MEDIA_CACHE_FRAMES && plane_bytes <= buf.len() {
+                    cache.push(Arc::new(buf[..plane_bytes].to_vec()));
+                }
+                last = Some((frame.meta, frame.width, frame.height));
+            }
+            // A packet the decoder swallowed without emitting is real work, but not
+            // a frame: timing it into a per-frame figure would charge a frame that
+            // never arrived. Counted nowhere, which is why the reported rate is
+            // frames ÷ decode time and not packets ÷ anything.
+            Ok(None) => decode_time += dt,
+            Err(e) => return Err(format!("decode_into failed: {e:?}")),
+        }
+    }
+    // Frame-threading holds back roughly one frame per core, so a short clip can
+    // yield almost nothing without this — see `media_compat.rs`.
+    while decoded < max_frames {
+        let t = Instant::now();
+        let got = decoder.drain_into(&mut buf);
+        let dt = t.elapsed();
+        match got {
+            Ok(Some(frame)) => {
+                decode_time += dt;
+                decoded += 1;
+                let plane_bytes = frame_bytes_for(frame.meta.layout, frame.width, frame.height);
+                if cache.len() < MEDIA_CACHE_FRAMES && plane_bytes <= buf.len() {
+                    cache.push(Arc::new(buf[..plane_bytes].to_vec()));
+                }
+                last = Some((frame.meta, frame.width, frame.height));
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("drain_into failed: {e:?}")),
+        }
+    }
+
+    let (meta, w, h) = last.ok_or("the file produced no decodable frames")?;
+    if cache.is_empty() {
+        return Err("no frame could be cached for the render pass".to_string());
+    }
+    Ok((
+        PassReading {
+            frames: decoded,
+            elapsed: decode_time,
+        },
+        DecodedCache {
+            frames: cache,
+            meta,
+            width: w,
+            height: h,
+        },
+    ))
+}
+
+/// Bytes one decoded frame occupies for a given layout — luma plus both chroma
+/// planes at 4:2:0.
+///
+/// Computed from the layout the DECODER reported rather than assumed: at 10-bit
+/// this is twice the 8-bit figure, and slicing the staging buffer to the wrong
+/// length would hand `YuvUploadNode` a short frame, which it reports as a warning
+/// and then skips a plane over.
+fn frame_bytes_for(layout: FrameLayout, width: u32, height: u32) -> usize {
+    let bpp = layout.bytes_per_sample();
+    let luma = width as usize * height as usize * bpp;
+    // 4:2:0 chroma is half the luma samples in total, whether planar (U + V) or
+    // semi-planar (one interleaved plane).
+    luma + luma / 2
+}
+
+/// Build the one-layer graph the media passes render through: upload → YUV→RGB →
+/// composite into `FINAL_COLOR`.
+///
+/// Deliberately the SIMPLE shape rather than the Heavy one. The question this
+/// profile answers is what real coded frames cost relative to synthetic bars, and
+/// the effect chain is identical either way — it never sees the source's
+/// provenance. Adding four LUT passes here would make each class's number a mix of
+/// two changes at once.
+///
+/// The upload node and the converter are both built from `cache.meta`, i.e. from
+/// what the decoder reported — not from the container and not from a constant.
+/// That is the gotcha 11 rule: a fixture whose metadata is dropped somewhere would
+/// otherwise still render plausibly.
+fn media_graph(
+    device: &Arc<GpuDevice>,
+    shaders: &ShaderRegistry,
+    compute: &Arc<ComputePipelineCache>,
+    cache: &DecodedCache,
+) -> Result<(nexir::render::graph::CompiledGraph, usize, FrameState), String> {
+    let mut compiler = RenderGraphCompiler::new();
+    let mut id_counter = 2u32;
+    let y = ResourceId::next(&mut id_counter);
+    let uv = ResourceId::next(&mut id_counter);
+    let rgba = ResourceId::next(&mut id_counter);
+
+    let upload_idx = compiler.add_node(Box::new(YuvUploadNode::new_with_layout(
+        device,
+        0,
+        cache.width,
+        cache.height,
+        y,
+        uv,
+        cache.meta.layout,
+    )));
+    compiler.add_node(Box::new(YuvToRgbNode::new_with_layout(
+        device,
+        shaders,
+        compute,
+        y,
+        uv,
+        rgba,
+        cache.width,
+        cache.height,
+        cache.meta.color,
+        cache.meta.layout.semi_planar,
+    )));
+    let mut composite = CompositeNode::new(
+        device,
+        shaders,
+        ResourceId::FINAL_COLOR,
+        1,
+        wgpu::TextureFormat::Rgba16Float,
+    );
+    composite.input_textures.push(rgba);
+    compiler.add_node(Box::new(composite));
+
+    let graph = compiler
+        .compile(cache.width, cache.height)
+        .map_err(|e| format!("graph compile failed: {e:?}"))?;
+
+    let frame_state = FrameState {
+        pts: 0,
+        canvas_width: cache.width,
+        canvas_height: cache.height,
+        clips: vec![ClipRenderEntry {
+            source_id: SourceId::new(0),
+            texture_slot: 0,
+            layer_order: 0,
+            clip_width: cache.width,
+            clip_height: cache.height,
+            transform: ClipTransform::identity(),
+            opacity: 1.0,
+            blend_mode: nexir::timeline::transform::BlendMode::Normal,
+            crop: nexir::timeline::transform::CropRect::full(),
+            corner_pin: nexir::timeline::transform::CornerPin::identity(),
+            matte_mode: nexir::timeline::transform::MatteMode::None,
+            effects: Default::default(),
+            // From the decoder, not a literal — see the doc comment.
+            frame_meta: cache.meta,
+            kind: ClipKind::Video,
+        }],
+        test_textures: vec![],
+    };
+    Ok((graph, upload_idx, frame_state))
+}
+
+/// Push one cached frame into the upload node.
+///
+/// `upload_frame_shared` rather than `upload_frame`, for the same reason the
+/// synthetic loop uses it: the node may have resolved to `UploadPath::WriteTexture`
+/// (1080p classes do — 1920 pads to 2048), and that path needs the bytes to
+/// survive until `record`. On the staging path it is exactly `upload_frame`.
+fn media_push_frame(
+    graph: &mut nexir::render::graph::CompiledGraph,
+    upload_idx: usize,
+    cache: &DecodedCache,
+    frame: usize,
+) {
+    if let Some(u) = graph.nodes_mut()[upload_idx]
+        .as_any_mut()
+        .and_then(|n| n.downcast_mut::<YuvUploadNode>())
+    {
+        u.upload_frame_shared(
+            Arc::clone(&cache.frames[frame % cache.frames.len()]),
+            cache.meta.layout.semi_planar,
+            cache.width,
+            cache.height,
+        );
+    }
+}
+
+/// Upload + graph, from real decoded frames, with no decoder and no encoder in the
+/// loop.
+///
+/// Serial (`poll(Wait)` per frame) on purpose: this pass exists to isolate the GPU
+/// cost of a real frame, and the six benchmarks above already report the pipelined
+/// figure. Keeping it serial also means its FPS is comparable across classes
+/// without the pipeline depth as a hidden variable.
+fn media_render_pass(
+    device: &Arc<GpuDevice>,
+    graph: &mut nexir::render::graph::CompiledGraph,
+    upload_idx: usize,
+    cache: &DecodedCache,
+    frame_state: &FrameState,
+    frames: usize,
+) -> PassReading {
+    // Untimed warm-up: first-frame pipeline and bind-group creation is not a
+    // per-frame cost, and at 4K it is tens of milliseconds.
+    for f in 0..WARMUP_MIN_FRAMES {
+        media_push_frame(graph, upload_idx, cache, f);
+        let mut enc = device.begin_frame();
+        graph.execute(&mut enc, device, frame_state);
+        let sid = device.submit(enc);
+        device
+            .device
+            .poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+    }
+
+    let start = Instant::now();
+    for f in 0..frames {
+        media_push_frame(graph, upload_idx, cache, f);
+        let mut enc = device.begin_frame();
+        graph.execute(&mut enc, device, frame_state);
+        let sid = device.submit(enc);
+        device
+            .device
+            .poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+    }
+    PassReading {
+        frames,
+        elapsed: start.elapsed(),
+    }
+}
+
+/// Upload + graph + `Nv12EncodeNode` into a real NVENC session.
+///
+/// `Err` is a per-class skip with its reason — a machine without CUDA interop or
+/// NVENC must print that rather than a zero row.
+///
+/// The bitstream size is returned alongside the rate because it is the one figure
+/// that says whether the encoder was given real work: the whole point of this
+/// profile is that grain and non-translational motion cost bits, and the synthetic
+/// bars' bitstream is a floor.
+#[allow(clippy::too_many_arguments)]
+fn media_encode_pass(
+    device: &Arc<GpuDevice>,
+    graph: &mut nexir::render::graph::CompiledGraph,
+    upload_idx: usize,
+    cache: &DecodedCache,
+    frame_state: &FrameState,
+    frames: usize,
+    target_fps: f64,
+) -> Result<(PassReading, usize, u64), String> {
+    let capability = InteropCapability::probe(device);
+    if !capability.is_available() {
+        return Err(format!(
+            "CUDA interop unavailable (transport={:?}), so no NVENC session can be \
+             opened",
+            capability.transport
+        ));
+    }
+    let cuda_ctx = Arc::new(
+        CudaContext::new(&capability).map_err(|e| format!("CudaContext::new failed: {e:?}"))?,
+    );
+    let job = nvenc_job_for(cache.width, cache.height, target_fps, frames);
+    job.validate()
+        .map_err(|e| format!("the bench's own ExportJob is invalid: {e:?}"))?;
+    let mut interop = EncodeInterop::open(
+        Arc::clone(&cuda_ctx),
+        device,
+        &job,
+        capability.transport,
+        job.video_codec,
+    )
+    .map_err(|e| format!("EncodeInterop::open failed: {e:?}"))?;
+    let nv12 = Nv12EncodeNode::new(device, job.output_color, job.width, job.height);
+
+    let slots = interop.slot_count();
+    let mut packets = 0usize;
+    let mut bitstream = 0u64;
+
+    let mut run = |frames: usize, timed: bool| -> Result<Duration, String> {
+        let start = Instant::now();
+        for f in 0..frames {
+            let slot = f % slots;
+            let reclaimed = interop
+                .reclaim_slot(slot)
+                .map_err(|e| format!("reclaim_slot failed: {e:?}"))?;
+            if timed {
+                packets += reclaimed.len();
+                bitstream += reclaimed.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
+            }
+            media_push_frame(graph, upload_idx, cache, f);
+            let mut enc = device.begin_frame();
+            // The pitch comes from the encoder and is never recomputed here: the
+            // chroma plane sits at pitch*height and a disagreement is a silent hue
+            // shift (gotcha 6).
+            let pitch = interop.pitch();
+            let nv12_buffer = interop.nv12_buffer_for_slot(slot);
+            graph.execute_with_callback(&mut enc, device, frame_state, |e, ctx| {
+                let view = ctx
+                    .get(ResourceId::FINAL_COLOR)
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                nv12.record(e, device, &view, nv12_buffer, pitch);
+            });
+            let sid = device.submit(enc);
+            // NVENC reads the NV12 buffer through CUDA, so the conversion must have
+            // completed before the picture is submitted. Two APIs sharing no
+            // timeline — a real ordering requirement, not a benchmark artefact.
+            device
+                .device
+                .poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+            let out = interop
+                .encode_frame(job.frame_pts(f), slot)
+                .map_err(|e| format!("encode_frame failed: {e:?}"))?;
+            if timed {
+                packets += out.len();
+                bitstream += out.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
+            }
+        }
+        Ok(start.elapsed())
+    };
+
+    run(WARMUP_MIN_FRAMES, false)?;
+    let elapsed = run(frames, true)?;
+
+    let tail = interop
+        .flush()
+        .map_err(|e| format!("NVENC flush failed: {e:?}"))?;
+    packets += tail.len();
+    bitstream += tail.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
+
+    Ok((PassReading { frames, elapsed }, packets, bitstream))
+}
+
+/// Demux → decode → upload → graph, in ONE loop, which is what a user watching
+/// playback experiences.
+///
+/// Measured rather than derived. The three passes above each isolate a stage, and
+/// the temptation is to combine them arithmetically — but decode is CPU work and
+/// the graph is GPU work, so they overlap by an amount only a run can report. A
+/// computed end-to-end figure would be an estimate printed beside measurements.
+///
+/// The decoder is re-opened from the start of the file, so this pass decodes the
+/// same coded frames the decode pass did rather than continuing from wherever it
+/// stopped.
+fn media_end_to_end_pass(
+    path: &Path,
+    device: &Arc<GpuDevice>,
+    graph: &mut nexir::render::graph::CompiledGraph,
+    upload_idx: usize,
+    cache: &DecodedCache,
+    frame_state: &FrameState,
+    frames: usize,
+) -> Result<PassReading, String> {
+    let mut demuxer = Demuxer::open(path).map_err(|e| format!("Demuxer::open failed: {e:?}"))?;
+    let stream = demuxer
+        .video_stream
+        .clone()
+        .ok_or_else(|| "no video stream".to_string())?;
+    let mut decoder = Decoder::open(&stream, stream.codecpar, true)
+        .map_err(|e| format!("Decoder::open failed: {e:?}"))?;
+    let mut buf = vec![0u8; cache.width as usize * cache.height as usize * 6 + 256];
+
+    let plane_bytes = frame_bytes_for(cache.meta.layout, cache.width, cache.height);
+    let mut rendered = 0usize;
+    let start = Instant::now();
+    while rendered < frames {
+        let pkt = match demuxer.next_video_packet() {
+            Ok(Some(p)) => p,
+            // Out of coded frames before the target count: report what was
+            // actually rendered rather than looping the file, which would report a
+            // decode rate for frames that were decoded once.
+            Ok(None) => break,
+            Err(e) => return Err(format!("next_video_packet failed: {e:?}")),
+        };
+        let got = decoder
+            .decode_into(&pkt, &mut buf, None)
+            .map_err(|e| format!("decode_into failed: {e:?}"))?;
+        let Some(frame) = got else { continue };
+        let bytes = frame_bytes_for(frame.meta.layout, frame.width, frame.height).min(plane_bytes);
+
+        // One copy per frame, into an `Arc` the node can hold. This is the cost the
+        // production path pays too — `IoLayer` decodes into a pooled slot and hands
+        // it on — so it belongs inside the timed region rather than outside it.
+        if let Some(u) = graph.nodes_mut()[upload_idx]
+            .as_any_mut()
+            .and_then(|n| n.downcast_mut::<YuvUploadNode>())
+        {
+            u.upload_frame(
+                &buf[..bytes],
+                frame.meta.layout.semi_planar,
+                frame.width.min(cache.width),
+                frame.height.min(cache.height),
+            );
+        }
+        let mut enc = device.begin_frame();
+        graph.execute(&mut enc, device, frame_state);
+        let sid = device.submit(enc);
+        device
+            .device
+            .poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+        rendered += 1;
+    }
+    Ok(PassReading {
+        frames: rendered,
+        elapsed: start.elapsed(),
+    })
+}
+
+/// One class's four measured rates, for the summary table.
+struct MediaReading {
+    label: &'static str,
+    width: u32,
+    height: u32,
+    layout: FrameLayout,
+    decode: Option<f64>,
+    render: Option<f64>,
+    encode: Option<f64>,
+    end_to_end: Option<f64>,
+    /// Bitstream the encoder actually produced, `None` when NVENC was skipped.
+    bitstream_bytes: Option<u64>,
+}
+
+/// Run all four passes for one class.
+fn run_media_class(
+    device: &Arc<GpuDevice>,
+    class: &'static MediaClass,
+    path: &Path,
+) -> Result<MediaReading, String> {
+    let shaders = ShaderRegistry::compile_all(device)
+        .map_err(|e| format!("shader compilation failed: {e:?}"))?;
+    let compute = Arc::new(ComputePipelineCache::new());
+
+    // Decode first: everything below is built from what it reported.
+    let (decode, cache) = media_decode_pass(path, class.frame_count().min(MEDIA_PASS_FRAMES))?;
+    println!(
+        "    Decoded {}x{} {:?} ({} bit{}), {} frame(s) cached for the render passes",
+        cache.width,
+        cache.height,
+        cache.meta.color.matrix,
+        cache.meta.layout.bit_depth,
+        if cache.meta.layout.semi_planar {
+            ", semi-planar"
+        } else {
+            ", planar"
+        },
+        cache.frames.len(),
+    );
+
+    let (mut graph, upload_idx, frame_state) = media_graph(device, &shaders, &compute, &cache)?;
+    let render = media_render_pass(
+        device,
+        &mut graph,
+        upload_idx,
+        &cache,
+        &frame_state,
+        MEDIA_PASS_FRAMES,
+    );
+
+    let encoded = media_encode_pass(
+        device,
+        &mut graph,
+        upload_idx,
+        &cache,
+        &frame_state,
+        MEDIA_PASS_FRAMES,
+        class.fps as f64,
+    );
+    let (encode, bitstream) = match encoded {
+        Ok((reading, packets, bytes)) => {
+            println!(
+                "    NVENC: {} packet(s), {:.2} MB of bitstream from {} frame(s)",
+                packets,
+                bytes as f64 / (1024.0 * 1024.0),
+                reading.frames
+            );
+            if packets == 0 {
+                println!(
+                    "    WARNING: the NVENC session accepted every picture but returned \
+                     no bitstream."
+                );
+            }
+            (reading.fps(), Some(bytes))
+        }
+        Err(why) => {
+            // A printed skip, never a zero row.
+            println!("    NVENC pass SKIPPED: {why}");
+            (None, None)
+        }
+    };
+
+    let end_to_end = media_end_to_end_pass(
+        path,
+        device,
+        &mut graph,
+        upload_idx,
+        &cache,
+        &frame_state,
+        MEDIA_PASS_FRAMES,
+    )?;
+    // The pool's own counters, on a graph shape the six synthetic benchmarks never
+    // compile — which is exactly the reading gotcha 14 says to take rather than
+    // assume.
+    print_pool_stats(graph.pool_stats());
+
+    Ok(MediaReading {
+        label: class.label,
+        width: cache.width,
+        height: cache.height,
+        layout: cache.meta.layout,
+        decode: decode.fps(),
+        render: render.fps(),
+        encode,
+        end_to_end: end_to_end.fps(),
+        bitstream_bytes: bitstream,
+    })
+}
+
+/// The `--media` profile: generate (or reuse) each class's fixture and run it.
+///
+/// Returns whether anything was actually measured, so `main` can honour
+/// `NEXIR_REQUIRE_MEDIA` — a run where every class skipped must not exit 0 with a
+/// clean-looking summary on a machine that is supposed to have the tooling.
+fn run_media_profile(device: &Arc<GpuDevice>) -> bool {
+    println!("========================================================================");
+    println!("REAL-MEDIA PROFILE — coded frames, not synthetic bars");
+    println!("  Each class is decoded with this crate's own demuxer/decoder, then");
+    println!("  rendered through the same upload + graph the six benchmarks use, then");
+    println!("  encoded through a real NVENC session. The four rates are measured in");
+    println!("  four passes; none is computed from the others.");
+    println!("========================================================================\n");
+
+    let ffmpeg = match bench_media::ffmpeg_binary() {
+        Some(p) => p,
+        None => {
+            println!(
+                "SKIPPED: no `ffmpeg` binary on PATH (set NEXIR_FFMPEG to point at one).\n\
+                 The FFmpeg DLLs this crate links against do not imply the CLI is\n\
+                 installed, and the fixtures are generated with the CLI. No class ran.\n"
+            );
+            return false;
+        }
+    };
+    println!(
+        "ffmpeg      : {}\nFixture dir : {}\n",
+        ffmpeg.display(),
+        bench_media::fixture_dir().display()
+    );
+
+    let mut readings: Vec<MediaReading> = Vec::new();
+    let mut skipped: Vec<(&str, String)> = Vec::new();
+
+    for class in bench_media::MEDIA_CLASSES {
+        println!(
+            ">>> {} — {}x{}@{} ({})",
+            class.label, class.width, class.height, class.fps, class.why
+        );
+        let path = match bench_media::ensure_fixture(&ffmpeg, class) {
+            Ok(p) => p,
+            Err(why) => {
+                println!("    SKIPPED: {why}\n");
+                skipped.push((class.label, why));
+                continue;
+            }
+        };
+        match run_media_class(device, class, &path) {
+            Ok(r) => {
+                readings.push(r);
+                println!();
+            }
+            Err(why) => {
+                println!("    SKIPPED: {why}\n");
+                skipped.push((class.label, why));
+            }
+        }
+    }
+
+    if !readings.is_empty() {
+        fn fps(v: Option<f64>) -> String {
+            // `n/a` for a pass that did not run. A skipped NVENC session is not an
+            // encoder that managed 0 FPS.
+            v.map(|x| format!("{x:>8.1}"))
+                .unwrap_or_else(|| format!("{:>8}", "n/a"))
+        }
+        println!("------------------------------------------------------------------------");
+        println!("REAL-MEDIA SUMMARY — FPS, one run per class");
+        println!("  Decode is demux+decode alone; Render is upload+graph from decoded");
+        println!("  frames; Encode adds a real NVENC session; E2E is all of it in one");
+        println!("  loop. E2E is MEASURED, not 1/(1/decode + 1/render) — the stages");
+        println!("  overlap, and by how much is what the pass reports.");
+        println!("  All four passes are serial (one frame in flight), so these are NOT");
+        println!("  comparable to the pipelined figures in the summary above; they are");
+        println!("  comparable to each other and across classes.");
+        println!("------------------------------------------------------------------------");
+        println!(
+            "{:<16} {:>11} {:>8} {:>8} {:>8} {:>8} {:>10}",
+            "Class", "Geometry", "Decode", "Render", "Encode", "E2E", "Bitstream"
+        );
+        for r in &readings {
+            println!(
+                "{:<16} {:>11} {} {} {} {} {:>10}",
+                r.label,
+                format!("{}x{}/{}b", r.width, r.height, r.layout.bit_depth),
+                fps(r.decode),
+                fps(r.render),
+                fps(r.encode),
+                fps(r.end_to_end),
+                r.bitstream_bytes
+                    .map(|b| format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)))
+                    .unwrap_or_else(|| "n/a".into()),
+            );
+        }
+        println!("------------------------------------------------------------------------\n");
+    }
+
+    if !skipped.is_empty() {
+        println!("{} class(es) did NOT run:", skipped.len());
+        for (label, why) in &skipped {
+            println!("  - {label}\n      {why}");
+        }
+        println!();
+    }
+
+    !readings.is_empty()
 }
 
 const BENCHMARKS: &[BenchmarkConfig] = &[
@@ -1402,6 +2256,84 @@ const BENCHMARKS: &[BenchmarkConfig] = &[
     },
 ];
 
+/// How many outlier frames the per-frame dump prints, or `None` when it is off.
+///
+/// `NEXIR_FRAME_DUMP=1` gives the default 8; any other number sets it. The dump
+/// exists for one question — does the frame with the worst latency have the worst
+/// upload? — and that question is settled by looking at the pairing, which a
+/// percentile cannot show. See `profiling::format_frame_dump`.
+fn frame_dump_rows() -> Option<usize> {
+    let raw = std::env::var("NEXIR_FRAME_DUMP").ok()?;
+    match raw.trim() {
+        "" | "0" | "false" | "off" => None,
+        "1" | "true" | "on" => Some(8),
+        n => n.parse::<usize>().ok().filter(|v| *v > 0).or(Some(8)),
+    }
+}
+
+/// Where to write a per-frame CSV of this run, or `None` when not requested.
+///
+/// `NEXIR_FRAME_CSV=path` writes one row per frame: index, latency, every CPU
+/// stage, and the GPU spans. Separate from `NEXIR_FRAME_DUMP` because the two
+/// answer different questions — the dump ranks outliers and prints coefficients,
+/// while the CSV keeps ARRIVAL ORDER, which is the only way a periodic pattern is
+/// visible. A tail that alternates every other frame and a tail that stalls once
+/// have the same distribution and the same correlations; they differ only in
+/// sequence.
+///
+/// A `%d` in the path is replaced by `<benchmark>_<run>`, so a multi-benchmark
+/// multi-repeat invocation does not have every row overwrite the last. Without a
+/// `%d` that is exactly what happens, which is why the placeholder is documented
+/// rather than optional in practice.
+fn frame_csv_path(bench: usize, run: usize) -> Option<std::path::PathBuf> {
+    let raw = std::env::var("NEXIR_FRAME_CSV").ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(
+        raw.replace("%d", &format!("{bench}_{run}")),
+    ))
+}
+
+/// Write the per-frame series in arrival order.
+///
+/// Failure is printed, not swallowed and not fatal: the benchmark's own numbers are
+/// unaffected by a CSV that could not be written, but a silently absent file would
+/// have the reader analysing a stale one from a previous run.
+fn write_frame_csv(path: &std::path::Path, frames: &[FrameProfile]) {
+    use std::io::Write;
+    let mut s = String::from(
+        "frame,latency_ms,cpu_sum_ms,upload_ms,upload_prepare_ms,upload_submit_ms,\
+         composite_ms,gpu_submit_ms,gpu_wait_ms,nvenc_ms,gpu_graph_ms,gpu_transfer_ms\n",
+    );
+    // Empty rather than 0 for anything unmeasured, so a spreadsheet cannot average
+    // a missing GPU tick into the series as a fast frame.
+    fn o(v: Option<f64>) -> String {
+        v.map(|x| format!("{x:.4}")).unwrap_or_default()
+    }
+    for f in frames {
+        s.push_str(&format!(
+            "{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{}\n",
+            f.frame_index,
+            o(f.latency_ms()),
+            f.total_time_ms(),
+            f.stage_time_ms(PipelineStage::Upload),
+            f.stage_time_ms(PipelineStage::UploadPrepare),
+            f.stage_time_ms(PipelineStage::UploadSubmit),
+            f.stage_time_ms(PipelineStage::Composite),
+            f.stage_time_ms(PipelineStage::GpuSubmit),
+            f.stage_time_ms(PipelineStage::GpuWait),
+            f.stage_time_ms(PipelineStage::Nvenc),
+            o(f.gpu_time_ms(PipelineStage::Composite)),
+            o(f.gpu_time_ms(PipelineStage::GpuTransfer)),
+        ));
+    }
+    match std::fs::File::create(path).and_then(|mut fh| fh.write_all(s.as_bytes())) {
+        Ok(()) => println!("    Per-frame CSV: {}", path.display()),
+        Err(e) => println!("    WARNING: could not write {}: {e}", path.display()),
+    }
+}
+
 fn main() {
     println!("\n========================================================================");
     println!("                     NEXIR FRAME-TIMING BENCHMARKS                      ");
@@ -1434,6 +2366,24 @@ fn main() {
     );
 
     let mut skipped = Vec::new();
+    // Whether `--media` was asked for. When it is, the synthetic benchmarks are
+    // skipped: the two profiles share one GPU and one process, and running the
+    // 4K60 rows first would leave the media classes' clocks warmed by them —
+    // exactly the position-dependence `WARMUP_DURATION` documents. Run them in
+    // separate invocations and each is measured from the same starting state.
+    let media_only = std::env::args().any(|a| a == "--media");
+    if media_only {
+        let ran = run_media_profile(&device);
+        if !ran && bench_media::require() {
+            eprintln!(
+                "NEXIR_REQUIRE_MEDIA is set but no media class ran. Every figure the\n\
+                 real-media profile would have reported is absent, so this is a failure\n\
+                 rather than a skip."
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
     // Every benchmark's repeated readings, for the summary table.
     //
     // A Vec of runs per benchmark rather than one figure each, because one reading
@@ -1490,12 +2440,36 @@ fn main() {
                 Ok(session) => {
                     let report = session.generate_report();
                     println!("{}", report.format_table());
+                    // P2.1 step 1: the pairing, not the percentiles.
+                    //
+                    // Behind an env flag because it is per-frame output — 8 rows and
+                    // several coefficients per repeat — and because the question it
+                    // answers ("is the late frame the slow upload?") is asked while
+                    // investigating, not on every run.
+                    if frame_dump_rows().is_some() || frame_csv_path(number, r + 1).is_some() {
+                        let frames = session.frames_snapshot();
+                        if let Some(worst) = frame_dump_rows() {
+                            println!(
+                                "{}",
+                                nexir::profiling::format_frame_dump(&frames, worst)
+                            );
+                        }
+                        if let Some(path) = frame_csv_path(number, r + 1) {
+                            write_frame_csv(&path, &frames);
+                        }
+                    }
                     let lat = report.frame_latency_stats.unwrap_or_default();
+                    // Percentiles from the steady-state series, mean from the
+                    // whole-run one — see `RunReading::lat_p95`. Falling back to the
+                    // whole-run series when there is no steady one (a 1-frame run)
+                    // rather than reporting zeros.
+                    let steady = report.steady_latency_stats.unwrap_or(lat);
                     runs.push(RunReading {
                         fps: report.average_fps,
                         lat_avg: lat.avg_ms,
-                        lat_p95: lat.p95_ms,
-                        lat_p99: lat.p99_ms,
+                        lat_p95: steady.p95_ms,
+                        lat_p99: steady.p99_ms,
+                        fill: report.pipeline_fill_ms.unwrap_or(0.0),
                     });
                 }
                 Err(Skipped(reason)) => {
@@ -1532,17 +2506,22 @@ fn main() {
         // being quoted as if it were repeatable.
         println!("========================================================================");
         println!("SUMMARY — median of {repeats} run(s), with spread");
-        println!("  P95/P99 are frame LATENCY (wall-clock spacing between frames), which is");
-        println!("  the quantity a 60 FPS target is stated in. 60 FPS = 16.67 ms.");
+        println!("  Lat avg is the WHOLE-RUN mean interval (it must agree with FPS; both");
+        println!("  cover the same seconds). P95/P99 are over the STEADY-STATE intervals,");
+        println!("  i.e. after the pipeline fills — the `Fill` column is that first");
+        println!("  interval, separated rather than hidden. A ~90-frame run has ~90");
+        println!("  intervals, so a whole-run P99 lands on the largest sample, and at 4K");
+        println!("  that sample is the fill: reporting it as a frame's latency attributes");
+        println!("  a cold-start cost to steady playback. 60 FPS = 16.67 ms.");
         println!("  FPS spread is (max-min)/median: anything above ~10% means one run's");
         println!("  number is not a result on its own.");
         println!("------------------------------------------------------------------------");
         println!(
-            "{:<40} {:>5} {:>8} {:>8} {:>9} {:>9} {:>9}",
-            "Benchmark", "L:S", "FPS", "spread", "Lat avg", "Lat P95", "Lat P99"
+            "{:<34} {:>5} {:>8} {:>7} {:>9} {:>9} {:>9} {:>9}",
+            "Benchmark", "L:S", "FPS", "spread", "Lat avg", "P95 std", "P99 std", "Fill"
         );
         for s in &summary {
-            let short: String = s.name.chars().take(38).collect();
+            let short: String = s.name.chars().take(32).collect();
             let fps = median(s.runs.iter().map(|r| r.fps));
             let spread = if fps > 0.0 {
                 let lo = s.runs.iter().map(|r| r.fps).fold(f64::MAX, f64::min);
@@ -1552,7 +2531,7 @@ fn main() {
                 0.0
             };
             println!(
-                "{:<40} {:>5} {:>8.1} {:>7.0}% {:>6.2} ms {:>6.2} ms {:>6.2} ms",
+                "{:<34} {:>5} {:>8.1} {:>6.0}% {:>6.2} ms {:>6.2} ms {:>6.2} ms {:>6.2} ms",
                 short,
                 format!("{}:{}", s.layers, s.sources),
                 fps,
@@ -1560,6 +2539,7 @@ fn main() {
                 median(s.runs.iter().map(|r| r.lat_avg)),
                 median(s.runs.iter().map(|r| r.lat_p95)),
                 median(s.runs.iter().map(|r| r.lat_p99)),
+                median(s.runs.iter().map(|r| r.fill)),
             );
         }
         println!("========================================================================\n");
