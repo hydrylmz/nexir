@@ -1089,6 +1089,52 @@ fn run_benchmark(
         warmup_start.elapsed().as_secs_f64()
     );
 
+    // ── Per-node GPU timings (E1b) ────────────────────────────────────────────
+    // Deliberately BEFORE `ProfilingSession::new`, and this placement is
+    // load-bearing.
+    //
+    // `generate_report` divides the frame count by `start_time.elapsed()`, so any
+    // work between the session's creation and the report lands in the throughput
+    // divisor. Running this pass after the drain instead cost benchmark 5 a
+    // measured 41.8 FPS against a 17.55 ms mean interval — i.e. the FPS row was
+    // reporting the extra 30 bracketed frames as if they were part of the run.
+    // The report caught it (`mean latency implies 57.0 FPS but throughput is
+    // 41.8`), which is exactly what gotcha 13's cross-check exists for; the fix is
+    // to keep the session's seconds covering only the measured loop.
+    //
+    // Behind `NEXIR_NODE_TIMINGS` because bracketing every node adds two encoder
+    // commands per node per frame, so a run with it on is not the run the headline
+    // figures come from. Its frames double as extra warm-up, which is harmless —
+    // they are untimed either way.
+    //
+    // This is for understanding, not for the 4K60 target: the whole graph is
+    // ~7.4 ms measured against a 16.7 ms budget, so even a free graph leaves the
+    // ~10 ms transfer row. It exists so Phase H can be scoped from data.
+    if let Some(timing_frames) = node_timing_frames() {
+        let uploads: Vec<(usize, usize)> = uploaders
+            .iter()
+            .map(|u| (u.node_idx, u.source_idx))
+            .collect();
+        let frames_ref = &nv12_frames;
+        print_node_timings(device, &mut graph, &frame_state, timing_frames, |g, f| {
+            for &(node_idx, source_idx) in &uploads {
+                if let Some(u) = g.nodes_mut()[node_idx]
+                    .as_any_mut()
+                    .and_then(|n| n.downcast_mut::<YuvUploadNode>())
+                {
+                    u.upload_frame_shared(
+                        std::sync::Arc::clone(
+                            &frames_ref[(f + source_phase_offset(source_idx)) % PATTERN_FRAMES],
+                        ),
+                        true,
+                        config.canvas_w,
+                        config.canvas_h,
+                    );
+                }
+            }
+        });
+    }
+
     // ── Measurement loop ──────────────────────────────────────────────────────
     //
     // FRAMES IN FLIGHT (P0.2/P0.5). The loop is split into a submit half and a
@@ -1385,6 +1431,9 @@ fn run_benchmark(
     }
 
     // ── What the texture pool did ─────────────────────────────────────────────
+    // Counted after the node-timing pass as well as the measured loop, when both
+    // ran: the pool is per-graph and its high-water mark is what gotcha 14's cap
+    // is read off, so it must cover every frame this graph executed.
     print_pool_stats(graph.pool_stats());
 
     // NVML, read once here rather than per frame: the driver samples utilisation
@@ -2048,6 +2097,15 @@ fn run_media_class(
         &frame_state,
         MEDIA_PASS_FRAMES,
     )?;
+    // Per-node timings on a real-media graph too, when asked for: the shape here
+    // is one layer rather than four, so the per-pass figures are directly
+    // comparable with the Heavy graph's without its multiplicity.
+    if let Some(timing_frames) = node_timing_frames() {
+        print_node_timings(device, &mut graph, &frame_state, timing_frames, |g, f| {
+            media_push_frame(g, upload_idx, &cache, f)
+        });
+    }
+
     // The pool's own counters, on a graph shape the six synthetic benchmarks never
     // compile — which is exactly the reading gotcha 14 says to take rather than
     // assume.
@@ -2172,6 +2230,205 @@ fn run_media_profile(device: &Arc<GpuDevice>) -> bool {
     }
 
     !readings.is_empty()
+}
+
+/// How many frames the per-node GPU timing pass measures, or `None` when it is
+/// off.
+///
+/// `NEXIR_NODE_TIMINGS=1` gives the default 30; any other number sets it.
+///
+/// Behind a flag, and run AFTER the measured loop, because it changes what is
+/// being measured: `execute_timed` writes two timestamps around every node, so a
+/// 21-node graph gets 42 extra encoder commands per frame and a resolve. Folding
+/// it into the main loop would mean the headline FPS came from a run nobody
+/// reproduces without the flag.
+fn node_timing_frames() -> Option<usize> {
+    let raw = std::env::var("NEXIR_NODE_TIMINGS").ok()?;
+    match raw.trim() {
+        "" | "0" | "false" | "off" => None,
+        "1" | "true" | "on" => Some(30),
+        n => n.parse::<usize>().ok().filter(|v| *v > 0).or(Some(30)),
+    }
+}
+
+/// One node's GPU cost, aggregated across the timing frames.
+struct NodeTiming {
+    name: String,
+    /// How many brackets contributed — `frames × instances of this node`.
+    samples: usize,
+    /// Instances of this node in one frame, e.g. 4 for `YuvUpload` in the Heavy
+    /// graph.
+    per_frame: usize,
+    /// Median of the individual brackets.
+    median_ms: f64,
+    /// Median of this node's TOTAL per frame, i.e. all its instances summed.
+    ///
+    /// The figure that matters for "how much of the frame is this shader": one LUT
+    /// pass at 0.4 ms is cheap, four of them are 1.6 ms of a 16.7 ms budget. A
+    /// report that printed only the per-bracket median would understate every
+    /// repeated node by its own multiplicity.
+    frame_total_ms: f64,
+}
+
+/// Bracket every node for `frames` frames and print what each shader cost.
+///
+/// Aggregated by node NAME, so the Heavy graph's four LUT passes report as one row
+/// with a count rather than four indistinguishable rows.
+///
+/// `push` uploads one frame's pixels; it is a closure because the two profiles
+/// feed their upload nodes differently and this pass must drive whichever one the
+/// caller built.
+fn print_node_timings(
+    device: &Arc<GpuDevice>,
+    graph: &mut nexir::render::graph::CompiledGraph,
+    frame_state: &FrameState,
+    frames: usize,
+    mut push: impl FnMut(&mut nexir::render::graph::CompiledGraph, usize),
+) {
+    if !device.has_timestamp_queries {
+        println!(
+            "    Per-node GPU timings SKIPPED: this adapter does not report \
+             TIMESTAMP_QUERY, so\n    there is nothing to read. Never a zero row."
+        );
+        return;
+    }
+
+    let node_count = graph.execution_order().len();
+    // One bracket per node. `QUERY_SET_MAX_QUERIES` is 8192, so the Heavy graph's
+    // 21 nodes (42 queries) is not close to the limit — but assert rather than
+    // assume, because an undersized timer drops brackets silently and
+    // `execute_timed` would then return fewer names than nodes.
+    assert!(
+        node_count as u32 * 2 <= wgpu::QUERY_SET_MAX_QUERIES,
+        "{node_count} nodes need {} queries, over the {} limit",
+        node_count * 2,
+        wgpu::QUERY_SET_MAX_QUERIES
+    );
+    let mut timer = nexir::render::gpu_timer::GpuTimer::new(device, node_count as u32);
+
+    // name → one sample per bracket, and name → its per-frame sum.
+    let mut per_bracket: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
+    let mut per_frame_totals: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
+    let mut instances: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut incomplete = 0usize;
+
+    for f in 0..frames {
+        push(graph, f);
+        let mut enc = device.begin_frame();
+        // MUST reset first: the timer writes from index 0 and `written` is what
+        // decides whether a bracket fitted.
+        timer.reset();
+        let names = graph.execute_timed(&mut enc, device, frame_state, &mut timer);
+        let sid = device.submit(enc);
+        device
+            .device
+            .poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+
+        // The names `execute_timed` returns are the nodes it BRACKETED, in
+        // execution order. Cross-checked against the graph's own order rather than
+        // trusted: `node_name(idx)` rebuilds the same mapping independently, and if
+        // the two ever disagree every row below names the wrong shader.
+        let expected: Vec<&str> = graph
+            .execution_order()
+            .iter()
+            .map(|&i| graph.node_name(i))
+            .collect();
+        if names.len() != expected.len() {
+            incomplete += 1;
+        }
+        assert_eq!(
+            names.as_slice(),
+            &expected[..names.len()],
+            "execute_timed's names disagree with execution_order()'s — every \
+             per-node figure would be attributed to the wrong shader"
+        );
+
+        let Some(pairs) = timer.resolve_all() else {
+            continue;
+        };
+        let mut frame_sums: std::collections::BTreeMap<String, f64> = Default::default();
+        let mut frame_counts: std::collections::BTreeMap<String, usize> = Default::default();
+        for (name, ns) in names.iter().zip(pairs.iter()) {
+            let ms = ns / 1.0e6;
+            per_bracket.entry((*name).to_string()).or_default().push(ms);
+            *frame_sums.entry((*name).to_string()).or_default() += ms;
+            *frame_counts.entry((*name).to_string()).or_default() += 1;
+        }
+        for (name, sum) in frame_sums {
+            per_frame_totals.entry(name.clone()).or_default().push(sum);
+            // Recorded from the frame rather than from the compile-time graph, so a
+            // node that failed to bracket is not counted as an instance.
+            let n = frame_counts[&name];
+            instances.entry(name).and_modify(|v| *v = (*v).max(n)).or_insert(n);
+        }
+    }
+
+    if per_bracket.is_empty() {
+        println!(
+            "    Per-node GPU timings: no bracket resolved over {frames} frame(s) — \
+             nothing measured, so nothing printed."
+        );
+        return;
+    }
+
+    let mut rows: Vec<NodeTiming> = per_bracket
+        .iter()
+        .map(|(name, samples)| NodeTiming {
+            name: name.clone(),
+            samples: samples.len(),
+            per_frame: instances.get(name).copied().unwrap_or(1),
+            median_ms: median(samples.iter().copied()),
+            frame_total_ms: median(
+                per_frame_totals
+                    .get(name)
+                    .map(|v| v.iter().copied())
+                    .unwrap_or_default(),
+            ),
+        })
+        .collect();
+    // Costliest first: the point of this table is what to look at next.
+    rows.sort_by(|a, b| {
+        b.frame_total_ms
+            .partial_cmp(&a.frame_total_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let graph_total: f64 = rows.iter().map(|r| r.frame_total_ms).sum();
+    println!(
+        "    Per-node GPU timings over {frames} frame(s) — medians, GPU execution \
+         only:"
+    );
+    println!(
+        "      {:<18} {:>5} {:>11} {:>12} {:>7}",
+        "Node", "×/fr", "per pass", "per frame", "share"
+    );
+    for r in &rows {
+        println!(
+            "      {:<18} {:>5} {:>8.3} ms {:>9.3} ms {:>6.1}%",
+            r.name,
+            r.per_frame,
+            r.median_ms,
+            r.frame_total_ms,
+            if graph_total > 0.0 {
+                r.frame_total_ms / graph_total * 100.0
+            } else {
+                0.0
+            },
+        );
+        debug_assert!(r.samples >= r.per_frame);
+    }
+    println!(
+        "      {:<18} {:>5} {:>11} {:>9.3} ms {:>6.1}%",
+        "TOTAL", "", "", graph_total, 100.0
+    );
+    if incomplete > 0 {
+        // A dropped bracket means the timer was too small for the graph, which
+        // would otherwise show up only as a missing row.
+        println!(
+            "    WARNING: {incomplete} frame(s) bracketed fewer nodes than the graph \
+             has — the rows above\n    are incomplete and the TOTAL is a lower bound."
+        );
+    }
 }
 
 const BENCHMARKS: &[BenchmarkConfig] = &[
@@ -2364,6 +2621,13 @@ fn main() {
         "\nEvery figure below is timed or counted. Anything this process does not \
          measure\nprints as n/a rather than as an estimate.\n"
     );
+    if node_timing_frames().is_some() {
+        println!(
+            "NEXIR_NODE_TIMINGS is set: each benchmark prints per-node GPU timings from \
+             an\nEXTRA pass after its measured loop. Those frames are not in the FPS or \
+             latency\nrows — bracketing every node changes what is being measured.\n"
+        );
+    }
 
     let mut skipped = Vec::new();
     // Whether `--media` was asked for. When it is, the synthetic benchmarks are
