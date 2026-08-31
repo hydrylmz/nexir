@@ -107,6 +107,89 @@ struct BenchmarkConfig {
     canvas_h: u32,
     target_fps: f64,
     frame_count: usize,
+    /// How many DISTINCT video sources the layers are drawn from.
+    ///
+    /// Layers are assigned round-robin, so `1` means every layer shows the same
+    /// clip and `layer_count()` means they all show different ones. The engine
+    /// uploads once per distinct source, so this is exactly the multiplier on
+    /// bytes-per-frame — and it is the difference between an honest 4K row and a
+    /// flattering one.
+    ///
+    /// The Heavy workload is run BOTH ways on purpose. Four layers sharing one
+    /// source is a real editing pattern (the same clip on two tracks, one source
+    /// feeding several effect chains) and de-duplicating it is a real
+    /// optimisation. It is also not what "4 layers of 4K" means to a reader, and
+    /// a 4K60 claim measured on it would be measuring a smaller workload. Both
+    /// rows are printed; the distinct one is the one the audit's 4K60 target is
+    /// judged against.
+    distinct_sources: usize,
+}
+
+impl BenchmarkConfig {
+    /// Distinct sources, clamped to something buildable.
+    fn source_count(&self) -> usize {
+        self.distinct_sources.clamp(1, self.complexity.layer_count())
+    }
+}
+
+/// One `YuvUploadNode` in the compiled graph, and which source feeds it.
+///
+/// The mapping is not the identity once layers share sources: four layers over
+/// one source produce ONE uploader, and the loop that pushes pixels iterates
+/// uploaders rather than layers. Getting this backwards is how a "de-duplicated"
+/// pipeline uploads exactly as much as before while reporting that it did not.
+struct Uploader {
+    node_idx: usize,
+    source_idx: usize,
+}
+
+/// The Y/UV texture pair a source's decoded frame lands in.
+///
+/// Created once per distinct source and handed to every layer that reads it, so
+/// two layers sharing a clip share the upload, the staging buffer and the
+/// textures — the bytes cross the bus once.
+#[derive(Clone, Copy)]
+struct SourcePlanes {
+    y: ResourceId,
+    uv: ResourceId,
+}
+
+/// Get (or create) the upload node and planes for one source.
+///
+/// The first layer to ask for a source builds its `YuvUploadNode`; later layers
+/// with the same source get the same `ResourceId`s back and add no upload.
+#[allow(clippy::too_many_arguments)]
+fn planes_for_source(
+    device: &GpuDevice,
+    compiler: &mut RenderGraphCompiler,
+    id_counter: &mut u32,
+    planes: &mut [Option<SourcePlanes>],
+    uploaders: &mut Vec<Uploader>,
+    source_idx: usize,
+    width: u32,
+    height: u32,
+) -> SourcePlanes {
+    if let Some(existing) = planes[source_idx] {
+        return existing;
+    }
+    let y = ResourceId::next(id_counter);
+    let uv = ResourceId::next(id_counter);
+    let node_idx = compiler.add_node(Box::new(YuvUploadNode::new_with_layout(
+        device,
+        source_idx as u32,
+        width,
+        height,
+        y,
+        uv,
+        nexir::timeline::source::FrameLayout::NV12,
+    )));
+    uploaders.push(Uploader {
+        node_idx,
+        source_idx,
+    });
+    let created = SourcePlanes { y, uv };
+    planes[source_idx] = Some(created);
+    created
 }
 
 /// Why a benchmark could not run, for honest reporting instead of a zero row.
@@ -172,6 +255,72 @@ const PATTERN_FRAMES: usize = 8;
 /// frames complete" and becomes "how fast this loop records commands" — a number
 /// that improves when you make the pipeline worse.
 const DEFAULT_PIPELINE_DEPTH: usize = 4;
+
+/// How long the untimed warm-up runs before measurement starts.
+///
+/// **Three frames is not enough, and the difference is not small.** Benchmark 5
+/// measured 55.3 FPS when it ran after benchmarks 1-4 and 45.5 FPS when run
+/// alone — a 21% swing on identical code. The GPU's own graph execution was
+/// unchanged (8.2 ms both ways); what moved was CPU recording time (0.6 -> 4.6 ms)
+/// and the transfer span (9.0 -> 13.1 ms), i.e. CPU and GPU clocks ramping from
+/// idle. The earlier benchmarks were acting as a warm-up for the later ones, so
+/// each row's figure depended on its position in the list.
+///
+/// A duration rather than a frame count, because that is what clock ramping is
+/// measured in: 90 frames of 4K is 1.6 s, so a frame-count warm-up that is
+/// adequate at 1080p is a fraction of a second at 4K.
+const WARMUP_DURATION: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// Minimum warm-up frames regardless of duration, so pipeline/bind-group creation
+/// is always off the measured path even on an implausibly fast device.
+const WARMUP_MIN_FRAMES: usize = 3;
+
+/// How many times each benchmark is measured by default.
+///
+/// **A single reading of the 4K row is not a result on this hardware.** Measured
+/// across repeats it moved between 39 and 56 FPS on identical code, with the GPU's
+/// own graph execution steady at ~9 ms — so the variance is in transfer and CPU
+/// scheduling, not in the shaders. Quoting one run's number as "the" figure would
+/// be picking a sample from a distribution 40% wide.
+///
+/// Three is the minimum that yields a median rather than a midpoint, and the
+/// summary prints the full spread so a wide one cannot hide behind it.
+const DEFAULT_REPEATS: usize = 3;
+
+/// One measured run's headline figures.
+struct RunReading {
+    fps: f64,
+    lat_avg: f64,
+    lat_p95: f64,
+    lat_p99: f64,
+}
+
+/// Every reading for one benchmark, plus what workload produced them.
+struct BenchSummary {
+    name: &'static str,
+    layers: usize,
+    sources: usize,
+    runs: Vec<RunReading>,
+}
+
+/// Median of a sample, or 0.0 when empty.
+///
+/// Median rather than mean because the 4K distribution has a long slow tail — one
+/// repeat catching a background task would pull a mean down and the reported figure
+/// would then depend on machine noise rather than on the code.
+fn median(values: impl Iterator<Item = f64>) -> f64 {
+    let mut v: Vec<f64> = values.collect();
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = v.len() / 2;
+    if v.len() % 2 == 1 {
+        v[mid]
+    } else {
+        (v[mid - 1] + v[mid]) / 2.0
+    }
+}
 
 /// The export job an NVENC session is opened against: H.264, BT.709 limited
 /// 8-bit, at the benchmark's own canvas size and frame rate.
@@ -412,8 +561,17 @@ fn run_benchmark(
 
     let mut compiler = RenderGraphCompiler::new();
     let mut id_counter = 2u32;
-    let mut uploader_indices = Vec::new();
     let mut final_composite_inputs = Vec::new();
+
+    // ── Source sharing ────────────────────────────────────────────────────────
+    // Layers are assigned to sources round-robin, and each source is uploaded
+    // exactly once per frame. With `distinct_sources == layer_count()` this is the
+    // old one-uploader-per-layer shape; with fewer, the layers that share a source
+    // share its upload and its textures.
+    let source_count = config.source_count();
+    let layer_count = config.complexity.layer_count();
+    let mut source_planes: Vec<Option<SourcePlanes>> = vec![None; source_count];
+    let mut uploaders: Vec<Uploader> = Vec::with_capacity(source_count);
 
     // ── Build the render graph according to complexity ────────────────────────
 
@@ -421,21 +579,23 @@ fn run_benchmark(
         WorkloadComplexity::Simple => {
             // 1 video clip → YUV upload → YUV to RGB → composite
             let rgba_id = ResourceId::next(&mut id_counter);
-            let y_id = ResourceId::next(&mut id_counter);
-            let uv_id = ResourceId::next(&mut id_counter);
-
-            let u_idx = compiler.add_node(Box::new(YuvUploadNode::new_with_layout(
-                device, 0, config.canvas_w, config.canvas_h, y_id, uv_id,
-                nexir::timeline::source::FrameLayout::NV12,
-            )));
-            uploader_indices.push(u_idx);
+            let planes = planes_for_source(
+                device,
+                &mut compiler,
+                &mut id_counter,
+                &mut source_planes,
+                &mut uploaders,
+                0,
+                config.canvas_w,
+                config.canvas_h,
+            );
 
             compiler.add_node(Box::new(YuvToRgbNode::new_with_layout(
                 device,
                 &shaders,
                 &compute,
-                y_id,
-                uv_id,
+                planes.y,
+                planes.uv,
                 rgba_id,
                 config.canvas_w,
                 config.canvas_h,
@@ -456,24 +616,27 @@ fn run_benchmark(
         }
         WorkloadComplexity::Medium => {
             // 3 layers with colour correction
-            for i in 0..3 {
-                let y_id = ResourceId::next(&mut id_counter);
-                let uv_id = ResourceId::next(&mut id_counter);
+            for i in 0..layer_count {
                 let rgb_id = ResourceId::next(&mut id_counter);
                 let cc_id = ResourceId::next(&mut id_counter);
 
-                let u_idx = compiler.add_node(Box::new(YuvUploadNode::new_with_layout(
-                    device, i, config.canvas_w, config.canvas_h, y_id, uv_id,
-                    nexir::timeline::source::FrameLayout::NV12,
-                )));
-                uploader_indices.push(u_idx);
+                let planes = planes_for_source(
+                    device,
+                    &mut compiler,
+                    &mut id_counter,
+                    &mut source_planes,
+                    &mut uploaders,
+                    i % source_count,
+                    config.canvas_w,
+                    config.canvas_h,
+                );
 
                 compiler.add_node(Box::new(YuvToRgbNode::new_with_layout(
                     device,
                     &shaders,
                     &compute,
-                    y_id,
-                    uv_id,
+                    planes.y,
+                    planes.uv,
                     rgb_id,
                     config.canvas_w,
                     config.canvas_h,
@@ -528,26 +691,29 @@ fn run_benchmark(
                 domain_max: [1.0, 1.0, 1.0],
             };
 
-            for i in 0..4 {
-                let y_id = ResourceId::next(&mut id_counter);
-                let uv_id = ResourceId::next(&mut id_counter);
+            for i in 0..layer_count {
                 let rgb_id = ResourceId::next(&mut id_counter);
                 let cc_id = ResourceId::next(&mut id_counter);
                 let lut_id = ResourceId::next(&mut id_counter);
                 let key_id = ResourceId::next(&mut id_counter);
 
-                let u_idx = compiler.add_node(Box::new(YuvUploadNode::new_with_layout(
-                    device, i, config.canvas_w, config.canvas_h, y_id, uv_id,
-                    nexir::timeline::source::FrameLayout::NV12,
-                )));
-                uploader_indices.push(u_idx);
+                let planes = planes_for_source(
+                    device,
+                    &mut compiler,
+                    &mut id_counter,
+                    &mut source_planes,
+                    &mut uploaders,
+                    i % source_count,
+                    config.canvas_w,
+                    config.canvas_h,
+                );
 
                 compiler.add_node(Box::new(YuvToRgbNode::new_with_layout(
                     device,
                     &shaders,
                     &compute,
-                    y_id,
-                    uv_id,
+                    planes.y,
+                    planes.uv,
                     rgb_id,
                     config.canvas_w,
                     config.canvas_h,
@@ -623,6 +789,21 @@ fn run_benchmark(
         }
     }
 
+    // The de-duplication must be real, not merely intended: with layers sharing a
+    // source there must be FEWER upload nodes than layers, and the graph must
+    // contain exactly one per distinct source. If this ever fires, the round-robin
+    // above stopped hitting the memo in `planes_for_source` and the bench is
+    // uploading the same bytes several times while claiming it does not.
+    assert_eq!(
+        uploaders.len(),
+        source_count,
+        "one upload node per distinct source: {} layers over {} sources produced {} \
+         uploaders",
+        layer_count,
+        source_count,
+        uploaders.len()
+    );
+
     let mut graph = compiler
         .compile(config.canvas_w, config.canvas_h)
         .expect("Graph compile failed");
@@ -664,13 +845,35 @@ fn run_benchmark(
             make_nv12(config.canvas_w, config.canvas_h, phase)
         })
         .collect();
-    let upload_bytes_per_frame = nv12_frames[0].len() as u64 * uploader_indices.len() as u64;
 
+    // Which pattern frame each source shows, as an offset into the cycle.
+    //
+    // Distinct sources must carry distinct PIXELS, not just distinct node
+    // indices. Handing every source the same bytes would leave a
+    // four-distinct-source run uploading four copies of one image, which is a
+    // workload the driver's own caches may treat differently from four real
+    // clips — and the whole point of the distinct variant is to be the pessimistic
+    // case. Offsetting into the shared cycle costs no extra memory: at 4K a
+    // per-source frame set would be ~400 MB of host RAM.
+    let source_phase_offset = |source_idx: usize| source_idx * 2;
+
+    // Bytes handed to the queue per frame, ACCUMULATED FROM THE UPLOADS
+    // THEMSELVES rather than computed from the frame size.
+    //
+    // The two are not the same number, and the difference is not rounding: on the
+    // re-strided path the node writes padded rows, so 1080p 8-bit luma pads 1920
+    // to 2048 and a 3.11 MB frame becomes 3.32 MB on the bus. A computed figure
+    // would have understated 1080p traffic by 6.7% and fed that error straight
+    // into the GB/s divisor. Counted, this cannot drift from what happened.
+    let mut upload_bytes_per_frame: u64 = 0;
+
+    // One composite input per LAYER; several layers may name the same source.
     let mut frame_clips = Vec::new();
-    for i in 0..uploader_indices.len() {
+    for i in 0..layer_count {
+        let source_idx = i % source_count;
         frame_clips.push(ClipRenderEntry {
-            source_id: SourceId::new(i as u32),
-            texture_slot: i as u32,
+            source_id: SourceId::new(source_idx as u32),
+            texture_slot: source_idx as u32,
             layer_order: i as u16,
             clip_width: config.canvas_w,
             clip_height: config.canvas_h,
@@ -731,17 +934,24 @@ fn run_benchmark(
         .map(|_| nexir::render::gpu_timer::GpuTimer::new(device, 1))
         .collect();
 
-    // ── Warm-up: 3 frames, untimed ────────────────────────────────────────────
-    // Shader/pipeline creation and the first bind-group cache miss would
-    // otherwise land in frame 0 and skew its P99.
-    for w in 0..3 {
-        for &u_idx in &uploader_indices {
-            if let Some(u) = graph.nodes_mut()[u_idx]
+    // ── Warm-up, untimed ──────────────────────────────────────────────────────
+    // Runs until `WARMUP_DURATION` has elapsed (and at least `WARMUP_MIN_FRAMES`
+    // frames), doing exactly the work the measured loop does.
+    //
+    // The frame count is not the point; see `WARMUP_DURATION`. A 3-frame warm-up
+    // left the 4K row reading 55.3 FPS in the full suite and 45.5 FPS alone,
+    // because benchmarks 1-4 were warming the clocks for it and its number
+    // therefore depended on its position in the list.
+    let warmup_start = std::time::Instant::now();
+    let mut w = 0usize;
+    while w < WARMUP_MIN_FRAMES || warmup_start.elapsed() < WARMUP_DURATION {
+        for up in &uploaders {
+            if let Some(u) = graph.nodes_mut()[up.node_idx]
                 .as_any_mut()
                 .and_then(|n| n.downcast_mut::<YuvUploadNode>())
             {
                 u.upload_frame(
-                    &nv12_frames[w % PATTERN_FRAMES],
+                    &nv12_frames[(w + source_phase_offset(up.source_idx)) % PATTERN_FRAMES],
                     true,
                     config.canvas_w,
                     config.canvas_h,
@@ -754,7 +964,13 @@ fn run_benchmark(
         device
             .device
             .poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+        w += 1;
     }
+    println!(
+        "    Warm-up: {} frame(s) in {:.2} s (untimed)",
+        w,
+        warmup_start.elapsed().as_secs_f64()
+    );
 
     // ── Measurement loop ──────────────────────────────────────────────────────
     //
@@ -830,9 +1046,19 @@ fn run_benchmark(
         let upload_start = std::time::Instant::now();
         let mut upload_cost = nexir::render::nodes::yuv_upload::UploadCost::zero();
         {
-            let frame_bytes = &nv12_frames[f % PATTERN_FRAMES];
-            for &u_idx in &uploader_indices {
-                if let Some(u) = graph.nodes_mut()[u_idx]
+            // Iterates UPLOADERS, one per distinct source — not layers. When four
+            // layers share a source there is one upload node, so the bytes cross
+            // the bus once no matter how many layers read them.
+            //
+            // Indexed rather than iterated because the body needs `graph`
+            // mutably while `uploaders` is borrowed.
+            #[allow(clippy::needless_range_loop)]
+            for up_i in 0..uploaders.len() {
+                let (node_idx, source_idx) =
+                    (uploaders[up_i].node_idx, uploaders[up_i].source_idx);
+                let frame_bytes =
+                    &nv12_frames[(f + source_phase_offset(source_idx)) % PATTERN_FRAMES];
+                if let Some(u) = graph.nodes_mut()[node_idx]
                     .as_any_mut()
                     .and_then(|n| n.downcast_mut::<YuvUploadNode>())
                 {
@@ -849,17 +1075,31 @@ fn run_benchmark(
         profile.record_stage(PipelineStage::UploadPrepare, upload_cost.prepare);
         profile.record_stage(PipelineStage::UploadSubmit, upload_cost.submit);
         if f == 0 {
+            // Every frame uploads the same amount, so record the counted figure
+            // once and use it as the per-frame bandwidth divisor.
+            upload_bytes_per_frame = upload_cost.bytes;
             // Printed once per benchmark, because which path the upload took is
             // the difference between a memcpy and a no-op and is not otherwise
-            // visible in the table.
+            // visible in the table — and because the layer:source ratio is the
+            // single most important caveat on any FPS figure below it.
             println!(
-                "    Upload path: {} ({:.1} MB/frame handed to the queue)",
+                "    Upload path: {} ({:.1} MB/frame handed to the queue; {} layer(s) over \
+                 {} distinct source(s))",
                 if upload_cost.contiguous {
                     "contiguous — source rows already at the staging stride, no repack"
                 } else {
                     "re-strided — rows repacked into reused scratch"
                 },
                 upload_cost.bytes as f64 / (1024.0 * 1024.0),
+                layer_count,
+                source_count,
+            );
+        } else {
+            // Constant per frame by construction; if it ever is not, the GB/s
+            // divisor computed from frame 0 is wrong for every other frame.
+            debug_assert_eq!(
+                upload_cost.bytes, upload_bytes_per_frame,
+                "upload bytes changed mid-run"
             );
         }
 
@@ -1046,6 +1286,7 @@ const BENCHMARKS: &[BenchmarkConfig] = &[
         canvas_h: 1080,
         target_fps: 60.0,
         frame_count: 240,
+        distinct_sources: 1,
     },
     BenchmarkConfig {
         name: "2. Simple 1080p60 (1 layer, composite) — zero-copy NVENC",
@@ -1055,6 +1296,7 @@ const BENCHMARKS: &[BenchmarkConfig] = &[
         canvas_h: 1080,
         target_fps: 60.0,
         frame_count: 240,
+        distinct_sources: 1,
     },
     BenchmarkConfig {
         name: "3. Simple 1080p60 (1 layer, composite) — CPU readback",
@@ -1064,24 +1306,56 @@ const BENCHMARKS: &[BenchmarkConfig] = &[
         canvas_h: 1080,
         target_fps: 60.0,
         frame_count: 120,
+        distinct_sources: 1,
     },
     BenchmarkConfig {
-        name: "4. Medium 1080p60 (3 layers + colour correction) — zero-copy NVENC",
+        name: "4. Medium 1080p60 (3 layers, 3 sources + colour correction) — zero-copy NVENC",
         complexity: WorkloadComplexity::Medium,
         path: ExecutionPath::GpuNvencZeroCopy,
         canvas_w: 1920,
         canvas_h: 1080,
         target_fps: 60.0,
         frame_count: 180,
+        // Three distinct sources: this is the row the 1080p multi-layer target is
+        // judged against, so it must not be the cheaper shared-source case.
+        distinct_sources: 3,
     },
     BenchmarkConfig {
-        name: "5. Heavy 4K60 (4 layers + LUT + chroma key + tone map) — zero-copy NVENC",
+        name: "5. Heavy 4K60 (4 layers, 4 DISTINCT sources + LUT + chroma key + tone map) \
+               — zero-copy NVENC",
         complexity: WorkloadComplexity::Heavy,
         path: ExecutionPath::GpuNvencZeroCopy,
         canvas_w: 3840,
         canvas_h: 2160,
         target_fps: 60.0,
         frame_count: 90,
+        // FOUR distinct sources: 47.5 MB/frame across the bus.
+        //
+        // **This is the row the audit's 4K60 target is judged against.** A real
+        // 4-layer 4K timeline has four different clips, so this is what "4 layers
+        // of 4K" means. Benchmark 6 runs the same graph with all four layers
+        // sharing one source — a real editing pattern, a real optimisation, and a
+        // materially smaller workload. Reporting only that one would be claiming
+        // 4K60 on a quarter of the bytes.
+        distinct_sources: 4,
+    },
+    BenchmarkConfig {
+        name: "6. Heavy 4K60 (4 layers SHARING 1 source + LUT + chroma key + tone map) \
+               — zero-copy NVENC",
+        complexity: WorkloadComplexity::Heavy,
+        path: ExecutionPath::GpuNvencZeroCopy,
+        canvas_w: 3840,
+        canvas_h: 2160,
+        target_fps: 60.0,
+        frame_count: 90,
+        // ONE source feeding all four layers: 11.9 MB/frame instead of 47.5.
+        //
+        // The same clip on two tracks, or one source feeding several effect
+        // chains, is ordinary in real projects, and uploading it once is the
+        // engine doing the right thing. It is NOT the 4K60 target's workload —
+        // benchmark 5 is. Both are printed so the difference is visible rather
+        // than chosen.
+        distinct_sources: 1,
     },
 ];
 
@@ -1117,17 +1391,135 @@ fn main() {
     );
 
     let mut skipped = Vec::new();
+    // Every benchmark's repeated readings, for the summary table.
+    //
+    // A Vec of runs per benchmark rather than one figure each, because one reading
+    // of the 4K row is a sample and not a result — see `DEFAULT_REPEATS`.
+    let mut summary: Vec<BenchSummary> = Vec::new();
 
-    for bench in BENCHMARKS {
+    // Optional filter: `bench.exe 5` or `bench.exe 5 6` runs only those.
+    //
+    // Exists because benchmarks share one process and one GPU, so a row can be
+    // affected by what ran before it — thermals, driver state, the texture pool's
+    // buckets. Being able to run one in isolation is how that gets checked rather
+    // than assumed.
+    let only: Vec<usize> = std::env::args()
+        .skip(1)
+        .filter_map(|a| a.parse::<usize>().ok())
+        .collect();
+
+    // `NEXIR_BENCH_REPEATS=1` for a quick smoke run; the default is what any
+    // reported figure must come from.
+    let repeats: usize = std::env::var("NEXIR_BENCH_REPEATS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_REPEATS);
+    if repeats != DEFAULT_REPEATS {
+        println!(
+            "Repeats: {repeats} (overridden from {DEFAULT_REPEATS}). A single run of the \
+             4K row\nspans ~40% between repeats, so treat any figure from repeats=1 as \
+             a sample.\n"
+        );
+    } else {
+        println!("Repeats: {repeats} per benchmark; the summary reports the median and spread.\n");
+    }
+
+    for (i, bench) in BENCHMARKS.iter().enumerate() {
+        let number = i + 1;
+        if !only.is_empty() && !only.contains(&number) {
+            continue;
+        }
         println!(">>> Running: {}", bench.name);
-        println!("    Layers: {}", bench.complexity.layer_count());
-        match run_benchmark(&device, bench) {
-            Ok(session) => println!("{}", session.generate_report().format_table()),
-            Err(Skipped(reason)) => {
-                println!("    SKIPPED: {reason}\n");
-                skipped.push((bench.name, reason));
+        println!(
+            "    Layers: {} over {} distinct source(s)",
+            bench.complexity.layer_count(),
+            bench.source_count()
+        );
+
+        let mut runs: Vec<RunReading> = Vec::with_capacity(repeats);
+        let mut skip_reason: Option<String> = None;
+        for r in 0..repeats {
+            if repeats > 1 {
+                println!("    --- repeat {}/{} ---", r + 1, repeats);
+            }
+            match run_benchmark(&device, bench) {
+                Ok(session) => {
+                    let report = session.generate_report();
+                    println!("{}", report.format_table());
+                    let lat = report.frame_latency_stats.unwrap_or_default();
+                    runs.push(RunReading {
+                        fps: report.average_fps,
+                        lat_avg: lat.avg_ms,
+                        lat_p95: lat.p95_ms,
+                        lat_p99: lat.p99_ms,
+                    });
+                }
+                Err(Skipped(reason)) => {
+                    println!("    SKIPPED: {reason}\n");
+                    skip_reason = Some(reason);
+                    break;
+                }
             }
         }
+
+        if let Some(reason) = skip_reason {
+            skipped.push((bench.name, reason));
+        } else if !runs.is_empty() {
+            summary.push(BenchSummary {
+                name: bench.name,
+                layers: bench.complexity.layer_count(),
+                sources: bench.source_count(),
+                runs,
+            });
+        }
+    }
+
+    if !summary.is_empty() {
+        // Throughput and the latency percentiles, side by side.
+        //
+        // Printed because the per-benchmark tables are long enough that the two 4K
+        // rows end up screens apart, and the whole reason both exist is to be
+        // compared. `layers:sources` is in the table because an FPS figure without
+        // it is not comparable to anything.
+        //
+        // Medians with an explicit spread, not means: the 4K distribution is wide
+        // enough that a mean would be dragged around by whichever repeat happened
+        // to hit a slow patch, and a figure printed without its spread invites
+        // being quoted as if it were repeatable.
+        println!("========================================================================");
+        println!("SUMMARY — median of {repeats} run(s), with spread");
+        println!("  P95/P99 are frame LATENCY (wall-clock spacing between frames), which is");
+        println!("  the quantity a 60 FPS target is stated in. 60 FPS = 16.67 ms.");
+        println!("  FPS spread is (max-min)/median: anything above ~10% means one run's");
+        println!("  number is not a result on its own.");
+        println!("------------------------------------------------------------------------");
+        println!(
+            "{:<40} {:>5} {:>8} {:>8} {:>9} {:>9} {:>9}",
+            "Benchmark", "L:S", "FPS", "spread", "Lat avg", "Lat P95", "Lat P99"
+        );
+        for s in &summary {
+            let short: String = s.name.chars().take(38).collect();
+            let fps = median(s.runs.iter().map(|r| r.fps));
+            let spread = if fps > 0.0 {
+                let lo = s.runs.iter().map(|r| r.fps).fold(f64::MAX, f64::min);
+                let hi = s.runs.iter().map(|r| r.fps).fold(f64::MIN, f64::max);
+                (hi - lo) / fps * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "{:<40} {:>5} {:>8.1} {:>7.0}% {:>6.2} ms {:>6.2} ms {:>6.2} ms",
+                short,
+                format!("{}:{}", s.layers, s.sources),
+                fps,
+                spread,
+                median(s.runs.iter().map(|r| r.lat_avg)),
+                median(s.runs.iter().map(|r| r.lat_p95)),
+                median(s.runs.iter().map(|r| r.lat_p99)),
+            );
+        }
+        println!("========================================================================\n");
     }
 
     if skipped.is_empty() {
