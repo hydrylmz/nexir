@@ -2431,6 +2431,710 @@ fn print_node_timings(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TASK F2 — THE END-TO-END EXPORT BENCHMARK (`bench --export`)
+//
+// Input MP4 → demux → decode → upload → graph → NV12 → NVENC → mux → output MP4,
+// driving the REAL `ExportEngine`. Not a reimplementation of it: the engine
+// already wires the decode workers, the renderer's in-flight pipeline, the encoder
+// and the muxer, and a benchmark that rebuilt that would be measuring a pipeline
+// no user has.
+//
+// Reported: input duration, export wall time, the realtime multiplier, average
+// FPS, peak process RSS, and the output's bitrate counted from its own size and
+// duration.
+//
+// VERIFIED, not assumed. A "fast export" that wrote a broken file would otherwise
+// score best: the output is reopened with this crate's own demuxer/decoder and the
+// benchmark fails the row unless the frames decode and the count is right. That is
+// the same contract `src/tests/export_validation.rs` holds the engine to.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How long to wait for an export before calling it wedged.
+///
+/// Generous — a 4K60 clip through a real encoder is not fast — but bounded, so a
+/// stuck encoder is a printed failure rather than a benchmark that never returns.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// What one class's export measured, all of it counted or timed.
+struct ExportReading {
+    label: &'static str,
+    width: u32,
+    height: u32,
+    /// Frames the job asked for.
+    frames_requested: usize,
+    /// Frames the OUTPUT file actually decodes to. The two must agree.
+    frames_decoded: usize,
+    input_seconds: f64,
+    export_seconds: f64,
+    output_bytes: u64,
+    /// Peak RSS observed while the export ran, from the OS. `None` where the query
+    /// is unavailable.
+    peak_rss_bytes: Option<u64>,
+    /// Whether the engine's own backend probe said NVENC. Reported rather than
+    /// assumed: `ExportEngine` falls back to FFmpeg silently, and an export timed
+    /// without knowing which encoder ran is not comparable to one that does.
+    nvenc: bool,
+}
+
+impl ExportReading {
+    /// Frames divided by elapsed seconds — the only FPS this row claims.
+    fn fps(&self) -> Option<f64> {
+        if self.frames_decoded == 0 || self.export_seconds <= 0.0 {
+            None
+        } else {
+            Some(self.frames_decoded as f64 / self.export_seconds)
+        }
+    }
+
+    /// Output seconds produced per second of wall time.
+    fn realtime(&self) -> Option<f64> {
+        if self.export_seconds <= 0.0 || self.input_seconds <= 0.0 {
+            None
+        } else {
+            Some(self.input_seconds / self.export_seconds)
+        }
+    }
+
+    /// Bits per second, counted from the file's size and its own duration — not
+    /// from the job's requested quality, which is a setting rather than a result.
+    fn bitrate_bps(&self) -> Option<f64> {
+        if self.input_seconds <= 0.0 || self.output_bytes == 0 {
+            None
+        } else {
+            Some(self.output_bytes as f64 * 8.0 / self.input_seconds)
+        }
+    }
+}
+
+/// One class's repeats, aggregated the way the synthetic sweep aggregates its own:
+/// median with an explicit spread.
+///
+/// A separate type rather than medians computed inline at the print site, because
+/// every figure here has to be reduced the same way and the per-repeat `Option`s
+/// have to survive the reduction — a class whose bitrate is unavailable must print
+/// `n/a` after three repeats just as it does after one (gotcha 9), not `0.0`
+/// because `unwrap_or(0.0)` crept into a median.
+struct ExportRow {
+    /// At least one; a class with no successful repeat is not pushed.
+    runs: Vec<ExportReading>,
+}
+
+impl ExportRow {
+    /// The first repeat, for the fields that are properties of the job rather than
+    /// of the run: label, geometry, frame count, encoder, input duration.
+    ///
+    /// Those are identical across repeats by construction — the same class, the
+    /// same file, the same job — and `verify_exported_file` has already failed the
+    /// class if a repeat's frame count differed.
+    fn first(&self) -> &ExportReading {
+        &self.runs[0]
+    }
+
+    fn median_seconds(&self) -> f64 {
+        median(self.runs.iter().map(|r| r.export_seconds))
+    }
+
+    /// Median of the per-repeat FPS figures, or `None` when no repeat produced one.
+    ///
+    /// Median of the rates rather than frames ÷ median time: the two differ, and
+    /// this one is a median of things that were each measured.
+    fn median_fps(&self) -> Option<f64> {
+        let v: Vec<f64> = self.runs.iter().filter_map(|r| r.fps()).collect();
+        (!v.is_empty()).then(|| median(v.into_iter()))
+    }
+
+    fn median_realtime(&self) -> Option<f64> {
+        let v: Vec<f64> = self.runs.iter().filter_map(|r| r.realtime()).collect();
+        (!v.is_empty()).then(|| median(v.into_iter()))
+    }
+
+    fn median_bitrate_bps(&self) -> Option<f64> {
+        let v: Vec<f64> = self.runs.iter().filter_map(|r| r.bitrate_bps()).collect();
+        (!v.is_empty()).then(|| median(v.into_iter()))
+    }
+
+    /// `(max - min) / median` over the repeats' FPS, as a percentage.
+    ///
+    /// The figure that says whether the median above is a result or a sample. One
+    /// repeat has no spread to report, so this is `None` rather than 0% — a single
+    /// run is not a run with zero variance.
+    fn fps_spread_percent(&self) -> Option<f64> {
+        if self.runs.len() < 2 {
+            return None;
+        }
+        let v: Vec<f64> = self.runs.iter().filter_map(|r| r.fps()).collect();
+        if v.len() < 2 {
+            return None;
+        }
+        let med = median(v.iter().copied());
+        if med <= 0.0 {
+            return None;
+        }
+        let lo = v.iter().copied().fold(f64::MAX, f64::min);
+        let hi = v.iter().copied().fold(f64::MIN, f64::max);
+        Some((hi - lo) / med * 100.0)
+    }
+
+    /// The highest RSS peak any repeat observed, or `None` where the OS query is
+    /// unavailable.
+    ///
+    /// A max rather than a median: the question a peak answers is "how much did
+    /// this need at worst", and a median of high-water marks answers neither that
+    /// nor anything else.
+    fn peak_rss_bytes(&self) -> Option<u64> {
+        self.runs.iter().filter_map(|r| r.peak_rss_bytes).max()
+    }
+}
+
+/// Everything `ExportEngine::new` needs, built around one real input file.
+///
+/// Mirrors `src/tests/export_validation.rs`'s harness rather than inventing a
+/// second way to assemble a project: the source registry, the track, the clip and
+/// the `FrameScheduler` are wired exactly as a real project is, so the export
+/// under measurement is the one users run.
+struct ExportHarness {
+    device: Arc<GpuDevice>,
+    scheduler: Arc<nexir::scheduler::frame_scheduler::FrameScheduler>,
+    timeline: Arc<std::sync::RwLock<nexir::timeline::store::TimelineStore>>,
+    tracks: Arc<std::sync::RwLock<nexir::timeline::track::TrackList>>,
+    sources: Arc<std::sync::RwLock<nexir::timeline::source::SourceRegistry>>,
+    shaders: Arc<ShaderRegistry>,
+    compute: Arc<ComputePipelineCache>,
+    /// Kept alive so the prefetch worker's channel does not disconnect, and set on
+    /// drop so the worker actually stops — see [`ExportHarness::drop`].
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ExportHarness {
+    /// Stop this harness's prefetch worker.
+    ///
+    /// Not tidiness: `PrefetchWorker::run` polls its channel with a 500 µs sleep
+    /// and calls `decode_blocking` on whatever it is handed, so a harness left
+    /// undropped-but-idle keeps a thread and a decoder alive for the rest of the
+    /// process. One harness is built per class per repeat, so without this the
+    /// fifth class of the third repeat is measured against fourteen surviving
+    /// workers — the later rows would be slower for a reason that is the
+    /// benchmark's own bookkeeping rather than the pipeline's.
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Build a one-clip project over `path`, reading its geometry from the file.
+///
+/// Geometry, frame rate and duration come from the container rather than from the
+/// `MediaClass` declaration. The two should agree — `declared_geometry_matches_the_filter`
+/// pins that — but the export is judged against the file, so the file is what the
+/// job is built from.
+fn build_export_harness(
+    device: &Arc<GpuDevice>,
+    path: &Path,
+) -> Result<(ExportHarness, nexir::io::demuxer::StreamInfo, i64), String> {
+    use nexir::io::frame_cache::FrameCache;
+    use nexir::io::io_layer::IoLayer;
+    use nexir::io::slot_pool::FrameSlotPool;
+    use nexir::project::Project;
+    use nexir::scheduler::frame_scheduler::FrameScheduler;
+    use nexir::timeline::mutation::ClipInsertParams;
+    use nexir::timeline::source::{PixelFormat, VideoRotation, VideoStreamInfo};
+
+    let tb = Rational::TIMEBASE_90K;
+    let demuxer = Demuxer::open(path).map_err(|e| format!("Demuxer::open failed: {e:?}"))?;
+    let stream = demuxer
+        .video_stream
+        .clone()
+        .ok_or_else(|| "the input has no video stream".to_string())?;
+    let width = stream.width.ok_or("the input stream has no width")?;
+    let height = stream.height.ok_or("the input stream has no height")?;
+    let duration_pts = tb.from_pts(stream.duration, stream.time_base);
+    if duration_pts <= 0 {
+        return Err(format!(
+            "the container reports a {duration_pts}-tick duration, so there is no \
+             span to export"
+        ));
+    }
+    // `Demuxer` owns FFmpeg pointers and implements `Drop`; the `StreamInfo` clone
+    // carries the `codecpar` the decoder needs, and the engine reopens the file
+    // itself, so the demuxer is dropped here rather than held.
+    drop(demuxer);
+
+    // Assembled through `Project` rather than by poking `TimelineStore` directly:
+    // that is the API the UI uses, it owns the layer-order bookkeeping, and
+    // `TrackId`'s constructor is crate-private anyway. The three halves are then
+    // taken out of it because `ExportEngine::new` wants each behind its own lock.
+    let mut project = Project::new("bench-export");
+    let track_id = project
+        .add_video_track("V1")
+        .map_err(|e| format!("could not add a video track: {e:?}"))?;
+    let source_id = project.register_source(
+        path.to_path_buf(),
+        Some(VideoStreamInfo {
+            width,
+            height,
+            frame_rate: stream.frame_rate.unwrap_or(Rational { num: 30, den: 1 }),
+            pixel_fmt: if stream.color_info.bit_depth >= 10 {
+                PixelFormat::P010
+            } else {
+                PixelFormat::Yuv420p
+            },
+            color_info: stream.color_info,
+            duration_pts,
+            is_vfr: stream.is_vfr,
+            time_base: stream.time_base,
+            rotation: VideoRotation::None,
+        }),
+        None,
+    );
+    project
+        .insert_clip(ClipInsertParams {
+            track_id,
+            source_id,
+            kind: ClipKind::Video,
+            pts_in: 0,
+            pts_out: duration_pts,
+            ..Default::default()
+        })
+        .map_err(|e| format!("could not insert the clip: {e:?}"))?;
+
+    let sources = Arc::clone(&project.sources);
+    let tracks = Arc::new(std::sync::RwLock::new(std::mem::take(&mut project.tracks)));
+    let timeline = Arc::new(std::sync::RwLock::new(std::mem::replace(
+        &mut project.clips,
+        nexir::timeline::store::TimelineStore::new(),
+    )));
+
+    let pool = Arc::new(FrameSlotPool::new(device));
+    let cache = Arc::new(FrameCache::new(Arc::clone(&pool), 32));
+    let (prefetch_tx, prefetch_rx) = std::sync::mpsc::sync_channel(16);
+    let io_layer = Arc::new(IoLayer::new(
+        Arc::clone(&device.device),
+        Arc::clone(&pool),
+        Arc::clone(&cache),
+        Arc::clone(&sources),
+        prefetch_tx,
+        tb,
+    ));
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _ = nexir::io::prefetch::spawn_prefetch_worker(nexir::io::prefetch::PrefetchWorker::new(
+        prefetch_rx,
+        Arc::clone(&io_layer),
+        Arc::clone(&cache),
+        Arc::clone(&shutdown),
+    ));
+
+    let scheduler = Arc::new(FrameScheduler::new(io_layer, width, height));
+    let shaders = Arc::new(
+        ShaderRegistry::compile_all(device)
+            .map_err(|e| format!("shader compilation failed: {e:?}"))?,
+    );
+
+    Ok((
+        ExportHarness {
+            device: Arc::clone(device),
+            scheduler,
+            timeline,
+            tracks,
+            sources,
+            shaders,
+            compute: Arc::new(ComputePipelineCache::new()),
+            shutdown,
+        },
+        stream,
+        duration_pts,
+    ))
+}
+
+/// Decode the exported file and count its frames.
+///
+/// This is what stops a broken-but-fast export from scoring well. `Err` means the
+/// output does not decode, which is a failure of the export rather than a property
+/// of the host — so the row is reported as failed rather than skipped.
+///
+/// Software decode (`open_sw`): the question is whether the FILE is well formed,
+/// and a hardware decoder's tolerance for a malformed bitstream is its own
+/// property.
+fn verify_exported_file(path: &Path, expect_frames: usize) -> Result<usize, String> {
+    let mut demuxer =
+        Demuxer::open(path).map_err(|e| format!("the exported file will not open: {e:?}"))?;
+    let stream = demuxer
+        .video_stream
+        .clone()
+        .ok_or_else(|| "the exported file has no video stream".to_string())?;
+    let w = stream.width.ok_or("the exported stream has no width")? as usize;
+    let h = stream.height.ok_or("the exported stream has no height")? as usize;
+    let mut decoder = Decoder::open_sw(&stream, stream.codecpar)
+        .map_err(|e| format!("the exported file's codec will not open: {e:?}"))?;
+
+    let mut buf = vec![0u8; w * h * 6 + 256];
+    let mut frames = 0usize;
+    loop {
+        match demuxer.next_video_packet() {
+            Ok(Some(pkt)) => match decoder.decode_into(&pkt, &mut buf, None) {
+                Ok(Some(_)) => frames += 1,
+                Ok(None) => continue,
+                Err(e) => return Err(format!("the exported file failed to decode: {e:?}")),
+            },
+            Ok(None) => break,
+            Err(e) => return Err(format!("demuxing the exported file failed: {e:?}")),
+        }
+    }
+    // Frame-level threading holds frames back; without the drain a short export
+    // decodes to almost nothing and the count assertion below would fire on a
+    // perfectly good file.
+    loop {
+        match decoder.drain_into(&mut buf) {
+            Ok(Some(_)) => frames += 1,
+            Ok(None) => break,
+            Err(e) => return Err(format!("draining the exported file failed: {e:?}")),
+        }
+    }
+
+    if frames == 0 {
+        return Err("the exported file decoded to zero frames".to_string());
+    }
+    // A tolerance of one, for the same reason `media_compat` allows one: an open
+    // GOP can legitimately shift a leading frame. Anything wider than that is
+    // frames going missing.
+    if frames + 1 < expect_frames || frames > expect_frames + 1 {
+        return Err(format!(
+            "the exported file decoded to {frames} frame(s) but the job asked for \
+             {expect_frames} — frames were lost, so the export time above is for a \
+             different amount of work"
+        ));
+    }
+    Ok(frames)
+}
+
+/// Export one class end-to-end through the real `ExportEngine`, then verify the
+/// file it wrote.
+fn run_export_class(
+    device: &Arc<GpuDevice>,
+    class: &'static MediaClass,
+    input: &Path,
+) -> Result<ExportReading, String> {
+    use nexir::export::engine::ExportEngine;
+    use nexir::export::progress::ExportPhase;
+
+    let (harness, stream, duration_pts) = build_export_harness(device, input)?;
+    let tb = Rational::TIMEBASE_90K;
+    let fps = stream.frame_rate.unwrap_or(Rational { num: 30, den: 1 });
+    let out_path = bench_media::fixture_dir().join(format!("{}_export.mp4", class.label));
+    let _ = std::fs::remove_file(&out_path);
+
+    let mut job = nvenc_job_for(
+        stream.width.unwrap_or(1920),
+        stream.height.unwrap_or(1080),
+        fps.num as f64 / fps.den.max(1) as f64,
+        1,
+    );
+    job.output_path = out_path.clone();
+    job.pts_in = 0;
+    job.pts_out = duration_pts;
+    job.frame_rate = fps;
+    job.project_tb = tb;
+    job.validate()
+        .map_err(|e| format!("the bench's own ExportJob is invalid: {e:?}"))?;
+    let frames_requested = job.total_frames();
+
+    let capability = InteropCapability::probe(device);
+    let cuda_ctx = if capability.is_available() {
+        match CudaContext::new(&capability) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                // Not fatal: the engine falls back to the FFmpeg encoder, and an
+                // export that used it is still a real export. What must not happen
+                // is reporting the row as if NVENC ran.
+                println!("    CUDA context unavailable ({e:?}) — the engine will use FFmpeg");
+                None
+            }
+        }
+    } else {
+        println!(
+            "    CUDA interop unavailable (transport={:?}) — the engine will use FFmpeg",
+            capability.transport
+        );
+        None
+    };
+
+    // Ask which backend `select` picks BEFORE starting, using the engine's own
+    // inputs: the engine consumes the backend on its dispatch thread, so afterwards
+    // there is nothing left to probe. Reported rather than assumed — an export timed
+    // without knowing which encoder ran is not comparable to one that does.
+    let nvenc = match nexir::export::video_encoder::VideoEncoderBackend::select(
+        &job,
+        &capability,
+        cuda_ctx.as_ref(),
+        device,
+    ) {
+        Ok(b) => {
+            let is_gpu = matches!(
+                b,
+                nexir::export::video_encoder::VideoEncoderBackend::CudaNvenc { .. }
+            );
+            // Release the probe's session before the engine opens its own: NVENC
+            // allows only a few concurrent sessions.
+            drop(b);
+            is_gpu
+        }
+        Err(e) => {
+            println!("    backend probe failed ({e:?}) — reporting the row as non-NVENC");
+            false
+        }
+    };
+
+    let engine = ExportEngine::new(
+        Arc::clone(&harness.device),
+        job,
+        Arc::clone(&harness.scheduler),
+        Arc::clone(&harness.timeline),
+        Arc::clone(&harness.tracks),
+        Arc::clone(&harness.sources),
+        capability,
+        cuda_ctx,
+        false,
+    );
+
+    // The clock starts at `start`, which is where the engine's own threads begin —
+    // so the measured span covers demux, decode, upload, graph, NV12, encode and
+    // mux, i.e. everything a user waits for.
+    let started = Instant::now();
+    let rx = engine
+        .start(Arc::clone(&harness.shaders), Arc::clone(&harness.compute))
+        .map_err(|e| format!("ExportEngine::start failed: {e:?}"))?;
+
+    // Peak RSS is sampled while the export runs, not read once at the end: the
+    // interesting figure is the high-water mark, and by the time the export is done
+    // the renderer's buffers may already be freed. `None` where the OS query is
+    // unavailable — never a zero.
+    let mut peak_rss = nexir::profiling::sysinfo::process_rss_bytes();
+    let deadline = started + EXPORT_TIMEOUT;
+    let mut last = ExportPhase::Rendering;
+    let terminal = loop {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the export did not finish within {EXPORT_TIMEOUT:?} (last phase: \
+                 {last:?})"
+            ));
+        }
+        match rx.try_recv() {
+            Some(update) => {
+                last = update.phase.clone();
+                if let Some(rss) = nexir::profiling::sysinfo::process_rss_bytes() {
+                    peak_rss = Some(peak_rss.map_or(rss, |p: u64| p.max(rss)));
+                }
+                match update.phase {
+                    ExportPhase::Done => break ExportPhase::Done,
+                    ExportPhase::Cancelled | ExportPhase::Failed(_) => break last.clone(),
+                    _ => {}
+                }
+            }
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    let export_seconds = started.elapsed().as_secs_f64();
+    if terminal != ExportPhase::Done {
+        return Err(format!("the export ended in {terminal:?} rather than Done"));
+    }
+
+    let output_bytes = std::fs::metadata(&out_path)
+        .map_err(|e| format!("the export reported Done but its output is unreadable: {e}"))?
+        .len();
+    // Verified before any figure is reported: a fast export that wrote a broken
+    // file must fail rather than score well.
+    let frames_decoded = verify_exported_file(&out_path, frames_requested)?;
+
+    Ok(ExportReading {
+        label: class.label,
+        width: stream.width.unwrap_or(0),
+        height: stream.height.unwrap_or(0),
+        frames_requested,
+        frames_decoded,
+        input_seconds: duration_pts as f64 / tb.den as f64,
+        export_seconds,
+        output_bytes,
+        peak_rss_bytes: peak_rss,
+        nvenc,
+    })
+}
+
+/// The `--export` profile: export every media class end-to-end and verify each
+/// output.
+///
+/// Returns whether anything ran, for `NEXIR_REQUIRE_MEDIA`.
+fn run_export_profile(device: &Arc<GpuDevice>) -> bool {
+    println!("========================================================================");
+    println!("END-TO-END EXPORT PROFILE — the real ExportEngine");
+    println!("  Input MP4 -> demux -> decode -> upload -> graph -> NV12 -> encoder ->");
+    println!("  mux -> output MP4, driven through ExportEngine::start rather than a");
+    println!("  reimplementation of it. Every output is then reopened and decoded:");
+    println!("  a fast export that wrote a broken file FAILS instead of scoring well.");
+    println!("========================================================================\n");
+
+    let ffmpeg = match bench_media::ffmpeg_binary() {
+        Some(p) => p,
+        None => {
+            println!(
+                "SKIPPED: no `ffmpeg` binary on PATH (set NEXIR_FFMPEG). The inputs are\n\
+                 generated with the CLI, so no export ran.\n"
+            );
+            return false;
+        }
+    };
+
+    // Same knob and same default as the synthetic sweep, deliberately: an export
+    // row is a wall-clock time on a shared machine, so it carries the same
+    // run-to-run spread the 4K synthetic row does and a single reading of it is a
+    // sample rather than a result. `NEXIR_BENCH_REPEATS=1` is the smoke path and
+    // says so in the header, in the same words the synthetic path uses.
+    let repeats: usize = std::env::var("NEXIR_BENCH_REPEATS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_REPEATS);
+    if repeats != DEFAULT_REPEATS {
+        println!(
+            "Repeats: {repeats} (overridden from {DEFAULT_REPEATS}). A single run of the \
+             4K row\nspans ~40% between repeats, so treat any figure from repeats=1 as \
+             a sample.\n"
+        );
+    } else {
+        println!("Repeats: {repeats} per class; the summary reports the median and spread.\n");
+    }
+
+    let mut rows: Vec<ExportRow> = Vec::new();
+    let mut skipped: Vec<(&str, String)> = Vec::new();
+
+    for class in bench_media::MEDIA_CLASSES {
+        println!(
+            ">>> {} — {}x{}@{} ({})",
+            class.label, class.width, class.height, class.fps, class.why
+        );
+        let input = match bench_media::ensure_fixture(&ffmpeg, class) {
+            Ok(p) => p,
+            Err(why) => {
+                println!("    SKIPPED: {why}\n");
+                skipped.push((class.label, why));
+                continue;
+            }
+        };
+
+        let mut runs: Vec<ExportReading> = Vec::with_capacity(repeats);
+        for r in 0..repeats {
+            if repeats > 1 {
+                println!("    --- repeat {}/{} ---", r + 1, repeats);
+            }
+            match run_export_class(device, class, &input) {
+                Ok(reading) => {
+                    println!(
+                        "    Exported {} frame(s) in {:.2} s; the output decodes to {} \
+                         frame(s), {:.1} MB",
+                        reading.frames_requested,
+                        reading.export_seconds,
+                        reading.frames_decoded,
+                        reading.output_bytes as f64 / (1024.0 * 1024.0),
+                    );
+                    runs.push(reading);
+                }
+                Err(why) => {
+                    // A failed repeat fails the whole class rather than being
+                    // dropped from the median: the failures this can return are
+                    // "the file does not decode" and "frames went missing", and a
+                    // median over the repeats that happened to succeed would
+                    // report a rate for a pipeline that is not reliably producing
+                    // the file.
+                    println!("    FAILED: {why}\n");
+                    skipped.push((
+                        class.label,
+                        if runs.is_empty() {
+                            why
+                        } else {
+                            format!("{why} (after {} repeat(s) had succeeded)", runs.len())
+                        },
+                    ));
+                    runs.clear();
+                    break;
+                }
+            }
+        }
+        if !runs.is_empty() {
+            println!();
+            rows.push(ExportRow { runs });
+        }
+    }
+
+    if !rows.is_empty() {
+        println!("------------------------------------------------------------------------");
+        println!("EXPORT SUMMARY — median of {repeats} run(s) per class, with spread");
+        println!("  Realtime is output seconds per second of wall time; >1.0 x means the");
+        println!("  export is faster than playback. FPS is the DECODED frame count over");
+        println!("  the same wall time, so a row can only score well on a file that");
+        println!("  actually decoded. Spread is (max-min)/median over the repeats:");
+        println!("  anything above ~10% means one run's number is not a result on its");
+        println!("  own. Bitrate is counted from the output's own size and duration, not");
+        println!("  from the requested CRF. RSS is the highest peak sampled across the");
+        println!("  repeats.");
+        println!("------------------------------------------------------------------------");
+        println!(
+            "{:<16} {:>11} {:>6} {:>8} {:>9} {:>8} {:>7} {:>9} {:>9}",
+            "Class", "Geometry", "Enc", "Frames", "Export", "FPS", "spread", "Realtime", "Bitrate"
+        );
+        for row in &rows {
+            let first = row.first();
+            println!(
+                "{:<16} {:>11} {:>6} {:>8} {:>7.2} s {:>8} {:>7} {:>8} {:>9}",
+                first.label,
+                format!("{}x{}", first.width, first.height),
+                if first.nvenc { "NVENC" } else { "cpu" },
+                first.frames_decoded,
+                row.median_seconds(),
+                row.median_fps()
+                    .map(|f| format!("{f:.1}"))
+                    .unwrap_or_else(|| "n/a".into()),
+                // `n/a` rather than `0%` on a single repeat: one run is not a run
+                // with zero variance, and printing 0% there would read as the
+                // strongest possible claim about repeatability from the weakest
+                // possible evidence.
+                row.fps_spread_percent()
+                    .map(|s| format!("{s:.0}%"))
+                    .unwrap_or_else(|| "n/a".into()),
+                row.median_realtime()
+                    .map(|x| format!("{x:.2} x"))
+                    .unwrap_or_else(|| "n/a".into()),
+                row.median_bitrate_bps()
+                    .map(|b| format!("{:.1} Mb/s", b / 1.0e6))
+                    .unwrap_or_else(|| "n/a".into()),
+            );
+        }
+        // RSS on its own line: it is a process-wide figure, so it belongs beside the
+        // rows rather than inside one, and it is `n/a` where the OS query is absent.
+        for row in &rows {
+            let first = row.first();
+            println!(
+                "  {:<16} input {:.2} s, {} run(s), peak RSS {}",
+                first.label,
+                first.input_seconds,
+                row.runs.len(),
+                row.peak_rss_bytes()
+                    .map(|b| format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)))
+                    .unwrap_or_else(|| "n/a".into()),
+            );
+        }
+        println!("------------------------------------------------------------------------\n");
+    }
+
+    if !skipped.is_empty() {
+        println!("{} class(es) did NOT produce a verified export:", skipped.len());
+        for (label, why) in &skipped {
+            println!("  - {label}\n      {why}");
+        }
+        println!();
+    }
+
+    !rows.is_empty()
+}
+
 const BENCHMARKS: &[BenchmarkConfig] = &[
     BenchmarkConfig {
         name: "1. Simple 1080p60 (1 layer, composite) — GPU render only",
@@ -2630,19 +3334,24 @@ fn main() {
     }
 
     let mut skipped = Vec::new();
-    // Whether `--media` was asked for. When it is, the synthetic benchmarks are
-    // skipped: the two profiles share one GPU and one process, and running the
-    // 4K60 rows first would leave the media classes' clocks warmed by them —
-    // exactly the position-dependence `WARMUP_DURATION` documents. Run them in
-    // separate invocations and each is measured from the same starting state.
-    let media_only = std::env::args().any(|a| a == "--media");
-    if media_only {
-        let ran = run_media_profile(&device);
+    // `--media` and `--export` each replace the synthetic sweep rather than
+    // appending to it: the profiles share one GPU and one process, and running the
+    // 4K60 rows first would leave the later profile's clocks warmed by them —
+    // exactly the position-dependence `WARMUP_DURATION` documents. One profile per
+    // invocation, and each is measured from the same starting state.
+    let args: Vec<String> = std::env::args().collect();
+    let want_media = args.iter().any(|a| a == "--media");
+    let want_export = args.iter().any(|a| a == "--export");
+    if want_media || want_export {
+        let ran = if want_export {
+            run_export_profile(&device)
+        } else {
+            run_media_profile(&device)
+        };
         if !ran && bench_media::require() {
             eprintln!(
-                "NEXIR_REQUIRE_MEDIA is set but no media class ran. Every figure the\n\
-                 real-media profile would have reported is absent, so this is a failure\n\
-                 rather than a skip."
+                "NEXIR_REQUIRE_MEDIA is set but nothing ran. Every figure the profile\n\
+                 would have reported is absent, so this is a failure rather than a skip."
             );
             std::process::exit(1);
         }
