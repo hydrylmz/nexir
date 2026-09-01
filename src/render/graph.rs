@@ -429,6 +429,35 @@ impl CompiledGraph {
         self.texture_pool.lock().unwrap().stats()
     }
 
+    /// Acquire a pooled texture for every declared resource, for one frame.
+    ///
+    /// Shared by all three `execute*` bodies. The acquire loop is the one part of
+    /// them that must stay identical — a divergence is a resource the timed path
+    /// pools and the untimed one does not, which the pool's counters would then
+    /// disagree about between runs — so it lives here rather than being copied a
+    /// third time.
+    fn resolve_resources(
+        &self,
+        device: &GpuDevice,
+    ) -> Vec<Option<(wgpu::Texture, wgpu::TextureView, crate::render::resource::ViewId)>> {
+        let mut slots: Vec<Option<(wgpu::Texture, wgpu::TextureView, crate::render::resource::ViewId)>> =
+            (0..self.descriptors.len()).map(|_| None).collect();
+
+        let mut pool = self.texture_pool.lock().unwrap();
+        for (id_usize, desc_opt) in self.descriptors.iter().enumerate() {
+            if let Some((desc, usage)) = desc_opt {
+                let (w, h) = match desc.size {
+                    ResolutionSource::Canvas => (self.canvas_width, self.canvas_height),
+                    ResolutionSource::Fixed(fw, fh) => (fw, fh),
+                };
+                slots[id_usize] = Some(pool.acquire(device, desc.format, *usage, w, h));
+            }
+        }
+        drop(pool);
+
+        slots
+    }
+
     /// Execute the compiled graph for one frame.
     pub fn execute(
         &self,
@@ -437,28 +466,9 @@ impl CompiledGraph {
         frame: &FrameState,
     ) {
         // Step 1 & 2: Acquire transient textures and create views
-        let mut pool = self.texture_pool.lock().unwrap();
-        let mut resources: Vec<Option<(wgpu::Texture, wgpu::TextureView, crate::render::resource::ViewId)>> =
-            (0..self.descriptors.len()).map(|_| None).collect();
+        let ctx = RenderContext::new(self.resolve_resources(device));
 
-        for (id_usize, desc_opt) in self.descriptors.iter().enumerate() {
-            if let Some((desc, usage)) = desc_opt {
-                let (w, h) = match desc.size {
-                    ResolutionSource::Canvas => (self.canvas_width, self.canvas_height),
-                    ResolutionSource::Fixed(fw, fh) => (fw, fh),
-                };
-
-                resources[id_usize] = Some(pool.acquire(device, desc.format, *usage, w, h));
-            }
-        }
-
-        // Drop the MutexGuard
-        drop(pool);
-
-        // Step 3: Build RenderContext
-        let ctx = RenderContext::new(resources);
-
-        // Step 4: Execute nodes
+        // Step 3: Execute nodes
         for &node_idx in &self.order {
             let node = &self.nodes[node_idx];
             encoder.push_debug_group(node.name());
@@ -466,13 +476,12 @@ impl CompiledGraph {
             encoder.pop_debug_group();
         }
 
-        // Step 5: Release transient textures
+        // Step 4: Release transient textures
         let mut pool = self.texture_pool.lock().unwrap();
         for res in ctx.into_resources().into_iter().flatten() {
             pool.release(res);
         }
     }
-
 
     /// Execute with one GPU timestamp bracket per node.
     ///
@@ -504,27 +513,10 @@ impl CompiledGraph {
         frame: &FrameState,
         timer: &mut crate::render::gpu_timer::GpuTimer,
     ) -> Vec<&'a str> {
-        // Acquire exactly as `execute` does. Duplicated rather than shared because
-        // the alternative is a closure per node in the hot path — and the pool
-        // interaction is the part that must stay identical, which the pool's own
-        // counters make checkable: a timed run and an untimed one must report the
-        // same hit/miss/evicted numbers.
-        let mut pool = self.texture_pool.lock().unwrap();
-        let mut resources: Vec<Option<(wgpu::Texture, wgpu::TextureView, crate::render::resource::ViewId)>> =
-            (0..self.descriptors.len()).map(|_| None).collect();
-
-        for (id_usize, desc_opt) in self.descriptors.iter().enumerate() {
-            if let Some((desc, usage)) = desc_opt {
-                let (w, h) = match desc.size {
-                    ResolutionSource::Canvas => (self.canvas_width, self.canvas_height),
-                    ResolutionSource::Fixed(fw, fh) => (fw, fh),
-                };
-                resources[id_usize] = Some(pool.acquire(device, desc.format, *usage, w, h));
-            }
-        }
-        drop(pool);
-
-        let ctx = RenderContext::new(resources);
+        // Acquire exactly as `execute` does — through the same helper, so the two
+        // cannot drift. That the pool interaction is identical is checkable: a timed
+        // run and an untimed one must report the same hit/miss/evicted numbers.
+        let ctx = RenderContext::new(self.resolve_resources(device));
 
         let mut names: Vec<&'a str> = Vec::with_capacity(self.order.len());
         for &node_idx in &self.order {
@@ -562,24 +554,7 @@ impl CompiledGraph {
     ) where
         F: FnOnce(&mut wgpu::CommandEncoder, &RenderContext),
     {
-        let mut pool = self.texture_pool.lock().unwrap();
-        let mut resources: Vec<Option<(wgpu::Texture, wgpu::TextureView, crate::render::resource::ViewId)>> =
-            (0..self.descriptors.len()).map(|_| None).collect();
-
-        for (id_usize, desc_opt) in self.descriptors.iter().enumerate() {
-            if let Some((desc, usage)) = desc_opt {
-                let (w, h) = match desc.size {
-                    ResolutionSource::Canvas => (self.canvas_width, self.canvas_height),
-                    ResolutionSource::Fixed(fw, fh) => (fw, fh),
-                };
-
-                resources[id_usize] = Some(pool.acquire(device, desc.format, *usage, w, h));
-            }
-        }
-
-        drop(pool);
-
-        let ctx = RenderContext::new(resources);
+        let ctx = RenderContext::new(self.resolve_resources(device));
 
         for &node_idx in &self.order {
             let node = &self.nodes[node_idx];

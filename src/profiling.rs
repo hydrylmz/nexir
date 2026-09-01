@@ -1,5 +1,14 @@
 // src/profiling/mod.rs
 
+/// OS-level process metrics (RSS, CPU utilisation). Separate file because it is
+/// the only `#[cfg(windows)]` FFI in the profiler and everything else here is
+/// portable arithmetic.
+pub mod sysinfo;
+
+/// Native FFI for the driver-only metrics: NVML for GPU/NVENC utilisation and VRAM.
+/// Layout constants are established by `nvchk/nvml_probe.c`.
+pub mod ffi;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -418,10 +427,54 @@ pub struct ProfileReport {
     pub total_frame_stats: StageStats,
     /// Distribution of the wall-clock interval between frames retiring.
     ///
+    /// **Whole-run**, including the pipeline-fill interval — which is what keeps
+    /// its mean comparable with [`Self::average_fps`], since both then cover the
+    /// same seconds. For the percentiles a 60 FPS target is read off, use
+    /// [`Self::steady_latency_stats`]: on a 90-frame run the P99 index resolves to
+    /// the largest sample, and the largest sample is the fill.
+    ///
     /// `None` when nothing recorded a latency, which is the honest answer for a
     /// caller that never stamped one: a P95 of `0.00 ms` and "we did not measure
     /// the frame interval" are different claims.
     pub frame_latency_stats: Option<StageStats>,
+    /// The first stamped interval: the pipeline **fill**, from the loop starting to
+    /// the first frame retiring.
+    ///
+    /// Reported on its own because it is a startup cost of a different kind from
+    /// everything after it — it contains the submit work for the first
+    /// `gpu_lookahead` frames, the first NVENC picture, and any first-frame
+    /// allocation, none of which recurs. Measured at 4K: 67-91 ms against a 20 ms
+    /// steady-state mean.
+    ///
+    /// It is **kept in the series** rather than dropped, because dropping it is a
+    /// bug this project already had once — an unseeded `last_retire` silently
+    /// omitted it and the mean then read 18.25 ms on a run delivering a frame every
+    /// 21.1 ms. Separated and printed, not discarded.
+    pub pipeline_fill_ms: Option<f64>,
+    /// Distribution of the frame interval **after** the pipeline has filled, i.e.
+    /// every stamped interval except the first.
+    ///
+    /// **This is the row a "P95 ≤ 16.67 ms" target is read off.** The whole-run
+    /// series answers "did the instrument cover the run"; this one answers "how
+    /// evenly did frames arrive once the pipeline was running", which is the
+    /// question a viewer experiences and the only one a percentile over ~90 samples
+    /// can answer at all — see [`Self::pipeline_fill_ms`].
+    ///
+    /// `None` when fewer than two intervals were stamped.
+    pub steady_latency_stats: Option<StageStats>,
+    /// Mean steady-state interval of the even- and odd-indexed frames, separately.
+    ///
+    /// **A distribution cannot see a cycle.** The 4K row's steady intervals split
+    /// cleanly into 17.6 ms and 25.4 ms by frame parity, which is why its P95 sits
+    /// 25% above its mean — not a stall on a few frames, but every other frame
+    /// arriving late in a repeating two-state pattern. A percentile over the pooled
+    /// series is identical whether the slow frames alternate or cluster, so the
+    /// split has to be measured separately or the shape is invisible.
+    ///
+    /// Parity of the frame index within the steady series, so `(even, odd)`.
+    /// `None` when there are fewer than four steady intervals — below that, two
+    /// means each drawn from one or two samples say nothing.
+    pub latency_alternation: Option<(f64, f64)>,
     pub system_metrics: SystemMetrics,
 }
 
@@ -608,13 +661,59 @@ impl ProfileReport {
             self.total_frame_stats.p99_ms,
             100.0
         ));
-        // The frame interval, and the only row a "P95 ≤ 16.67 ms" target can be
-        // read off. Omitted entirely when unmeasured rather than printed as zeros.
+        // The frame interval. Two rows on purpose: the whole-run series (whose mean
+        // must agree with throughput) and the steady-state series after the pipeline
+        // has filled (whose percentiles are what a 60 FPS target is about). Omitted
+        // entirely when unmeasured rather than printed as zeros.
         if let Some(lat) = &self.frame_latency_stats {
             out.push_str(&format!(
                 "{:<16} {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>8}\n",
                 "Frame latency", lat.avg_ms, lat.min_ms, lat.p95_ms, lat.p99_ms, "—"
             ));
+            // The steady row, and the fill it was separated from. Both printed:
+            // hiding the fill would be trimming the sample that made the P99 large,
+            // and printing only the whole-run P99 attributes a startup cost to a
+            // frame that arrived late.
+            if let (Some(steady), Some(fill)) = (&self.steady_latency_stats, self.pipeline_fill_ms) {
+                out.push_str(&format!(
+                    "{:<16} {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>8.2} ms {:>8}\n",
+                    "  ↳ steady",
+                    steady.avg_ms,
+                    steady.min_ms,
+                    steady.p95_ms,
+                    steady.p99_ms,
+                    "—"
+                ));
+                out.push_str(&format!(
+                    "  Pipeline fill (first interval, excluded from ↳ steady only): \
+                     {fill:.2} ms\n"
+                ));
+                // The two-state pattern, when there is one. Printed only above a
+                // threshold because a few percent apart is noise, and a line
+                // announcing a "pattern" on every run would train the reader to skip
+                // it. Above ~15% it is the dominant fact about the row: the P95 is
+                // then not a tail at all but the slow half of a cycle.
+                if let Some((even, odd)) = self.latency_alternation {
+                    let (lo, hi) = if even <= odd { (even, odd) } else { (odd, even) };
+                    if lo > 0.0 && (hi - lo) / lo > 0.15 {
+                        out.push_str(&format!(
+                            "  ALTERNATING: frames arrive {lo:.2} ms / {hi:.2} ms in a \
+                             two-frame cycle\n   ({:.0}% apart). The P95 above is the \
+                             slow half of that cycle, NOT a rare\n   stall — a fix must \
+                             change the cycle, and pipeline depth will not.\n",
+                            (hi - lo) / lo * 100.0,
+                        ));
+                    }
+                }
+                // Said explicitly, because the two P99s can differ by 2-3x and a
+                // reader needs to know which one the target is about.
+                out.push_str(
+                    "  Read P95/P99 off ↳ steady: the whole-run row's tail IS the fill \
+                     on a\n  short run (the P99 index lands on the largest sample). \
+                     Read the MEAN off\n  the whole-run row, which covers the same \
+                     seconds as Avg FPS.\n",
+                );
+            }
             out.push_str(
                 "  (Frame latency is wall-clock spacing between frames retiring — the \
                  quantity\n   P95/P99 targets are about. CPU per frame is the CPU's \
@@ -727,6 +826,242 @@ impl ProfilingSession {
         inner.system_metrics = metrics;
     }
 
+    /// A copy of every frame profile recorded so far, in arrival order.
+    ///
+    /// For per-frame analysis that a summary cannot answer: [`ProfileReport`]
+    /// carries distributions, and a distribution cannot say whether the frame with
+    /// the worst latency is the frame with the worst upload. Percentiles taken
+    /// over two series independently are compatible with any pairing between them,
+    /// so a tail explanation built on "the P99s are both large" is not evidence —
+    /// see [`format_frame_dump`].
+    pub fn frames_snapshot(&self) -> Vec<FrameProfile> {
+        self.inner.lock().unwrap().frames.clone()
+    }
+}
+
+/// Pearson correlation between two equal-length per-frame series.
+///
+/// `None` when there are fewer than three pairs, when the lengths differ, or when
+/// either series has no variance — in all three cases a coefficient would be
+/// arithmetic without meaning, and printing one anyway is how a tail gets
+/// attributed to whatever was measured next to it.
+pub fn pearson(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    if xs.len() != ys.len() || xs.len() < 3 {
+        return None;
+    }
+    let n = xs.len() as f64;
+    let mx = xs.iter().sum::<f64>() / n;
+    let my = ys.iter().sum::<f64>() / n;
+    let mut cov = 0.0;
+    let mut vx = 0.0;
+    let mut vy = 0.0;
+    for (x, y) in xs.iter().zip(ys) {
+        let dx = x - mx;
+        let dy = y - my;
+        cov += dx * dy;
+        vx += dx * dx;
+        vy += dy * dy;
+    }
+    if vx <= 0.0 || vy <= 0.0 {
+        return None;
+    }
+    Some(cov / (vx * vy).sqrt())
+}
+
+/// The value above which a sample counts as an outlier: median + 3 scaled MADs.
+///
+/// Robust rather than mean+3σ because the series this is applied to is exactly the
+/// kind with a long tail: one 45 ms upload among 5 ms ones drags a standard
+/// deviation far enough that the outlier stops being an outlier by its own measure
+/// (σ ≈ 8.7 there, so mean+3σ ≈ 33 and the mean has already moved to 7).
+///
+/// **A flat series must select nothing, not everything.** When the MAD is zero —
+/// which happens whenever more than half the samples are identical — `median + 3
+/// MADs` collapses to the median itself, and "anything above the median" would flag
+/// half the run. The zero-MAD arm therefore doubles the median instead, so a series
+/// of equal values selects nothing while a single large value among them still
+/// stands out. This case is live, not hypothetical: `↳ submit` on the
+/// `write_texture` path is sub-microsecond on every frame, and a "top N slowest"
+/// ranking over it would name whichever frames happened to sort first and then
+/// report them as coinciding with the latency tail.
+///
+/// `None` for an empty series.
+pub fn outlier_threshold(samples: &[f64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut v = samples.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = v[v.len() / 2];
+    let mut dev: Vec<f64> = v.iter().map(|x| (x - med).abs()).collect();
+    dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mad = dev[dev.len() / 2];
+    if mad > 0.0 {
+        // 1.4826 puts the MAD on the same scale as a standard deviation for
+        // normal data, so "3 MADs" reads like the familiar 3σ.
+        Some(med + 3.0 * 1.4826 * mad)
+    } else {
+        // No spread to scale by. Twice the median: a flat series selects nothing
+        // (nothing exceeds 2× its own value when every value is the median), while
+        // a lone spike among identical samples still does.
+        Some(med * 2.0)
+    }
+}
+
+/// Per-frame dump of the worst-latency frames, with the stages that could explain
+/// them.
+///
+/// **This exists because a percentile cannot attribute a tail.** The 4K row shows
+/// a 54.6 ms latency P99 against a 20.0 ms mean, and an `Upload` P99 of 43-46 ms
+/// against a 5.3 ms mean; those two facts are equally consistent with "the late
+/// frame is the slow upload" and with "two unrelated frames were slow". Only the
+/// pairing decides, so this prints the pairing: the `worst` latest frames, each
+/// with its own upload/prepare/submit and GPU spans, plus
+///
+///   * the Pearson coefficient between latency and each candidate stage, and
+///   * the **intersection of the outlier sets** — which of the frames that arrived
+///     anomalously late also uploaded anomalously slowly.
+///
+/// The intersection is stated over outlier *sets* rather than as "how many of the
+/// top N overlap" because the latter cannot survive ties: on the `write_texture`
+/// path every frame's `↳ submit` is a fraction of a microsecond, so a
+/// slowest-N ranking over it names arbitrary frames and then reports them as
+/// coinciding with the tail. See [`outlier_threshold`].
+///
+/// An empty intersection **refutes** the upload explanation, which is the outcome
+/// that matters: it sends the investigation to the texture pool rather than to
+/// `write_buffer`.
+pub fn format_frame_dump(frames: &[FrameProfile], worst: usize) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "── Per-frame outliers (NEXIR_FRAME_DUMP) ────────────────────────────────\n",
+    );
+
+    // Only frames that carry a latency stamp: frame 0 has no interval before it,
+    // and a frame without one cannot be ranked by lateness at all.
+    let mut rows: Vec<(usize, f64, &FrameProfile)> = frames
+        .iter()
+        .filter_map(|f| f.latency_ms().map(|l| (f.frame_index, l, f)))
+        .collect();
+    if rows.len() < 3 {
+        out.push_str(
+            "  Fewer than 3 frames carry a latency stamp; nothing to attribute.\n",
+        );
+        return out;
+    }
+
+    let lat_series: Vec<f64> = rows.iter().map(|(_, l, _)| *l).collect();
+    let submit_series: Vec<f64> = rows
+        .iter()
+        .map(|(_, _, f)| f.stage_time_ms(PipelineStage::UploadSubmit))
+        .collect();
+    let upload_series: Vec<f64> = rows
+        .iter()
+        .map(|(_, _, f)| f.stage_time_ms(PipelineStage::Upload))
+        .collect();
+    let cpu_series: Vec<f64> = rows.iter().map(|(_, _, f)| f.total_time_ms()).collect();
+    // The GPU-timeline spans, over the frames that carry them. Included because
+    // this is the candidate the upload lead competes with: if latency tracks the
+    // transfer span and not `↳ submit`, the tail is queue time and not
+    // `write_buffer`. Frames missing a reading (the first, which has no previous
+    // frame's closing tick) are dropped from BOTH series so the pairs stay aligned
+    // — substituting 0.0 would invent a fast frame and flatten the coefficient.
+    let (gpu_lat_series, xfer_series): (Vec<f64>, Vec<f64>) = rows
+        .iter()
+        .filter_map(|(_, l, f)| f.gpu_time_ms(PipelineStage::GpuTransfer).map(|x| (*l, x)))
+        .unzip();
+    let (graph_lat_series, graph_series): (Vec<f64>, Vec<f64>) = rows
+        .iter()
+        .filter_map(|(_, l, f)| f.gpu_time_ms(PipelineStage::Composite).map(|x| (*l, x)))
+        .unzip();
+
+    // Ranked by lateness, worst first.
+    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let take = worst.min(rows.len());
+
+    out.push_str(&format!(
+        "{:>7} {:>10} {:>10} {:>10} {:>10} {:>11} {:>11}\n",
+        "frame", "latency", "CPU sum", "Upload", "↳ submit", "GPU graph", "GPU xfer"
+    ));
+    fn opt(v: Option<f64>) -> String {
+        v.map(|x| format!("{x:>8.2} ms")).unwrap_or_else(|| format!("{:>11}", "n/a"))
+    }
+    for (idx, lat, f) in rows.iter().take(take) {
+        out.push_str(&format!(
+            "{idx:>7} {lat:>7.2} ms {:>7.2} ms {:>7.2} ms {:>7.2} ms {} {}\n",
+            f.total_time_ms(),
+            f.stage_time_ms(PipelineStage::Upload),
+            f.stage_time_ms(PipelineStage::UploadSubmit),
+            opt(f.gpu_time_ms(PipelineStage::Composite)),
+            opt(f.gpu_time_ms(PipelineStage::GpuTransfer)),
+        ));
+    }
+
+    // ── The pairing, as an intersection of outlier sets ───────────────────────
+    // Ranked in the same frame order as the series above, so index i of every
+    // series is the same frame.
+    let ordered: Vec<usize> = frames
+        .iter()
+        .filter(|f| f.latency.is_some())
+        .map(|f| f.frame_index)
+        .collect();
+    let pick = |series: &[f64]| -> std::collections::BTreeSet<usize> {
+        match outlier_threshold(series) {
+            Some(t) => ordered
+                .iter()
+                .zip(series)
+                .filter(|(_, v)| **v > t)
+                .map(|(i, _)| *i)
+                .collect(),
+            None => Default::default(),
+        }
+    };
+    let late = pick(&lat_series);
+    let slow_submit = pick(&submit_series);
+    let both: Vec<usize> = late.intersection(&slow_submit).copied().collect();
+
+    out.push_str(&format!(
+        "  Outlier sets (> median + 3 MAD): {} late frame(s), {} slow-submit \
+         frame(s),\n  {} in BOTH{}\n",
+        late.len(),
+        slow_submit.len(),
+        both.len(),
+        if both.is_empty() {
+            " — the late frames are NOT the slow uploads.".to_string()
+        } else {
+            format!(" — frames {both:?}.")
+        },
+    ));
+
+    fn r(v: Option<f64>) -> String {
+        v.map(|x| format!("{x:+.3}")).unwrap_or_else(|| "n/a (no variance)".into())
+    }
+    out.push_str(&format!(
+        "  Pearson r vs latency over {} frames:  ↳submit {}   Upload {}   CPU sum {}\n",
+        lat_series.len(),
+        r(pearson(&lat_series, &submit_series)),
+        r(pearson(&lat_series, &upload_series)),
+        r(pearson(&lat_series, &cpu_series)),
+    ));
+    // The competing explanation, on the same footing. `GPU xfer` is the span
+    // between one frame's graph closing and the next's opening — where wgpu's own
+    // staging copies execute — so a latency series that tracks it rather than
+    // `↳ submit` says the time is on the queue, not in this thread's `write_buffer`
+    // call.
+    out.push_str(&format!(
+        "  {:<38}  GPU xfer {}   GPU graph {}\n",
+        format!("(over {} frame(s) carrying GPU ticks)", xfer_series.len()),
+        r(pearson(&gpu_lat_series, &xfer_series)),
+        r(pearson(&graph_lat_series, &graph_series)),
+    ));
+    out.push_str(
+        "  (A coefficient near 0 with an empty intersection means the late frame is not \
+         the\n   slow upload, and the tail is somewhere this dump does not measure.)\n",
+    );
+    out
+}
+
+impl ProfilingSession {
     /// Compute summary report over all accumulated frame profiles.
     pub fn generate_report(&self) -> ProfileReport {
         let inner = self.inner.lock().unwrap();
@@ -821,12 +1156,60 @@ impl ProfilingSession {
         // Frame latency: the interval frames actually arrived at, gathered only
         // from the frames that carry one. Defaulting a missing stamp to 0.0 would
         // drag the mean toward zero and report a pipeline faster than the clock.
-        let mut latency_samples: Vec<f64> =
+        //
+        // Collected in ARRIVAL order first, because the first stamped interval is
+        // the pipeline fill and has to be separable from the rest — see
+        // `ProfileReport::pipeline_fill_ms`. Sorting happens inside
+        // `compute_distribution_stats`, on copies.
+        let ordered_latencies: Vec<f64> =
             inner.frames.iter().filter_map(|f| f.latency_ms()).collect();
+        let mut latency_samples = ordered_latencies.clone();
         let frame_latency_stats = if latency_samples.is_empty() {
             None
         } else {
             Some(compute_distribution_stats(&mut latency_samples))
+        };
+
+        // The fill, and the steady state after it.
+        //
+        // Split rather than trimmed: the whole-run series above still contains the
+        // fill, so its mean stays comparable with `average_fps`, while the
+        // percentiles a 60 FPS target is read off come from the steady series. On a
+        // 90-frame run the P99 index lands on the largest sample, and at 4K the
+        // largest sample is the 67-91 ms fill — so the old P99 of 54.6 ms was
+        // reporting the pipeline starting up, not a frame arriving late.
+        let pipeline_fill_ms = ordered_latencies.first().copied();
+        let steady_latency_stats = if ordered_latencies.len() > 1 {
+            let mut steady = ordered_latencies[1..].to_vec();
+            Some(compute_distribution_stats(&mut steady))
+        } else {
+            None
+        };
+
+        // The two-state pattern, measured rather than eyeballed off a CSV. See
+        // `ProfileReport::latency_alternation`: pooled percentiles cannot
+        // distinguish "every other frame is late" from "a few frames stalled", and
+        // the two call for completely different fixes.
+        let latency_alternation = if ordered_latencies.len() >= 5 {
+            let steady = &ordered_latencies[1..];
+            let (mut even, mut odd) = (Vec::new(), Vec::new());
+            for (i, v) in steady.iter().enumerate() {
+                if i % 2 == 0 {
+                    even.push(*v)
+                } else {
+                    odd.push(*v)
+                }
+            }
+            if even.len() >= 2 && odd.len() >= 2 {
+                Some((
+                    even.iter().sum::<f64>() / even.len() as f64,
+                    odd.iter().sum::<f64>() / odd.len() as f64,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         ProfileReport {
@@ -839,6 +1222,9 @@ impl ProfilingSession {
             stage_stats,
             total_frame_stats,
             frame_latency_stats,
+            pipeline_fill_ms,
+            steady_latency_stats,
+            latency_alternation,
             system_metrics: inner.system_metrics,
         }
     }
@@ -1444,6 +1830,298 @@ mod tests {
         let report = session.generate_report();
         assert!(report.transfer_bandwidth_gbps().is_none());
         assert!(!report.format_table().contains("GB/s"));
+    }
+
+    /// The pipeline-fill interval must be separated from the steady state, and
+    /// kept.
+    ///
+    /// THE BUG THIS PINS. The 4K row's "latency P99 = 54.6 ms against a 20.0 ms
+    /// mean" was read off the whole-run series. A 90-frame run stamps ~90
+    /// intervals, so `ceil(90 × 0.99) - 1 = 88` — the second-largest sample — and
+    /// the largest two are the pipeline fill (measured 67-91 ms at 4K) and whatever
+    /// sat next to it. The "tail stall" was the pipeline starting up, reported as a
+    /// frame arriving late in steady playback.
+    ///
+    /// The fix is a split, NOT a trim: dropping the fill is the other bug this
+    /// project already had, where an unstamped fill made the mean disagree with
+    /// throughput. So the whole-run row keeps it (its mean stays comparable with
+    /// `average_fps`) and the steady row excludes it (its percentiles answer the
+    /// 60 FPS question).
+    #[test]
+    fn the_pipeline_fill_is_separated_from_the_steady_state_and_not_discarded() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..90 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(PipelineStage::Upload, Duration::from_millis(4));
+            // One 80 ms fill, then a steady 20 ms — exactly the 4K shape.
+            fp.record_latency(if i == 0 {
+                Duration::from_millis(80)
+            } else {
+                Duration::from_millis(20)
+            });
+            session.push_frame(fp);
+        }
+        let report = session.generate_report();
+
+        let whole = report.frame_latency_stats.expect("latency recorded");
+        let steady = report.steady_latency_stats.expect("89 steady intervals");
+        assert_eq!(report.pipeline_fill_ms, Some(80.0), "the fill must be reported");
+
+        // The whole-run tail is the fill.
+        assert!(
+            whole.p99_ms > 70.0,
+            "the whole-run P99 is the fill by construction, got {:.2}",
+            whole.p99_ms
+        );
+        // The steady tail is the steady state, and it passes a 16.67 ms-class
+        // target's shape (here 20 ms, but with no 80 ms sample in it).
+        assert!(
+            (steady.p99_ms - 20.0).abs() < 0.01,
+            "the steady P99 must exclude the fill, got {:.2}",
+            steady.p99_ms
+        );
+        // And the fill is still inside the whole-run series, so the mean covers the
+        // whole run.
+        assert!(
+            whole.avg_ms > steady.avg_ms,
+            "the whole-run mean must include the fill: whole {:.2} vs steady {:.2}",
+            whole.avg_ms,
+            steady.avg_ms
+        );
+
+        let table = report.format_table();
+        assert!(table.contains("↳ steady"), "the steady row must be printed:\n{table}");
+        assert!(
+            table.contains("Pipeline fill"),
+            "the fill must be printed, not silently dropped:\n{table}"
+        );
+        assert!(
+            table.contains("Read P95/P99 off ↳ steady"),
+            "the table must say which row a target is read off:\n{table}"
+        );
+    }
+
+    /// A run with a single interval has no steady state to report, and must say
+    /// nothing rather than repeat the fill as if it were one.
+    #[test]
+    fn a_single_interval_yields_no_steady_series() {
+        let session = ProfilingSession::new(60.0);
+        let mut fp = FrameProfile::new(0, 0);
+        fp.record_latency(Duration::from_millis(80));
+        session.push_frame(fp);
+        let report = session.generate_report();
+        assert_eq!(report.pipeline_fill_ms, Some(80.0));
+        assert!(
+            report.steady_latency_stats.is_none(),
+            "one interval is a fill and nothing else"
+        );
+        assert!(!report.format_table().contains("↳ steady"));
+    }
+
+    /// An alternating interval must be reported as a cycle, not as a tail.
+    ///
+    /// THE FINDING THIS PINS. Benchmark 5's steady intervals are 17.6 ms on
+    /// even-indexed frames and 25.4 ms on odd ones — measured, `target/p21_run1.csv`
+    /// — and its `GPU transfer` span splits the same way (9.3 / 17.6 ms) while its
+    /// graph execution does not (8.5 ms either way). So the row's P95 sitting 25%
+    /// above its mean is not a rare stall; it is every other frame. A pooled
+    /// percentile is blind to the difference, and the two diagnoses lead opposite
+    /// ways: a stall invites more pipeline depth, a cycle is made worse by it.
+    #[test]
+    fn an_alternating_latency_is_reported_as_a_cycle() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..90 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_latency(if i == 0 {
+                Duration::from_millis(66)
+            } else if i % 2 == 0 {
+                Duration::from_micros(17_600)
+            } else {
+                Duration::from_micros(25_400)
+            });
+            session.push_frame(fp);
+        }
+        let report = session.generate_report();
+        let (even, odd) = report.latency_alternation.expect("89 steady intervals");
+        // Steady series starts at frame 1 (odd), so its index-0 bucket is the
+        // odd-numbered frames.
+        let (lo, hi) = if even <= odd { (even, odd) } else { (odd, even) };
+        assert!((lo - 17.6).abs() < 0.2, "fast half should be ~17.6 ms, got {lo:.2}");
+        assert!((hi - 25.4).abs() < 0.2, "slow half should be ~25.4 ms, got {hi:.2}");
+
+        let table = report.format_table();
+        assert!(
+            table.contains("ALTERNATING"),
+            "a 44% two-state split must be called out:\n{table}"
+        );
+        assert!(
+            table.contains("NOT a rare"),
+            "the table must say the P95 is a cycle rather than a tail:\n{table}"
+        );
+    }
+
+    /// ...and an evenly paced run must NOT carry that line, or it is noise.
+    #[test]
+    fn a_steady_latency_is_not_reported_as_alternating() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..40 {
+            let mut fp = FrameProfile::new(i, 0);
+            // A few percent of jitter, alternating — below the threshold.
+            fp.record_latency(Duration::from_micros(if i % 2 == 0 { 16_500 } else { 17_000 }));
+            session.push_frame(fp);
+        }
+        let report = session.generate_report();
+        assert!(report.latency_alternation.is_some(), "the split is still computed");
+        assert!(
+            !report.format_table().contains("ALTERNATING"),
+            "3% apart is jitter, not a cycle"
+        );
+    }
+
+    /// A per-frame dump must decide the pairing, not restate the percentiles.
+    ///
+    /// Fixture: latency and upload spike on DIFFERENT frames. Both series then
+    /// have exactly the distributions of the "they line up" case below, so anything
+    /// reading only percentiles cannot tell the two apart — and telling them apart
+    /// is the whole purpose of P2.1's first step. Here the answer must be "no
+    /// frame is in both sets".
+    #[test]
+    fn a_frame_dump_refutes_the_upload_lead_when_the_spikes_do_not_line_up() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..40 {
+            let mut fp = FrameProfile::new(i, 0);
+            fp.record_stage(
+                PipelineStage::UploadSubmit,
+                if i == 10 { Duration::from_millis(45) } else { Duration::from_millis(5) },
+            );
+            fp.record_stage(PipelineStage::Upload, Duration::from_millis(5));
+            fp.record_latency(if i == 30 {
+                Duration::from_millis(54)
+            } else {
+                Duration::from_millis(20)
+            });
+            session.push_frame(fp);
+        }
+        let frames = session.frames_snapshot();
+        let dump = format_frame_dump(&frames, 3);
+        assert!(
+            dump.contains("0 in BOTH") && dump.contains("NOT the slow uploads"),
+            "the spikes are on frames 30 and 10; the dump must say they do not \
+             coincide:\n{dump}"
+        );
+        assert!(
+            dump.contains("1 late frame(s), 1 slow-submit frame(s)"),
+            "each series has exactly one outlier:\n{dump}"
+        );
+        assert!(
+            dump.lines().any(|l| l.trim_start().starts_with("30 ")),
+            "the late frame must be named:\n{dump}"
+        );
+    }
+
+    /// ...and must confirm it when they do, or an empty intersection means nothing.
+    #[test]
+    fn a_frame_dump_confirms_the_upload_lead_when_the_spikes_coincide() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..40 {
+            let mut fp = FrameProfile::new(i, 0);
+            let slow = i == 30;
+            fp.record_stage(
+                PipelineStage::UploadSubmit,
+                if slow { Duration::from_millis(45) } else { Duration::from_millis(5) },
+            );
+            fp.record_latency(if slow {
+                Duration::from_millis(54)
+            } else {
+                Duration::from_millis(20)
+            });
+            session.push_frame(fp);
+        }
+        let frames = session.frames_snapshot();
+        let dump = format_frame_dump(&frames, 3);
+        assert!(
+            dump.contains("1 in BOTH") && dump.contains("frames [30]"),
+            "the coinciding spike must be named as the shared outlier:\n{dump}"
+        );
+        let r = pearson(
+            &frames.iter().filter_map(|f| f.latency_ms()).collect::<Vec<_>>(),
+            &frames
+                .iter()
+                .filter(|f| f.latency.is_some())
+                .map(|f| f.stage_time_ms(PipelineStage::UploadSubmit))
+                .collect::<Vec<_>>(),
+        )
+        .expect("both series vary");
+        assert!(r > 0.9, "one shared spike must correlate strongly, got {r:.3}");
+    }
+
+    /// A stage that is flat across every frame has NO outliers, so it can never be
+    /// the shared one.
+    ///
+    /// This is the case a rank-based overlap gets wrong, and it is the live one:
+    /// `↳ submit` on the `write_texture` path is sub-microsecond every frame, so
+    /// "the 3 slowest uploads" is 3 arbitrary frames. Ranking would then report
+    /// them as coinciding with the latency tail and the dump would confirm the
+    /// upload lead on a run where the upload does nothing.
+    #[test]
+    fn a_flat_stage_is_never_the_shared_outlier() {
+        let session = ProfilingSession::new(60.0);
+        for i in 0..40 {
+            let mut fp = FrameProfile::new(i, 0);
+            // Identical on every frame — the write_texture path's submit cost.
+            fp.record_stage(PipelineStage::UploadSubmit, Duration::from_micros(1));
+            fp.record_latency(if i == 30 {
+                Duration::from_millis(54)
+            } else {
+                Duration::from_millis(20)
+            });
+            session.push_frame(fp);
+        }
+        let frames = session.frames_snapshot();
+        let dump = format_frame_dump(&frames, 3);
+        assert!(
+            dump.contains("0 slow-submit frame(s)"),
+            "a flat series has no outliers at all:\n{dump}"
+        );
+        assert!(
+            dump.contains("0 in BOTH"),
+            "a stage with no outliers cannot share one with latency:\n{dump}"
+        );
+    }
+
+    /// The outlier rule must be robust to the tail it is looking for.
+    #[test]
+    fn outlier_threshold_is_robust_and_empty_on_a_flat_series() {
+        // 19 fives and one 45: the 45 must be above the threshold and the fives
+        // below it. A mean+3σ rule fails here — the mean is already 7 and σ ≈ 8.7,
+        // so mean+3σ ≈ 33 and the spike that produced the spread is what widened
+        // the gate.
+        let mut s = vec![5.0; 19];
+        s.push(45.0);
+        let t = outlier_threshold(&s).expect("non-empty");
+        assert!(t > 5.0 && t < 45.0, "threshold {t} must separate 5 from 45");
+
+        // Flat: nothing may be selected, at any magnitude — including all-zero,
+        // which is what an unmeasured stage's series looks like.
+        for flat in [vec![2.0; 10], vec![0.0; 10], vec![0.0009; 40]] {
+            let t = outlier_threshold(&flat).expect("non-empty");
+            assert!(
+                !flat.iter().any(|v| *v > t),
+                "a flat series must select no outliers; {:?} against threshold {t}",
+                &flat[..2]
+            );
+        }
+        assert!(outlier_threshold(&[]).is_none());
+    }
+
+    /// A correlation over a flat series is not 0.0 — it does not exist.
+    #[test]
+    fn pearson_refuses_a_series_without_variance() {
+        assert!(pearson(&[1.0, 1.0, 1.0], &[1.0, 2.0, 3.0]).is_none());
+        assert!(pearson(&[1.0, 2.0], &[1.0, 2.0]).is_none(), "2 pairs is not a correlation");
+        assert!(pearson(&[1.0, 2.0, 3.0], &[1.0, 2.0]).is_none(), "lengths must match");
+        let r = pearson(&[1.0, 2.0, 3.0], &[2.0, 4.0, 6.0]).expect("both vary");
+        assert!((r - 1.0).abs() < 1e-9, "got {r}");
     }
 
     #[test]

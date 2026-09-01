@@ -41,6 +41,7 @@ tag *and* commit hash is a stronger provenance claim than a copy in our tree
 | `extbuf_probe.c` | `CUDA_EXTERNAL_MEMORY_*` layout; whether `D3D12_RESOURCE` is 4 or 5 and which the driver tolerates; that a mapped buffer frees with `cuMemFree`; logical-vs-padded import size | `src/interop/ffi/cuda_gl_vk_interop.rs`, `src/interop/external_buffer.rs` |
 | `d3d12_buf_probe.c` | the shape that shipped: D3D12 committed BUFFER → NT handle → `cuImportExternalMemory` → `cuExternalMemoryGetMappedBuffer` → registered as `CUDADEVICEPTR`+NV12. Answers whether chroma is read at `pitch * height` or `width * height` by using `pitch != width` | `src/interop/ffi/nvenc.rs`, `src/interop/nv12_encode.rs` |
 | `check_nv12.py` | decodes a probe's bitstream and compares each bar's centre sample against BT.709 limited-range codes computed independently in Python | all of the above |
+| `nvml_probe.c` | NVML struct layouts (`nvmlUtilization_t` 8 bytes, `nvmlMemory_t` 24, `nvmlMemory_v2_t` 40 with its offsets), the `NVML_STRUCT_VERSION(Memory, 2)` word, and whether that version field is load-bearing — plus a live utilisation/VRAM reading to catch a transposed field. Loads `nvml.dll` dynamically; no CUDA Toolkit, no `build/cuda.def` entry, no delay-load | `src/profiling/ffi/nvml.rs` |
 
 `check_nv12.py` is the part that makes the rungs mean anything: **`NV_ENC_SUCCESS`
 proves only that the driver accepted the call.** NVENC will happily encode
@@ -102,3 +103,29 @@ Measured on RTX 3050, driver API 12.2:
   `nvEncInitializeEncoder` → `NV_ENC_ERR_UNSUPPORTED_PARAM (12)`, exit 1. The
   original failure, reproduced on demand.
 - `--codec h264`: unchanged from the 2026-08-30 run above.
+
+## NVML — added 2026-08-31 (D3)
+
+`nvml_probe.c` was written **before** `src/profiling/ffi/nvml.rs`, per the rule at the
+top of this file. Measured on RTX 3050, driver API 12.2 (`./nvml_probe.exe`, exit 0,
+"every claim held"):
+
+- Layout: `nvmlUtilization_t` 8 bytes (`gpu` @ 0, `memory` @ 4); `nvmlMemory_t` 24
+  (`total`/`free`/`used` @ 0/8/16); `nvmlMemory_v2_t` 40 (`version`/`total`/`reserved`/
+  `free`/`used` @ 0/8/16/24/32). `NVML_STRUCT_VERSION(Memory, 2)` = `0x02000028`, both
+  halves decoded and checked.
+- Every entry point the Rust side needs is exported, including the optional
+  `nvmlDeviceGetMemoryInfo_v2`.
+- Live: `gpu=2%`, `memory-controller=1%`, `encoder util=0%` at a 200000 µs sampling
+  period, `total=8192 MB`. Both memory queries satisfy `used + free == total`.
+- **Negative control:** `nvmlDeviceGetMemoryInfo_v2` with `version = 1` is **rejected**
+  with `NVML_ERROR_INVALID_ARGUMENT`. Without this the successful v2 call would not be
+  evidence that the version word matters — a driver ignoring it looks identical.
+- v1 and v2 disagree by design: `used` was 1706 MB (v1) vs 1556 MB (v2) on an idle
+  card, because v1 includes driver-reserved memory. `GpuMetrics::vram_is_v2` records
+  which one answered so that 150 MB is never read as a workload difference.
+
+Unlike every other probe here, this one touches no encoder and cannot kill the
+process; it reads counters. It is also the only probe whose DLL is loaded purely by
+`LoadLibraryA` in the *shipping* code as well, so there is no import library or
+`/DELAYLOAD` entry to keep in step.

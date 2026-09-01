@@ -44,6 +44,12 @@ build nv12_pitch_probe.exe nv12_pitch_probe.c
 build extbuf_probe.exe     extbuf_probe.c    -ld3d12
 build d3d12_buf_probe.exe  d3d12_buf_probe.c -ld3d12 -ldxgi
 
+# NVML. Needs no ffnvcodec header and no D3D12 — it declares the NVML types itself
+# (nvml.h ships with the CUDA Toolkit, which this repo deliberately does not
+# require) and resolves every entry point with GetProcAddress. Safe: it reads
+# counters and encodes nothing.
+build nvml_probe.exe       nvml_probe.c
+
 echo
 echo "built:"
 ls -1 ./*.exe

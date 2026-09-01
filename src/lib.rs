@@ -20,6 +20,11 @@ pub mod sync;
 pub mod export;
 pub mod interop;
 pub mod profiling;
+/// Locally generated real-media fixtures, shared by `src/bin/bench.rs` and
+/// `src/tests/media_compat.rs`. Not `#[cfg(test)]`: a `[[bin]]` target cannot see
+/// a test-only module, and the alternative was a second copy of the ffmpeg
+/// locator and its skip contract.
+pub mod bench_media;
 
 #[cfg(test)]
 mod tests;

@@ -35,7 +35,10 @@ rusttype = "0.9.3"
 # ID3D12Device pointers handed across the boundary are the same COM types.
 [target.'cfg(windows)'.dependencies]
 d3d12 = "0.19.0"
-winapi = { version = "0.3", features = ["d3d12", "d3dcommon", "dxgiformat", "handleapi", "winerror", "winnt", "unknwnbase"] }
+# `psapi` + `processthreadsapi` are for src/profiling/sysinfo.rs (GetProcessMemoryInfo,
+# GetProcessTimes) — the OS queries behind the RAM (RSS) and CPU Util rows, which
+# must come from the OS or print n/a. `minwindef` provides FILETIME.
+winapi = { version = "0.3", features = ["d3d12", "d3dcommon", "dxgiformat", "handleapi", "winerror", "winnt", "unknwnbase", "psapi", "processthreadsapi", "minwindef", "libloaderapi"] }
 
 [dev-dependencies]
 pollster = "0.3"

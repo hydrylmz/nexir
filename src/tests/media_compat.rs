@@ -149,26 +149,13 @@ mod media_compat {
 
     /// Locate an `ffmpeg` binary, or explain why the matrix cannot run.
     ///
-    /// `ffmpeg` on PATH is the normal case; `NEXIR_FFMPEG` overrides it for a
-    /// machine where the binary is present but not on PATH (the DLLs this crate
-    /// links against say nothing about the CLI being installed).
+    /// Delegates to [`crate::bench_media::ffmpeg_binary`], which is the single
+    /// locator for the tree — `src/bin/bench.rs` needs the same one and cannot see
+    /// a `#[cfg(test)]` module, so the implementation moved there rather than
+    /// being duplicated. The `NEXIR_FFMPEG` override and the "missing ffmpeg is a
+    /// printed skip, never a pass" contract are unchanged.
     fn ffmpeg_binary() -> Option<PathBuf> {
-        if let Ok(explicit) = std::env::var("NEXIR_FFMPEG") {
-            let p = PathBuf::from(explicit);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-        // `-version` rather than `-h`: it exits 0, writes little, and needs no
-        // input file.
-        Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .ok()
-            .filter(|s| s.success())
-            .map(|_| PathBuf::from("ffmpeg"))
+        crate::bench_media::ffmpeg_binary()
     }
 
     /// A scratch directory unique to this process, so two concurrent `cargo test`
