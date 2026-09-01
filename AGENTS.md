@@ -7,10 +7,15 @@ GPU-accelerated non-linear video editor in Rust. Workspace with two packages: `n
 ```bash
 cargo build                   # builds both nexir and ui
 cargo test                    # unit + integration tests
-cargo test -p nexir --lib     # library unit tests only
-cargo test -p nexir --test '*'  # integration tests
+cargo test -p nexir --lib     # ALL of this crate's tests, including src/tests/
 cargo run -p ui               # launch the desktop app
 ```
+
+**There is no `tests/` directory.** Integration tests live in `src/tests/` behind a
+`#[cfg(test)] mod tests` in `lib.rs`, so they are `--lib` tests as far as Cargo is
+concerned: `cargo test -p nexir --test '*'` fails with *"no test target matches
+pattern `*`"* rather than running them. Use `cargo test -p nexir --lib
+tests::colour_plumbing` to name one file's tests.
 
 **Run tests with GPU** (integration tests need headless wgpu): `cargo test`
 
@@ -23,6 +28,12 @@ cp target/debug/*.dll target/release/   # cuda.dll must sit beside the binary
 ./target/release/bench.exe 5 6          # only benchmarks 5 and 6
 NEXIR_BENCH_REPEATS=1 ./target/release/bench.exe    # smoke run; prints that it is a sample
 NEXIR_UPLOAD_PATH=write_texture ./target/release/bench.exe   # force one upload mechanism
+NEXIR_FRAME_DUMP=1 ./target/release/bench.exe 5      # per-frame outliers + the latency/stage pairing
+NEXIR_FRAME_CSV=target/run_%d.csv ./target/release/bench.exe 5   # per-frame series in ARRIVAL order
+NEXIR_GPU_LOOKAHEAD=1 ./target/release/bench.exe 5   # collapse the pipeline (lowers only)
+NEXIR_NODE_TIMINGS=1 ./target/release/bench.exe 5    # per-node GPU timings, in an EXTRA pass
+./target/release/bench.exe --media    # real coded frames: decode/render/encode/E2E per class
+./target/release/bench.exe --export   # end-to-end ExportEngine per class, every output verified
 ```
 
 A single run of the 4K row spans ~40% between repeats, so **quote the median with its spread, never one run.**
@@ -128,6 +139,26 @@ Hardcoded dark theme in `NexirApp::new()`. No theme switching. Window size: 1280
     - **Adding a layout to the `write_texture` path means adding it to `upload_frame_shared`'s guard.** It accepts semi-planar only and falls back to staging otherwise, because planar U/V must be interleaved first and `upload_frame` already does that correctly — a second interleaver is a second thing to keep in step. `bytes_per_row` there is the UNPADDED source stride; passing the 256-aligned one shears the picture exactly like a wrong NVENC pitch (gotcha 6).
 
 13. **A percentile over `CPU per frame` is not a frame time.** Since frames went in flight, the sum of one frame's CPU stages is the CPU's *share* of a frame (6.7 ms at 4K) while frames arrive 20.0 ms apart — so the report carries a separate measured `Frame latency` row, and that is the only row a "P95 ≤ 16.67 ms" target can be read off. `average_fps` is likewise frames ÷ wall time, never `1000 / CPU sum`: the old formula reported 237 FPS on a run delivering 58. Three rules follow, each with a test: unrecorded latency prints nothing rather than `0.00 ms`; the latency series must cover the WHOLE run (an unseeded `last_retire` silently dropped the pipeline-fill interval and printed 18.25 ms mean on a 21.1 ms/frame run); and because mean latency and throughput measure the same seconds two ways, `format_table` prints a `WARNING` when they disagree by >10%.
+
+14. **`POOL_BUCKET_CAPACITY` is coupled to the graph's SIMULTANEOUS peak, and getting it wrong has no error message.** `CompiledGraph::execute` acquires every declared resource before the first node records and releases them all after the last, so a graph with N same-key intermediates holds N at once and hands back N together. `TransientTexturePool::release` drops whatever exceeds the per-key cap, so a cap below N discards the surplus every frame and re-creates it on the next frame's acquire — a permanent steady-state miss. **This was the P2.1 tail, and it was found by measurement, not by reading the code.** Benchmark 5's Heavy 4K graph peaks at 16 canvas-sized RGBA16Float textures in one bucket; the old cap of `8` therefore evicted ~1150 of them per 90-frame run at 66 MB each. Measured either way, three repeats (`target/bench_P21_cap8.txt` vs `target/bench_P21_final.txt`):
+
+    | cap | `peak bucket` | miss rate | evicted | FPS | steady P95 | frame interval |
+    |---|---|---|---:|---:|---:|---|
+    | 8 | 8/8 (clamped) | 31.3% | ~1150 | 43.6 | 27.48 ms | **17.9 / 25.7 ms alternating** |
+    | 32 | 16/32 | 0.6% | 0 | **57.3** | **18.24 ms** | 16.8 ms even |
+
+    **The only symptom was the alternation** — `GPU transfer` split the same way (9.9 / 17.8 ms) while graph execution stayed flat at ~8.5 ms either way. No error, no warning, no failing test, and the pooled percentiles looked like an ordinary tail. Three rules:
+    - **Read the cap off a measurement, not a guess.** `PoolStats::peak_bucket` is the observed high-water mark of any single bucket and the bench prints it as `peak bucket N/CAP`. `N == CAP` means the true peak is unknown and at least the cap — which is exactly when `evicted > 0` and the bench prints its `WARNING`. `render::resource::tests::the_bucket_cap_covers_a_whole_frames_peak` pins the constant against that measured 16, and `releasing_more_than_the_cap_evicts_the_surplus` pins the mechanism (surplus dropped → re-allocated next frame) so raising the constant does not leave the coupling untested.
+    - **A cap costs nothing when it is not reached.** Buckets are created on demand and only hold what a frame actually returned, so `32` leaves the 1080p single-layer graph at `peak bucket 1/32` and 4 pooled textures.
+    - **`miss_rate()` is `Option`.** Zero acquisitions is not a 0% miss rate; the pool follows gotcha 9's rule and prints `n/a`.
+
+15. **The 4K "latency P99 = 54.6 ms" was the pipeline fill, not a stall — the latency series needs a split, never a trim.** A 90-frame run stamps ~90 intervals, so the P99 index resolves to the second-largest sample, and at 4K the largest samples are the first interval (measured 47-71 ms: the first `gpu_lookahead` submits, the first NVENC picture, first-frame allocation). Reporting that as a frame arriving late sent P2.1 hunting a tail stall that did not exist. But **dropping the fill is the bug gotcha 13 already records** (mean 18.25 ms on a 21.1 ms/frame run), so `ProfileReport` carries both: `frame_latency_stats` is whole-run and its mean must stay comparable with `average_fps`; `steady_latency_stats` excludes only the first interval and is the row a P95/P99 target is read off; `pipeline_fill_ms` prints that interval separately rather than hiding it. `format_table` says which row is which, and the bench summary has a `Fill` column. Two supporting rules:
+    - **A distribution cannot see a cycle, so measure the parity split.** `latency_alternation` reports the mean of the even- and odd-indexed steady intervals, and `format_table` prints `ALTERNATING` above a 15% split. A pooled percentile is identical whether the slow frames alternate or cluster, and the two diagnoses lead opposite ways — a stall invites more pipeline depth, a cycle is made *worse* by it. `NEXIR_GPU_LOOKAHEAD` collapses the pipeline to tell those apart from one binary, and `NEXIR_FRAME_CSV` keeps arrival order, which is the only view a periodic pattern is visible in.
+    - **Attribute a tail by the PAIRING, not by two percentiles.** `Upload`'s P99 being large next to a large latency P99 is equally consistent with "the late frame is the slow upload" and with "two unrelated frames were slow". `profiling::format_frame_dump` (`NEXIR_FRAME_DUMP=1`) prints the intersection of the two outlier sets and Pearson coefficients; on benchmark 5 it returned `0 in BOTH` with `r = +0.04`, which is what **refuted** the `write_buffer` lead and sent the investigation to the texture pool. Outliers are `median + 3 MAD`, not `mean + 3σ` (one 45 ms sample among 5 ms ones widens σ until it is no longer an outlier by its own measure) and a flat series must select **nothing** — `↳ submit` on the `write_texture` path is sub-microsecond every frame, so a "slowest N" ranking over it would name arbitrary frames and then report them as coinciding with the tail.
+
+16. **The transient texture pool is FIFO, and a stack there costs nothing measurable while invalidating every bind-group cache in the graph.** `CompiledGraph::execute` acquires resources in ascending `ResourceId` order and releases them in ascending order too (`into_resources()` is indexed by id), so a LIFO bucket pops them back out **reversed**: resource 1 receives resource N's texture, resource 2 receives N-1's, and the whole assignment flips — then flips back next frame, alternating with period 2. Eleven nodes key their bind-group cache on the `ViewId`s they were handed (`lut.rs:241`, `composite.rs:398`, `tonemap.rs:350`, …), so all of them rebuilt every frame. **The pool's own counters cannot see this**: hits, misses (0.6%), `evicted` (0) and `peak bucket` (16/32) are identical either way, because every acquisition is still a hit — it is simply the *wrong* hit. `TransientTexturePool::buckets` is therefore a `VecDeque` with `push_back`/`pop_front`, pinned by `render::resource::tests::a_repeated_frame_shape_reuses_each_resources_own_texture`, which compares the ViewId *assignment* across three frames rather than the miss rate (two frames would pass a period-2 alternation). Measured on benchmark 5, three repeats each: 52.9 → 53.9 FPS median, whole-run mean latency 18.15 → 17.85 ms — i.e. **~2%, at the edge of the row's own 2-3% spread.** Keep it because it is free and the graph's caches are meaningless without it; do not quote it as a throughput win. The 4K frame is still ~10 ms `GPU transfer` + ~7.8 ms graph, and neither moved.
+
+17. **`bench --export` measures the whole `ExportEngine`, and the harness's prefetch worker must be stopped by hand.** `PrefetchWorker::run` loops on a 500 µs sleep until its `shutdown` flag is set or its channel disconnects, and the export harness keeps the `SyncSender` alive — so one worker per class per repeat survives the run that spawned it. With 5 classes × 3 repeats that is fourteen live decode threads by the last row, making later rows slower for a reason that is the benchmark's own bookkeeping. `ExportHarness` implements `Drop` to set the flag; a new harness field is not enough. The profile also honours `NEXIR_BENCH_REPEATS` with the same default and the same wording as the synthetic sweep, and a **failed repeat fails the whole class** rather than being dropped from the median — the failures `verify_exported_file` returns are "the output does not decode" and "frames went missing", and a median over the repeats that happened to succeed would report a rate for a pipeline that is not reliably producing the file. Spread prints `n/a` on a single repeat, never `0%`.
 
 ## Style Notes
 

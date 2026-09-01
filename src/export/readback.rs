@@ -1,6 +1,15 @@
 use crate::render::device::GpuDevice;
 
 /// Two ping-pong staging buffers for GPU→CPU frame readback.
+///
+/// **This is the FFmpeg-encoder path only, and it must stay that way.** P2.6 —
+/// the audit asked whether the export pipeline should adopt this readback; it must
+/// not. `ExportBackend::GpuNvenc` converts to NV12 straight into the buffer NVENC
+/// reads (`src/interop/nv12_encode.rs`), so a frame never touches the CPU; routing
+/// it through here would add a full-frame `copy_texture_to_buffer`, a
+/// `map_async` + `poll(Wait)` stall and two host copies per frame — measured at 4K
+/// as `strip_padding` alone moving 66 MB. The separate `ExecutionPath` is
+/// deliberate: this file exists for the encoders that can only accept host memory.
 pub struct FrameReadback {
     buffers:      [wgpu::Buffer; 2],
     width:        u32,
