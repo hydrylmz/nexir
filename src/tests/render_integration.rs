@@ -424,4 +424,133 @@ mod render_integration {
         let submission_id = device.submit(encoder);
         device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(submission_id));
     }
+
+    /// `execute_timed` must bracket every node, name them in execution order, and
+    /// touch the texture pool exactly as `execute` does.
+    ///
+    /// Three properties, because two of them are the ways a per-node timing report
+    /// silently lies:
+    ///
+    /// 1. **The names must align with the brackets.** The timer returns a flat
+    ///    `Vec<f64>` of pair durations, so `names[i]` is the only thing saying which
+    ///    shader `pair[i]` belongs to. If it drifts, the report attributes one
+    ///    node's cost to another and looks entirely reasonable.
+    /// 2. **The pool interaction must be identical to `execute`'s.** The timed path
+    ///    duplicates the acquire/release block, so a timed run that pooled
+    ///    differently would be profiling a graph the user never runs — and after
+    ///    gotcha 14, a differing `evicted` count is exactly the difference that
+    ///    matters. Asserted against the pool's own counters.
+    /// 3. **Timings must be per-node, not one span for the frame.** Summing them and
+    ///    comparing against a single bracket around the whole graph is what
+    ///    distinguishes real per-node data from the same number printed N times.
+    #[test]
+    fn execute_timed_brackets_every_node_in_order() {
+        use crate::render::compute::ComputePipelineCache;
+        use crate::render::gpu_timer::GpuTimer;
+        use crate::render::nodes::color_correction::{ColorCorrectionNode, ColorCorrectionParams};
+        use crate::render::nodes::gaussian_blur::{BlurPassNode, BlurParams};
+        use crate::render::nodes::sharpen::{SharpenNode, SharpenParams};
+
+        let device = Arc::new(pollster::block_on(GpuDevice::new_headless()).unwrap());
+        let shaders = ShaderRegistry::compile_all(&device).unwrap();
+        let compute_cache = Arc::new(ComputePipelineCache::new());
+
+        let mut compiler = RenderGraphCompiler::new();
+        let mut id_counter = 2u32;
+        let in_id = ResourceId::next(&mut id_counter);
+        let cc_out = ResourceId::next(&mut id_counter);
+        let blur_out = ResourceId::next(&mut id_counter);
+        let final_out = ResourceId::FINAL_COLOR;
+
+        struct DummyProducer(ResourceId);
+        impl RenderNode for DummyProducer {
+            fn name(&self) -> &str { "DummyProducer" }
+            fn declare_resources(&self, builder: &mut ResourceBuilder) {
+                builder.creates.push((self.0, ResourceDescriptor {
+                    label: Some("InitialTexture".into()),
+                    size: ResolutionSource::Fixed(W, H),
+                    format: wgpu::TextureFormat::Rgba16Float,
+                }));
+                builder.write(self.0, TextureAccess::StorageWrite);
+            }
+            fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
+        }
+        compiler.add_node(Box::new(DummyProducer(in_id)));
+        compiler.add_node(Box::new(ColorCorrectionNode::new(
+            &device, &shaders, &compute_cache, in_id, cc_out,
+            ColorCorrectionParams::identity(W, H),
+        )));
+        compiler.add_node(Box::new(BlurPassNode::new(
+            &device, &shaders, &compute_cache, cc_out, blur_out,
+            BlurParams::horizontal(5.0, 2.5, W, H), "BlurH",
+        )));
+        compiler.add_node(Box::new(SharpenNode::new(
+            &device, &shaders, &compute_cache, blur_out, final_out,
+            SharpenParams::new(0.5, W, H),
+        )));
+
+        let graph = compiler.compile(W, H).expect("graph failed to compile");
+        let frame_state = FrameState::test_empty(W, H);
+        let node_count = graph.execution_order().len();
+        assert_eq!(node_count, 4, "four nodes were added");
+
+        // ── Property 2, first half: the untimed baseline's pool behaviour ──────
+        let mut encoder = device.begin_frame();
+        graph.execute(&mut encoder, &device, &frame_state);
+        let sid = device.submit(encoder);
+        device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+        let after_untimed = graph.pool_stats();
+
+        // ── The timed run ─────────────────────────────────────────────────────
+        let mut timer = GpuTimer::new(&device, node_count as u32);
+        if !timer.is_enabled() {
+            eprintln!("SKIP: this device does not report TIMESTAMP_QUERY");
+            return;
+        }
+        timer.reset();
+        let mut encoder = device.begin_frame();
+        let names = graph.execute_timed(&mut encoder, &device, &frame_state, &mut timer);
+        let sid = device.submit(encoder);
+        device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+
+        // Property 1: one name per node, in execution order, matching the graph's
+        // own order rather than the order they were added.
+        assert_eq!(names.len(), node_count, "every node must be bracketed: {names:?}");
+        let expected: Vec<&str> = graph
+            .execution_order()
+            .iter()
+            .map(|&i| graph.node_name(i))
+            .collect();
+        assert_eq!(names, expected, "names must follow execution order");
+
+        let timings = timer.resolve_all().expect("brackets were recorded");
+        assert_eq!(
+            timings.len(),
+            names.len(),
+            "one duration per name, or the mapping is meaningless"
+        );
+
+        // Property 3: the durations are per-node, so at least one differs from
+        // another. All-equal would mean one span reported N times — and all-zero
+        // would mean nothing was measured.
+        assert!(
+            timings.iter().any(|t| *t > 0.0),
+            "every node measured 0 ns; the brackets did not capture work: {timings:?}"
+        );
+
+        // Property 2, second half: the timed path must pool exactly like `execute`.
+        let after_timed = graph.pool_stats();
+        assert_eq!(
+            after_timed.evicted, after_untimed.evicted,
+            "the timed path must not evict differently from `execute`"
+        );
+        assert_eq!(
+            after_timed.misses, after_untimed.misses,
+            "a second frame of the same shape must reuse the pool either way"
+        );
+        assert_eq!(
+            after_timed.peak_bucket, after_untimed.peak_bucket,
+            "the timed path must hold the same textures simultaneously"
+        );
+    }
 }
