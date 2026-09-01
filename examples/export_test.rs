@@ -50,6 +50,12 @@ fn main() {
         Arc::clone(&sources),
         prefetch_tx,
         Rational::new(1, 90000),
+        // This example forces the CPU path (`capability` above is `none()`), so a
+        // disabled registry is the honest description rather than a probe whose
+        // answer would be ignored.
+        Arc::new(nexir::io::interop_decode::InteropDecodeTargets::disabled(
+            Arc::clone(&device),
+        )),
     ));
     // Spawn the prefetch worker so the channel doesn't block.
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));

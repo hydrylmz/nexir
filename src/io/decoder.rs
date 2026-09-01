@@ -84,6 +84,18 @@ impl Decoder {
         self.ctx
     }
 
+    /// Which hardware decoder, if any, this decoder actually attached.
+    ///
+    /// G2c reads this rather than assuming: `Decoder::open` *probes* for hardware
+    /// and silently falls back to software, and `open_sw` never probes at all. The
+    /// interop decode path is only reachable for `Cuda`, so a caller that allocated
+    /// a `DecodeInteropTarget` for a software decoder would hold 12.4 MB of VRAM
+    /// per source that nothing ever writes into — and every frame would come back
+    /// from the CPU path with the graph still bound to an empty texture.
+    pub fn hw_type(&self) -> HwDeviceType {
+        self.hw_type
+    }
+
     /// Flush the decoder (called on seek).
     ///
     /// Also clears the draining flag: after `avcodec_flush_buffers` the decoder

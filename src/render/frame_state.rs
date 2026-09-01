@@ -3,7 +3,7 @@
 use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode, ClipEffects};
 use crate::timeline::ids::SourceId;
 use crate::timeline::source::DecodedFrameMeta;
-use crate::render::resource::ImportedResources;
+use crate::render::resource::{ImportedResources, InteropPlanes};
 
 /// One clip's contribution to the current frame.
 #[derive(Clone, Debug)]
@@ -32,12 +32,30 @@ pub struct ClipRenderEntry {
     /// the frame and the container's metadata then describes something else.
     pub frame_meta:    DecodedFrameMeta,
     pub kind:          crate::timeline::store::ClipKind,
+    /// `Some` when this clip's frame is already in GPU textures — NVDEC decoded
+    /// straight into them and `texture_slot` means nothing.
+    ///
+    /// G2c. This is the flag every graph builder branches on: a clip with planes
+    /// gets **no `YuvUploadNode` at all** (not one that is fed nothing), and its
+    /// `YuvToRgbNode` reads two resources the frame imports instead of two the
+    /// graph allocates. `None` is the CPU upload path, unchanged.
+    ///
+    /// Carried per entry rather than per source because it is a property of THIS
+    /// frame: the same source falls back to the CPU path for any frame whose
+    /// interop decode failed, and the graph must recompile when that happens —
+    /// which is why `ExportRenderer`'s `ClipSignature` includes it.
+    pub interop_planes: Option<InteropPlanes>,
 }
 
 impl ClipRenderEntry {
     /// Whether the slot holds semi-planar chroma (NV12 / P010).
     pub fn is_nv12(&self) -> bool {
         self.frame_meta.layout.semi_planar
+    }
+
+    /// Whether this clip's pixels are already on the GPU.
+    pub fn is_interop(&self) -> bool {
+        self.interop_planes.is_some()
     }
 }
 

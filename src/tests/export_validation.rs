@@ -557,6 +557,11 @@ mod export_validation {
             Arc::clone(&sources),
             prefetch_tx,
             TB,
+            // These tests exercise the CPU upload path and the NVENC encode path;
+            // the interop DECODE path has its own tests in `tests::interop_graph`.
+            Arc::new(crate::io::interop_decode::InteropDecodeTargets::disabled(
+                Arc::clone(&device),
+            )),
         ));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker = crate::io::prefetch::PrefetchWorker::new(
@@ -622,34 +627,25 @@ mod export_validation {
         }
     }
 
-    /// One CUDA primary context for the whole test process.
+    /// The process-wide CUDA primary context.
     ///
-    /// `CudaContext::new` retains the device's primary context and `Drop`
-    /// releases it.  With two export tests running concurrently under `cargo
-    /// test`, one test's release can race the other's retain and
-    /// `cuStreamCreate` then fails with "invalid device context" — which made
-    /// `nvenc_export_matches_pattern` fall back to FFmpeg for reasons that had
-    /// nothing to do with the code under test.  Retaining exactly once, and never
-    /// releasing, removes the race: the context lives for the process.
+    /// `CudaContext::new` retains the device's primary context and `Drop` releases
+    /// it.  With two export tests running concurrently under `cargo test`, one
+    /// test's release can race the other's retain and `cuStreamCreate` then fails
+    /// with "invalid device context" — which made `nvenc_export_matches_pattern`
+    /// fall back to FFmpeg for reasons that had nothing to do with the code under
+    /// test.  Retaining exactly once, and never releasing, removes the race.
+    ///
+    /// Delegates to [`crate::tests::shared_cuda_ctx`] so this module,
+    /// `tests::shared_buffer` and `io::interop_decode` share ONE owner: a second
+    /// private `OnceLock` here would be a second retain/release pair on one
+    /// `CUcontext`, which is the same class of bug as a second mutex guarding one
+    /// resource. G2c added the third caller and re-broke exactly these three tests
+    /// by giving it its own — see that function's doc comment.
     fn shared_cuda_ctx(
         capability: &InteropCapability,
     ) -> Option<Arc<crate::interop::cuda_context::CudaContext>> {
-        static CUDA: std::sync::OnceLock<
-            Option<Arc<crate::interop::cuda_context::CudaContext>>,
-        > = std::sync::OnceLock::new();
-        CUDA.get_or_init(|| {
-            if !capability.is_available() {
-                return None;
-            }
-            match crate::interop::cuda_context::CudaContext::new(capability) {
-                Ok(c) => Some(Arc::new(c)),
-                Err(e) => {
-                    eprintln!("[export_validation] CudaContext::new failed: {e:?}");
-                    None
-                }
-            }
-        })
-        .clone()
+        crate::tests::shared_cuda_ctx(capability)
     }
 
     /// Serialises the exports against each other AND against every other test

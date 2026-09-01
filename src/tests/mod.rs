@@ -52,3 +52,44 @@ pub fn cuda_lock() -> std::sync::MutexGuard<'static, ()> {
     // failure into "every other CUDA test also failed".
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// The ONE CUDA primary context for the whole test binary, retained once and
+/// never released.
+///
+/// **One owner, for the same reason there is one lock**, and this was learned the
+/// expensive way. `CudaContext::new` calls `cuDevicePrimaryCtxRetain` and `Drop`
+/// calls the matching release, and every `CudaContext` in the process wraps the
+/// same `CUcontext`. A second module holding its own `OnceLock<Arc<CudaContext>>`
+/// is a second retain/release pair on one resource — and the symptom is not a
+/// failure in the module that added it: `tests::export_validation`'s three NVENC
+/// tests began reporting *"the export engine selected the FFmpeg backend"*,
+/// because `EncodeInterop::open` was refused against a context a second owner had
+/// disturbed. All six passed when that module ran alone, which is exactly the
+/// shape gotcha 4 describes.
+///
+/// Never released on purpose: with tests in parallel threads, a context that dies
+/// when one test finishes makes an unrelated test fail for reasons that have
+/// nothing to do with the code under test.
+///
+/// Returns `None` when the host has no interop capability, which callers must turn
+/// into a printed skip rather than a failure.
+pub fn shared_cuda_ctx(
+    capability: &crate::interop::capability::InteropCapability,
+) -> Option<std::sync::Arc<crate::interop::cuda_context::CudaContext>> {
+    static CUDA: std::sync::OnceLock<
+        Option<std::sync::Arc<crate::interop::cuda_context::CudaContext>>,
+    > = std::sync::OnceLock::new();
+    CUDA.get_or_init(|| {
+        if !capability.is_available() {
+            return None;
+        }
+        match crate::interop::cuda_context::CudaContext::new(capability) {
+            Ok(c) => Some(std::sync::Arc::new(c)),
+            Err(e) => {
+                eprintln!("[tests] CudaContext::new failed: {e:?}");
+                None
+            }
+        }
+    })
+    .clone()
+}

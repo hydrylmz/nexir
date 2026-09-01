@@ -61,16 +61,64 @@ impl FrameScheduler {
         all.sort_by_key(|e| e.layer_order);
 
         // Step 6 — Build FrameState
+        let imported = Self::interop_bindings(&all);
         FrameState {
             pts,
             canvas_width: self.canvas_w,
             canvas_height: self.canvas_h,
             clips: all,
             test_textures: vec![],
-            // The CPU upload path: nothing is imported, so the graph allocates
-            // every resource from its own pool. G2c is what fills this in.
-            imported: Default::default(),
+            imported,
         }
+    }
+
+    /// Which `ResourceId` a clip's interop luma plane is bound to.
+    ///
+    /// **The graph builder and the frame binding must agree on this number, and
+    /// nothing else enforces it** — `ResourceBuilder::import` takes the id from the
+    /// caller precisely so the reading node and the binder can share it. Deriving
+    /// it from the clip's index in one place and choosing it in another is how they
+    /// would drift, so both sides call these two functions.
+    ///
+    /// The ids start after `FINAL_COLOR` (0) and `SCREEN` (1) and are packed two
+    /// per clip, which keeps them out of the range a builder allocates with
+    /// `ResourceId::next` from a counter it starts at `2 + 2 * clips.len()`.
+    pub fn interop_y_id(clip_index: usize) -> crate::render::resource::ResourceId {
+        crate::render::resource::ResourceId(2 + 2 * clip_index as u32)
+    }
+
+    /// Which `ResourceId` a clip's interop chroma plane is bound to. See
+    /// [`Self::interop_y_id`].
+    pub fn interop_uv_id(clip_index: usize) -> crate::render::resource::ResourceId {
+        crate::render::resource::ResourceId(3 + 2 * clip_index as u32)
+    }
+
+    /// The first `ResourceId` a graph builder may allocate for its own
+    /// intermediates, given this frame's clips.
+    ///
+    /// Reserves two ids per clip whether or not that clip is on the interop path:
+    /// a counter that skipped the CPU-path clips would shift every later clip's
+    /// ids when one source fell back mid-timeline, and the ids a node holds must
+    /// match the ones the frame bound.
+    pub fn interop_id_counter_start(clip_count: usize) -> u32 {
+        2 + 2 * clip_count as u32
+    }
+
+    /// Bind every interop clip's planes into an [`ImportedResources`] for this
+    /// frame.
+    ///
+    /// Empty when no clip is on the interop path, which is exactly what the CPU
+    /// upload path means (gotcha 18) — so a frame with no GPU decode is
+    /// byte-for-byte what it was before G2c.
+    fn interop_bindings(clips: &[ClipRenderEntry]) -> crate::render::resource::ImportedResources {
+        let mut imported = crate::render::resource::ImportedResources::new();
+        for (i, clip) in clips.iter().enumerate() {
+            if let Some(planes) = &clip.interop_planes {
+                imported.bind(Self::interop_y_id(i), planes.y.clone());
+                imported.bind(Self::interop_uv_id(i), planes.uv.clone());
+            }
+        }
+        imported
     }
 
     /// Cache-only variant of `schedule_frame` for use during export rendering.
@@ -110,14 +158,14 @@ impl FrameScheduler {
         let mut all: Vec<ClipRenderEntry> = entries.into_iter().flatten().collect();
         all.sort_by_key(|e| e.layer_order);
 
+        let imported = Self::interop_bindings(&all);
         FrameState {
             pts,
             canvas_width: self.canvas_w,
             canvas_height: self.canvas_h,
             clips: all,
             test_textures: vec![],
-            // As above: the CPU upload path imports nothing.
-            imported: Default::default(),
+            imported,
         }
     }
 
@@ -168,6 +216,35 @@ impl FrameScheduler {
             };
 
             // Spin-wait for the decode worker with exponential backoff.
+            //
+            // G2c — the interop path is tried FIRST, before the wait: the decode
+            // workers populate the CPU `FrameCache`, and a source decoding into its
+            // own textures has no cache to wait for. `decode_interop` returns `None`
+            // for every source that cannot use it, so the wait below is unchanged
+            // for those.
+            if let Some(interop) =
+                self.io_layer.decode_interop(clip.source_id, quantized_pts)
+            {
+                entries.push(ClipRenderEntry {
+                    source_id: clip.source_id,
+                    texture_slot: 0,
+                    layer_order: clip.layer_order,
+                    clip_width: interop.width,
+                    clip_height: interop.height,
+                    transform: clip.transform,
+                    opacity: clip.opacity,
+                    blend_mode: clip.blend_mode,
+                    crop: clip.crop,
+                    corner_pin: clip.corner_pin,
+                    matte_mode: clip.matte_mode,
+                    effects: clip.effects,
+                    frame_meta: interop.meta,
+                    kind: clip.kind.clone(),
+                    interop_planes: Some(interop.planes),
+                });
+                continue;
+            }
+
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_millis(max_wait_ms);
             let mut sleep_us = 100u64;
@@ -206,6 +283,7 @@ impl FrameScheduler {
                     // those pixels are.
                     frame_meta: still_image_frame_meta(),
                     kind: clip.kind.clone(),
+                    interop_planes: None,
                 });
                 continue;
             }
@@ -231,6 +309,7 @@ impl FrameScheduler {
                 effects: clip.effects,
                 frame_meta,
                 kind: clip.kind.clone(),
+                interop_planes: None,
             });
         }
 
@@ -306,6 +385,38 @@ impl FrameScheduler {
                     effects: clip.effects,
                     frame_meta: still_image_frame_meta(),
                     kind: clip.kind.clone(),
+                    // Still images and text never touch the YUV path at all.
+                    interop_planes: None,
+                });
+                continue;
+            }
+
+            // G2c — GPU decode first: NVDEC writes into this source's own Y/UV
+            // textures and the frame never crosses PCIe. `None` covers every
+            // reason it cannot (no CUDA, no NVDEC, >8-bit, a failed copy), and
+            // falls through to the CPU path below unchanged.
+            if let Some(interop) = self.io_layer.decode_interop(clip.source_id, quantized_pts) {
+                entries.push(ClipRenderEntry {
+                    source_id: clip.source_id,
+                    // Meaningless on this path and deliberately left at 0: the
+                    // pixels are in `interop_planes`, and a plausible-looking slot
+                    // index would invite an upload that reads an unrelated buffer.
+                    texture_slot: 0,
+                    layer_order: clip.layer_order,
+                    // The frame's own dimensions, not the container's — the same
+                    // reason `frame_meta` comes from the decoder (gotcha 11).
+                    clip_width: interop.width,
+                    clip_height: interop.height,
+                    transform: clip.transform,
+                    opacity: clip.opacity,
+                    blend_mode: clip.blend_mode,
+                    crop: clip.crop,
+                    corner_pin: clip.corner_pin,
+                    matte_mode: clip.matte_mode,
+                    effects: clip.effects,
+                    frame_meta: interop.meta,
+                    kind: clip.kind.clone(),
+                    interop_planes: Some(interop.planes),
                 });
                 continue;
             }
@@ -338,6 +449,7 @@ impl FrameScheduler {
                 effects: clip.effects,
                 frame_meta,
                 kind: clip.kind.clone(),
+                interop_planes: None,
             });
         }
 

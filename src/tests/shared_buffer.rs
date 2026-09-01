@@ -58,20 +58,10 @@ mod shared_buffer {
 
     /// One CUDA primary context for the whole test binary.
     ///
-    /// Retained once and never released, for the reason `export_validation.rs`
-    /// documents: tests run in parallel threads, and a context that dies when one
-    /// test finishes makes an unrelated test fail for reasons that have nothing to
-    /// do with the code under test.
+    /// Now [`crate::tests::shared_cuda_ctx`] — see there for why one owner rather
+    /// than one per module.
     fn shared_cuda_ctx(capability: &InteropCapability) -> Option<Arc<CudaContext>> {
-        static CUDA: std::sync::OnceLock<Option<Arc<CudaContext>>> = std::sync::OnceLock::new();
-        CUDA.get_or_init(|| match CudaContext::new(capability) {
-            Ok(c) => Some(Arc::new(c)),
-            Err(e) => {
-                eprintln!("[shared_buffer] CudaContext::new failed: {e:?}");
-                None
-            }
-        })
-        .clone()
+        crate::tests::shared_cuda_ctx(capability)
     }
 
     /// Build the harness, or explain why this host cannot run these tests.

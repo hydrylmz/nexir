@@ -105,7 +105,13 @@ unsafe impl Send for ExternalTexture {}
 pub struct SharedTexture {
     /// The wgpu view of the allocation — usable as a normal texture (storage
     /// binding, copy source, render target, whatever `usage` allowed).
-    pub texture:  wgpu::Texture,
+    ///
+    /// `Arc` because G2c makes this allocation a texture the RENDER GRAPH binds
+    /// without owning: [`crate::render::resource::ImportedTexture::new`] takes an
+    /// `Arc<wgpu::Texture>` so a frame's binding can be cloned without moving the
+    /// texture away from the decoder that keeps writing into it. Deref makes every
+    /// existing `&self.texture` use unchanged.
+    pub texture:  Arc<wgpu::Texture>,
     /// The CUDA view of the same allocation.  Carries its own
     /// `Arc<CudaContext>`, so this struct needs no ordering discipline of its own.
     pub external: ExternalTexture,
@@ -161,7 +167,7 @@ impl SharedTexture {
                     }
                 };
 
-                Ok(Self { texture, external, shared_handle })
+                Ok(Self { texture: Arc::new(texture), external, shared_handle })
             }
             #[cfg(not(target_os = "windows"))]
             InteropTransport::D3D12Win32Handle => Err(CudaError::Import(

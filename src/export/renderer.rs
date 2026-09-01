@@ -72,6 +72,16 @@ struct ClipSignature {
     /// `StillImageUploadNode` instead of `YuvUploadNode → YuvToRgbNode`, so a
     /// change in this flag must trigger graph recompilation.
     is_still_image: bool,
+    /// True when this clip's frame arrived already in GPU textures (G2c/G2d).
+    ///
+    /// **In the signature because the graph SHAPE differs**: an interop clip has no
+    /// `YuvUploadNode` at all and its `YuvToRgbNode` reads two imported resources
+    /// rather than two pooled ones. A source that falls back to the CPU path
+    /// mid-timeline — one failed `cuMemcpy2DAsync`, or a mid-stream switch to a
+    /// 10-bit segment — therefore needs a recompile, and without this the cached
+    /// graph would keep importing planes the frame no longer binds, which
+    /// `resolve_resources` turns into a panic naming the resource.
+    is_interop: bool,
     effects: crate::timeline::transform::ClipEffects,
 }
 
@@ -157,6 +167,7 @@ impl ExportRenderer {
                     // this is not read from `sources.video_info()`.
                     frame_meta: c.frame_meta,
                     is_still_image: is_still,
+                    is_interop: c.is_interop(),
                     effects: c.effects,
                 }
             })
@@ -190,7 +201,13 @@ impl ExportRenderer {
         );
 
         let mut compiler = RenderGraphCompiler::new();
-        let mut id_counter = 2u32; // 0 = FINAL_COLOR, 1 = SCREEN (reserved)
+        // G2c/G2d — the first id a builder may allocate for itself. Two ids per
+        // clip are reserved below it for interop planes, whether or not a given
+        // clip uses them: `FrameScheduler::interop_y_id` chooses the same numbers
+        // when it binds the frame's imports, and a counter that only skipped the
+        // clips actually on the interop path would shift every later clip's ids the
+        // moment one source fell back.
+        let mut id_counter = FrameScheduler::interop_id_counter_start(sig.len());
 
         // Use the exact clip count so the binding-array layout is tight.
         // ensure_graph recompiles whenever sig changes, so this is always correct.
@@ -205,6 +222,9 @@ impl ExportRenderer {
 
         // `upload_indices` maps clip slot → YuvUploadNode index in the graph.
         // Still-image clips are stored as `None` — they have no YuvUploadNode.
+        // So are interop clips, and for a stronger reason: their pixels are already
+        // in the textures the graph imports, so there is nothing to upload and
+        // `upload_frame_data` must not try (G2d).
         let mut upload_indices: Vec<Option<usize>> = Vec::with_capacity(sig.len());
 
         for (slot, (clip, clip_sig)) in frame.clips.iter().zip(sig.iter()).enumerate() {
@@ -255,9 +275,6 @@ impl ExportRenderer {
             }
 
             // ── YUV video path ────────────────────────────────────────────────
-            let y_id  = ResourceId::next(&mut id_counter);
-            let uv_id = ResourceId::next(&mut id_counter);
-
             // P1.6 — layout and colour both come from the frame the decoder
             // actually produced.  Reading them off the source registry instead was
             // wrong whenever the decoder converted the frame (swscale fallback) or
@@ -265,21 +282,52 @@ impl ExportRenderer {
             let layout     = clip_sig.frame_meta.layout;
             let color_info = clip_sig.frame_meta.color;
 
-            // Create YuvUpload with the clip's ACTUAL dimensions so the GPU
-            // textures are exactly the right size — no wasted rows, no green fill.
-            let upload_node = YuvUploadNode::new_with_layout(
-                &self.device,
-                slot as u32,
-                clip.clip_width,
-                clip.clip_height,
-                y_id,
-                uv_id,
-                layout,
-            );
+            // G2d — where the two paths diverge, and the ONE thing this branch must
+            // get right: an interop clip's upload node is **absent, not fed**.
+            //
+            // `YuvUploadNode::declare_resources` calls `builder.creates` for both
+            // planes, so leaving the node in the graph and skipping its upload does
+            // not import anything — it allocates two pooled textures nobody writes,
+            // hands them to `YuvToRgbNode`, and renders a black or stale clip while
+            // NVDEC writes into textures the graph never looks at. There is no error
+            // and no failing test in that state; the pool reports two ordinary
+            // hits.
+            //
+            // The ids come from `FrameScheduler`, not from `id_counter`, because the
+            // frame binds its imports to exactly those numbers.
+            let (y_id, uv_id) = if clip.is_interop() {
+                (
+                    FrameScheduler::interop_y_id(slot),
+                    FrameScheduler::interop_uv_id(slot),
+                )
+            } else {
+                (
+                    ResourceId::next(&mut id_counter),
+                    ResourceId::next(&mut id_counter),
+                )
+            };
 
-            let node_idx = compiler.add_node(Box::new(upload_node));
-            upload_indices.push(Some(node_idx));
+            if clip.is_interop() {
+                // No upload node at all. `None` here is what keeps
+                // `upload_frame_data` from reaching for a slot-pool buffer that was
+                // never acquired for this clip.
+                upload_indices.push(None);
+            } else {
+                // Create YuvUpload with the clip's ACTUAL dimensions so the GPU
+                // textures are exactly the right size — no wasted rows, no green fill.
+                let upload_node = YuvUploadNode::new_with_layout(
+                    &self.device,
+                    slot as u32,
+                    clip.clip_width,
+                    clip.clip_height,
+                    y_id,
+                    uv_id,
+                    layout,
+                );
 
+                let node_idx = compiler.add_node(Box::new(upload_node));
+                upload_indices.push(Some(node_idx));
+            }
 
             compiler.add_node(Box::new(YuvToRgbNode::new_with_layout(
                 &self.device,
@@ -292,7 +340,7 @@ impl ExportRenderer {
                 clip.clip_height,
                 color_info,
                 layout.semi_planar,
-            )));
+            ).with_imported_planes(clip.is_interop())));
 
             // ── Colour transform into the output's space ──────────────────────
             //
@@ -575,6 +623,10 @@ impl ExportRenderer {
     ///
     /// Still-image clips are skipped — their staging buffer is written once at
     /// load time by `StillImageCache::get_or_load` and never needs refreshing.
+    /// So are interop clips (G2d): NVDEC already wrote their pixels into the
+    /// textures the graph imports, `upload_indices` holds `None` for them, and
+    /// there is no slot-pool buffer to read — `texture_slot` is 0 on that path and
+    /// reading tier 0 slot 0 would upload an unrelated source's frame.
     ///
     /// The graph must have been compiled by `ensure_graph` before calling this.
     fn upload_frame_data(&mut self, frame: &FrameState) {
@@ -588,7 +640,8 @@ impl ExportRenderer {
                 break;
             }
 
-            // None means this slot is a still image — no YUV upload needed.
+            // None means this slot needs no YUV upload: a still image, or an
+            // interop clip whose pixels are already in the imported textures.
             let node_idx = match self.upload_indices[slot_idx] {
                 Some(idx) => idx,
                 None => continue,

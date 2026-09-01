@@ -24,7 +24,8 @@ pub type YuvParams = YuvConversion;
 const YUV_PUSH_CONSTANT_BYTES: u32 = std::mem::size_of::<YuvConversion>() as u32;
 
 pub struct YuvToRgbNode {
-    /// Y-plane texture (R8Unorm or R16Unorm), produced by YuvUploadNode.
+    /// Y-plane texture (R8Unorm or R16Unorm), produced by YuvUploadNode — or, on
+    /// the interop path, imported from the decoder. See [`Self::imported_planes`].
     pub in_y:          ResourceId,
     /// UV-plane texture (Rg8Unorm or Rg16Unorm), produced by YuvUploadNode.
     pub in_uv:         ResourceId,
@@ -32,6 +33,21 @@ pub struct YuvToRgbNode {
     pub out_rgba:      ResourceId,
     pub width:         u32,
     pub height:        u32,
+    /// Whether `in_y`/`in_uv` come from OUTSIDE the graph (G2c/G2d).
+    ///
+    /// **This changes `declare_resources`, and it has to**: with no
+    /// `YuvUploadNode` in front of it there is no node creating those two ids, so a
+    /// plain `builder.read` is a read with no producer and compilation fails with
+    /// [`crate::render::graph::GraphError::MissingProducer`].
+    /// [`ResourceBuilder::import`] registers the id as its own producer instead —
+    /// which is what keeps `MissingProducer` meaningful for the case it exists to
+    /// catch (gotcha 18).
+    ///
+    /// It must NOT be inferred from anything the node can see. A node that guessed
+    /// wrong in the other direction — importing a plane the upload node creates —
+    /// is rejected at compile time by the `create` + `import` check, which is the
+    /// only reason that mistake is not a torn frame.
+    imported_planes:   bool,
     /// The fully resolved conversion: matrix, range and bit-depth handling for
     /// this clip's actual metadata.  Computed once at graph-compile time.
     conversion:        YuvConversion,
@@ -171,12 +187,35 @@ impl YuvToRgbNode {
             out_rgba,
             width,
             height,
+            // Pooled planes by default: every existing caller feeds this node from a
+            // `YuvUploadNode`, and `with_imported_planes` is the opt-in.
+            imported_planes: false,
             conversion,
             pipeline,
             bind_group_layout,
             device: Arc::clone(&device.device),
             bg_cache: Mutex::new(None),
         }
+    }
+
+    /// State that `in_y`/`in_uv` are bound by the frame rather than created by a
+    /// `YuvUploadNode` — the interop decode path (G2c/G2d).
+    ///
+    /// A builder-style setter rather than another `new_*` constructor: the node
+    /// already takes ten arguments, and the two paths differ in exactly this one
+    /// bit. The caller that sets it is the same one that omits the upload node and
+    /// takes its plane ids from `FrameScheduler::interop_y_id`; those three
+    /// decisions are one decision, and `src/tests/interop_graph.rs` pins that
+    /// getting any of them wrong fails to compile the graph or fails a pixel check
+    /// rather than rendering something plausible.
+    pub fn with_imported_planes(mut self, imported: bool) -> Self {
+        self.imported_planes = imported;
+        self
+    }
+
+    /// Whether this node imports its planes instead of reading pooled ones.
+    pub fn imports_planes(&self) -> bool {
+        self.imported_planes
     }
 
     /// The resolved conversion this node will apply.  Exposed so tests (and the
@@ -196,8 +235,18 @@ impl RenderNode for YuvToRgbNode {
             size: ResolutionSource::Fixed(self.width, self.height),
             format: wgpu::TextureFormat::Rgba16Float,
         }));
-        builder.read(self.in_y, TextureAccess::Sampled);
-        builder.read(self.in_uv, TextureAccess::Sampled);
+        // Imported planes are declared with `import`, not `read`: nothing inside the
+        // graph produces them (the upload node is absent), so a bare read would be
+        // `MissingProducer`, and `import` is also what stops the acquire loop
+        // allocating a pooled texture the frame's binding would then shadow —
+        // AGENTS.md gotcha 18.
+        if self.imported_planes {
+            builder.import(self.in_y, TextureAccess::Sampled);
+            builder.import(self.in_uv, TextureAccess::Sampled);
+        } else {
+            builder.read(self.in_y, TextureAccess::Sampled);
+            builder.read(self.in_uv, TextureAccess::Sampled);
+        }
         builder.write(self.out_rgba, TextureAccess::StorageWrite);
     }
 

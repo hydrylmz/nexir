@@ -235,6 +235,27 @@ impl std::fmt::Debug for ImportedTexture {
     }
 }
 
+/// One decoded frame's Y and UV planes, as textures the graph binds but does not
+/// own.
+///
+/// G2c. The pair travels together from
+/// [`crate::io::interop_decode::InteropDecodeTargets`] to whichever graph builder
+/// is constructing this frame's nodes, because the two planes are meaningless
+/// apart: `YuvToRgbNode` samples both, and binding one while the other is stale
+/// is a frame with last frame's chroma over this frame's luma — no error, and
+/// nothing in the pool's counters to show for it.
+///
+/// Cloning is what binding into a frame does, and it clones the `Arc`s rather
+/// than the textures, so both planes keep the one [`ViewId`] they were minted
+/// with (AGENTS.md gotcha 18).
+#[derive(Clone, Debug)]
+pub struct InteropPlanes {
+    /// Luma, `R8Unorm` at the frame's full size.
+    pub y:  ImportedTexture,
+    /// Interleaved chroma, `Rg8Unorm` at half size.
+    pub uv: ImportedTexture,
+}
+
 /// One slot of a [`crate::render::context::RenderContext`]: either a texture the
 /// pool lent for this frame, or one the graph was lent from outside.
 ///

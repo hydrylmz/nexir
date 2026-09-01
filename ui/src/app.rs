@@ -218,6 +218,15 @@ impl NexirApp {
 
         let (prefetch_tx, prefetch_rx) = std::sync::mpsc::sync_channel::<PrefetchRequest>(16);
 
+        // G2c — NVDEC decodes straight into per-source textures the render graph
+        // binds, which is what removes the ~10 ms `GPU transfer` row from a 4K
+        // frame. Every source this cannot serve (no CUDA, no NVDEC, >8-bit) falls
+        // back to the slot-pool upload path automatically.
+        let interop_targets = Arc::new(nexir::io::interop_decode::InteropDecodeTargets::new(
+            Arc::clone(&device),
+            nexir::interop::capability::InteropCapability::probe(&device),
+        ));
+
         let io_layer = Arc::new(IoLayer::new(
             device.device.clone(),
             pool,
@@ -225,6 +234,7 @@ impl NexirApp {
             project.sources.clone(),
             prefetch_tx,
             project_tb,
+            Arc::clone(&interop_targets),
         ));
         log::info!("NexirApp::new: io_layer created");
 
@@ -1201,7 +1211,12 @@ impl NexirApp {
         canvas_height: u32,
     ) -> Result<CompiledExportGraph, nexir::render::graph::GraphError> {
         let mut compiler = RenderGraphCompiler::new();
-        let mut id_counter = 2; // 0=FINAL_COLOR, 1=SCREEN
+        // G2c/G2d — two ids per clip are reserved below this for interop planes,
+        // whether or not a clip uses them. `FrameScheduler::interop_y_id` picks the
+        // same numbers when it binds the frame's imports, and a counter that skipped
+        // the CPU-path clips would shift every later clip's ids as soon as one
+        // source fell back.
+        let mut id_counter = FrameScheduler::interop_id_counter_start(frame.clips.len());
 
         let mut comp_node = CompositeNode::with_pipelines(
             device,
@@ -1210,7 +1225,10 @@ impl NexirApp {
             8, // max clips
         );
 
-        for clip in &frame.clips {
+        // Enumerated because an interop clip's plane ids are derived from its index
+        // in `frame.clips` — the same index `FrameScheduler::interop_bindings` used
+        // when it bound them (G2d).
+        for (clip_index, clip) in frame.clips.iter().enumerate() {
             // Determine input source type: Text, Still Image, or Video
             let (initial_rgba_id, clip_w, clip_h) = if let nexir::timeline::store::ClipKind::Text {
                 text, font_size, color, stroke_color, stroke_width, background_color, bg_padding
@@ -1249,13 +1267,6 @@ impl NexirApp {
                         continue;
                     }
                 } else {
-                    let tier = (clip.texture_slot >> 16) as u8;
-                    let index = (clip.texture_slot & 0xFFFF) as u16;
-                    let slot_id = nexir::io::slot_pool::FrameSlotId { tier, index };
-
-                    let y_id = ResourceId::next(&mut id_counter);
-                    let uv_id = ResourceId::next(&mut id_counter);
-
                     // P1.6 — layout and colour come from the DECODED frame in this
                     // clip's slot, not from the source registry: the decoder may
                     // have converted the frame, and its metadata is what describes
@@ -1263,21 +1274,44 @@ impl NexirApp {
                     let layout     = clip.frame_meta.layout;
                     let color_info = clip.frame_meta.color;
 
-                    let upload_node = YuvUploadNode::new_with_layout(
-                        device, 0, clip.clip_width, clip.clip_height, y_id, uv_id, layout,
-                    );
+                    // G2d — an interop clip gets NO `YuvUploadNode`. Leaving one in
+                    // and skipping its upload would allocate two pooled textures
+                    // nobody writes and render a black clip, with no error and
+                    // nothing in the pool's counters (gotcha 18); the plane ids come
+                    // from `FrameScheduler` because that is what the frame bound.
+                    let (y_id, uv_id) = if clip.is_interop() {
+                        (
+                            FrameScheduler::interop_y_id(clip_index),
+                            FrameScheduler::interop_uv_id(clip_index),
+                        )
+                    } else {
+                        (
+                            ResourceId::next(&mut id_counter),
+                            ResourceId::next(&mut id_counter),
+                        )
+                    };
 
-                    // Upload YUV data from the slot pool into staging buffers
-                    self.io_layer.pool.with_buffer_read(slot_id, |data| {
-                        upload_node.upload_frame(
-                            data,
-                            layout.semi_planar,
-                            clip.clip_width,
-                            clip.clip_height,
+                    if !clip.is_interop() {
+                        let tier = (clip.texture_slot >> 16) as u8;
+                        let index = (clip.texture_slot & 0xFFFF) as u16;
+                        let slot_id = nexir::io::slot_pool::FrameSlotId { tier, index };
+
+                        let upload_node = YuvUploadNode::new_with_layout(
+                            device, 0, clip.clip_width, clip.clip_height, y_id, uv_id, layout,
                         );
-                    });
 
-                    compiler.add_node(Box::new(upload_node));
+                        // Upload YUV data from the slot pool into staging buffers
+                        self.io_layer.pool.with_buffer_read(slot_id, |data| {
+                            upload_node.upload_frame(
+                                data,
+                                layout.semi_planar,
+                                clip.clip_width,
+                                clip.clip_height,
+                            );
+                        });
+
+                        compiler.add_node(Box::new(upload_node));
+                    }
 
                     // Add YuvToRgb node
                     let rgba_id = ResourceId::next(&mut id_counter);
@@ -1294,7 +1328,8 @@ impl NexirApp {
                             clip.clip_height,
                             color_info,
                             layout.semi_planar,
-                        ),
+                        )
+                        .with_imported_planes(clip.is_interop()),
                     ));
 
                     // Insert tone-mapping for HDR clips targeting the SDR viewport.
@@ -1604,6 +1639,11 @@ impl NexirApp {
         let export_cache = Arc::new(FrameCache::new(export_pool.clone(), 16));
         let (export_prefetch_tx, _export_prefetch_rx) =
             std::sync::mpsc::sync_channel::<PrefetchRequest>(1);
+        // Export keeps the CPU upload path. The interop path's target holds ONE
+        // frame per source, so it cannot serve `ExportDecodeWorker`'s 16-frame
+        // lookahead — the whole point of which is to decode ahead of the render
+        // cursor into the CPU `FrameCache`. Giving export a disabled registry states
+        // that rather than leaving it to a runtime coincidence.
         let export_io = Arc::new(IoLayer::new(
             self.device.device.clone(),
             export_pool,
@@ -1611,6 +1651,9 @@ impl NexirApp {
             self.project.sources.clone(),
             export_prefetch_tx,
             project_tb,
+            Arc::new(nexir::io::interop_decode::InteropDecodeTargets::disabled(
+                Arc::clone(&self.device),
+            )),
         ));
         let export_scheduler = Arc::new(FrameScheduler::new(export_io, width, height));
         let engine = ExportEngine::new(
@@ -1830,8 +1873,18 @@ impl NexirApp {
                 .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
         }
 
-        device.submit(encoder);
+        let submission = device.submit(encoder);
         surface_texture.present();
+
+        // G2c — stamp every interop source this frame sampled with the submission
+        // that reads its textures. The next decode for that source waits on this
+        // before overwriting them; without it NVDEC writes into a texture the
+        // submitted graph is still reading, which is a torn frame with no error and
+        // nothing in the pool's counters. Cheap: the stamp is a clone of a
+        // submission index per interop clip, and it is a no-op on the CPU path.
+        self.io_layer
+            .interop()
+            .mark_submitted(&frame.clips, &submission);
 
         // Eyedropper magnifier: keep preview_pixels current after the frame has been committed.
         // We do this after device.submit() so the blit into preview_texture is guaranteed complete.

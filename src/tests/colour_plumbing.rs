@@ -474,6 +474,438 @@ mod colour_plumbing {
         p
     }
 
+    // ── 4. The same claim, through the GPU decode path ────────────────────────
+    //
+    // G2c/G2d. The interop path bypasses `YuvUploadNode` entirely: NVDEC writes
+    // into textures the graph imports. That is EXACTLY the kind of bypass gotcha 11
+    // warns about — the upload path is where colour metadata is read on the CPU
+    // path, and a path that skips it is a path that can drop it. So the BT.601
+    // fixtures above have to survive it, with the same mis-tagged control, because
+    // BT.709 fixtures would pass even with the metadata discarded entirely.
+
+    /// The stream info the registry would hold for a fixture, from the container.
+    ///
+    /// Built from the DEMUXER rather than hardcoded, because
+    /// `InteropDecodeTargets::ensure_target` reads `pixel_fmt` and the dimensions
+    /// off it to decide whether the source may use the interop path at all — a
+    /// hardcoded `Nv12` would make this test pass for a fixture the production gate
+    /// would reject.
+    fn stream_info_for(path: &Path) -> (crate::timeline::source::VideoStreamInfo, u32, u32) {
+        let demuxer = crate::io::demuxer::Demuxer::open(path).expect("Demuxer::open");
+        let stream = demuxer.video_stream.clone().expect("no video stream");
+        let w = stream.width.expect("no width");
+        let h = stream.height.expect("no height");
+        (
+            crate::timeline::source::VideoStreamInfo {
+                width: w,
+                height: h,
+                frame_rate: FPS,
+                // 8-bit 4:2:0, which is what `write_source_video` encodes.
+                pixel_fmt: crate::timeline::source::PixelFormat::Yuv420p,
+                color_info: stream.color_info,
+                duration_pts: stream.duration,
+                is_vfr: stream.is_vfr,
+                time_base: stream.time_base,
+                rotation: Default::default(),
+            },
+            w,
+            h,
+        )
+    }
+
+    /// Decode the first frame of `path` STRAIGHT INTO GPU TEXTURES, through the
+    /// production registry.
+    ///
+    /// Returns `None` for every host reason the interop path is unavailable (no
+    /// CUDA, no NVDEC for this codec, an allocation failure) so the caller can
+    /// print a skip rather than fail — gotcha 9's rule applied to a test.
+    ///
+    /// Driven through [`crate::io::interop_decode::InteropDecodeTargets`] rather
+    /// than calling `DecodeInteropTarget` directly: the thing under test is the
+    /// wiring, and the registry is what production calls. Its read-forward
+    /// contract is honoured here too — `Pending` means feed another packet, which
+    /// matters because frame-level threading holds several frames back.
+    ///
+    /// **The registry is RETURNED, not dropped, and that is load-bearing.** It owns
+    /// the `DecodeInteropTarget`, whose `SharedTexture`s own the CUDA side of the
+    /// allocation — dropping it runs `cuMipmappedArrayDestroy` +
+    /// `cuDestroyExternalMemory` while the returned `ImportedTexture`s (which hold
+    /// only the wgpu `Arc`) are still about to be sampled. The wgpu texture survives
+    /// that, so nothing here fails; what happened instead was **three unrelated
+    /// NVENC tests in `tests::export_validation` starting to report "the export
+    /// engine selected the FFmpeg backend"**, because tearing down a live CUDA
+    /// import left the driver in a state where `EncodeInterop::open` was refused.
+    /// The registry outliving every frame it produced is a production invariant too:
+    /// `IoLayer` holds it for the session.
+    ///
+    /// Built with `with_context` and the process-wide context, NOT with `new`: see
+    /// [`shared_cuda_ctx`].
+    fn decode_first_frame_interop(
+        device: &Arc<GpuDevice>,
+        path: &Path,
+    ) -> Option<(
+        crate::io::interop_decode::InteropDecodeTargets,
+        crate::io::interop_decode::InteropFrame,
+    )> {
+        use crate::interop::capability::InteropCapability;
+        use crate::io::interop_decode::{InteropDecode, InteropDecodeTargets};
+
+        let capability = InteropCapability::probe(device);
+        let cuda = crate::tests::shared_cuda_ctx(&capability);
+        let targets =
+            InteropDecodeTargets::with_context(Arc::clone(device), capability, cuda);
+        if !targets.is_available() {
+            eprintln!("[colour_plumbing] SKIP: CUDA interop is unavailable on this host");
+            return None;
+        }
+
+        let (info, _, _) = stream_info_for(path);
+        let mut demuxer = crate::io::demuxer::Demuxer::open(path).expect("Demuxer::open");
+        let stream = demuxer.video_stream.clone().expect("no video stream");
+        // Hardware decode ENABLED — this is the whole point, and `Decoder::open`
+        // falls back to software silently, which `ensure_target` then rejects.
+        let mut decoder = crate::io::decoder::Decoder::open(&stream, stream.codecpar, true)
+            .expect("Decoder::open");
+
+        let source_id = crate::timeline::ids::SourceId::new(0);
+        for _ in 0..600 {
+            let Some(pkt) = demuxer.next_video_packet().ok().flatten() else {
+                break;
+            };
+            match targets.decode_into_target(source_id, &info, &mut decoder, &pkt) {
+                InteropDecode::Decoded(frame) => return Some((targets, frame)),
+                InteropDecode::Pending => continue,
+                InteropDecode::Unavailable(reason) => {
+                    eprintln!("[colour_plumbing] SKIP: the interop path declined: {reason}");
+                    return None;
+                }
+            }
+        }
+        eprintln!("[colour_plumbing] SKIP: no frame came out of the interop path");
+        None
+    }
+
+    /// Run `YuvToRgbNode` over IMPORTED planes and return the RGB it produced.
+    ///
+    /// The G2d shape, and the three decisions that make it one decision:
+    ///
+    ///  * **No `YuvUploadNode` in the graph at all.** Leaving one in and not
+    ///    feeding it does not import anything — `declare_resources` *creates* both
+    ///    planes, so the graph would allocate two pooled textures nobody writes and
+    ///    the clip would render black while NVDEC wrote into textures the graph
+    ///    never looked at. No error, no failing assertion in the pool's counters.
+    ///  * **`with_imported_planes(true)`**, so the node declares those ids with
+    ///    `import` rather than `read`. Without it the compile fails with
+    ///    `MissingProducer`, which is the good outcome — it is why that error had to
+    ///    keep its meaning (gotcha 18).
+    ///  * **The ids come from `FrameScheduler`**, the same function that binds
+    ///    them, because nothing else makes the reader and the binder agree.
+    ///
+    /// `color` is passed in so a caller can supply deliberately wrong metadata and
+    /// measure what that costs — the control that gives the pixel assertions teeth.
+    fn render_interop_yuv_to_rgb(
+        device: &GpuDevice,
+        shaders: &ShaderRegistry,
+        compute: &ComputePipelineCache,
+        frame_in: &crate::io::interop_decode::InteropFrame,
+        color: ColorInfo,
+    ) -> (Vec<[u8; 3]>, Vec<String>, crate::render::resource::PoolStats) {
+        use crate::render::resource::ImportedResources;
+        use crate::scheduler::frame_scheduler::FrameScheduler;
+
+        let layout = frame_in.meta.layout;
+        let y_id = FrameScheduler::interop_y_id(0);
+        let uv_id = FrameScheduler::interop_uv_id(0);
+        let mut id_counter = FrameScheduler::interop_id_counter_start(1);
+        let rgba_id = ResourceId::next(&mut id_counter);
+
+        let mut compiler = RenderGraphCompiler::new();
+        compiler.add_node(Box::new(
+            YuvToRgbNode::new_with_layout(
+                device,
+                shaders,
+                compute,
+                y_id,
+                uv_id,
+                rgba_id,
+                frame_in.width,
+                frame_in.height,
+                color,
+                layout.semi_planar,
+            )
+            .with_imported_planes(true),
+        ));
+
+        let out = Arc::new(device.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("colour_plumbing_interop_readback"),
+            size: (W * H * 8) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        }));
+        compiler.add_node(Box::new(ReadbackNode { src: rgba_id, buf: Arc::clone(&out) }));
+
+        let graph = compiler
+            .compile(W, H)
+            .expect("an imported plane is its own producer, so this must compile");
+        let names: Vec<String> = graph
+            .execution_order()
+            .iter()
+            .map(|&i| graph.node_name(i).to_string())
+            .collect();
+
+        let mut frame = FrameState::test_empty(W, H);
+        let mut binding = ImportedResources::new();
+        binding.bind(y_id, frame_in.planes.y.clone());
+        binding.bind(uv_id, frame_in.planes.uv.clone());
+        frame.imported = binding;
+
+        let mut encoder = device.begin_frame();
+        graph.execute(&mut encoder, device, &frame);
+        let submission = device.submit(encoder);
+        device
+            .device
+            .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
+
+        let slice = out.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.device.poll(wgpu::Maintain::Wait);
+        let mapped = slice.get_mapped_range().to_vec();
+        out.unmap();
+
+        let pixels = mapped
+            .chunks_exact(8)
+            .map(|px| {
+                let mut rgb = [0u8; 3];
+                for c in 0..3 {
+                    let v = f16::from_le_bytes([px[c * 2], px[c * 2 + 1]]).to_f32();
+                    rgb[c] = (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                }
+                rgb
+            })
+            .collect();
+        (pixels, names, graph.pool_stats())
+    }
+
+    /// Read the luma plane back and report the largest code in it.
+    ///
+    /// **Not a convenience — a guard against a false PASS and a false FAIL.** The
+    /// interop copy can silently write nothing: `CudaContext::with_context` is
+    /// `cuCtxPushCurrent`, the driver requires the primary context to be floating,
+    /// and a push that fails is *ignored* — so every CUDA call in the closure runs
+    /// against the wrong context and `cuMemcpy2DAsync` reports success having copied
+    /// nothing (gotcha 4, and it is silent in release). The result is an all-zero Y
+    /// plane, which the shader then converts to black.
+    ///
+    /// Distinguishing that from "the shader got the matrix wrong" is the whole
+    /// point: the first is a host/serialisation condition this test cannot control
+    /// and must skip on with a reason, the second is the failure it exists to catch.
+    /// Asserting on pixels without checking this makes a green suite that exercised
+    /// nothing look identical to a broken conversion.
+    fn peak_luma(device: &GpuDevice, frame: &crate::io::interop_decode::InteropFrame) -> u8 {
+        let bytes_per_row = (frame.width + 255) & !255;
+        let buf = device.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("interop_luma_probe"),
+            size: (bytes_per_row * frame.height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.begin_frame();
+        enc.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: frame.planes.y.texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &buf,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(frame.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: frame.width,
+                height: frame.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let sid = device.submit(enc);
+        device
+            .device
+            .poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.device.poll(wgpu::Maintain::Wait);
+        let peak = slice.get_mapped_range().iter().copied().max().unwrap_or(0);
+        buf.unmap();
+        peak
+    }
+
+    /// A BT.601 source decoded STRAIGHT INTO GPU TEXTURES must still decode to the
+    /// pixels it was built from — and reading it as BT.709 must still not.
+    ///
+    /// G2d's colour acceptance criterion. The interop path never touches
+    /// `YuvUploadNode`, so it is a path where the frame's colour metadata could be
+    /// dropped silently: `Decoder::emit_frame`'s interop arm reads `read_frame_color`
+    /// from the AVFrame and pins the layout to NV12/P010, and this is what proves
+    /// the result reaches `YuvToRgbNode`'s push constants.
+    ///
+    /// **BT.601, for the reason this whole file is BT.601** (gotcha 11): BT.709
+    /// limited is `ColorInfo::default()`, `from_ffmpeg`'s HD heuristic and
+    /// `luma_coefficients`' `Unknown` arm, so a BT.709 fixture would pass even if
+    /// the metadata never arrived. The mis-tagged control at the end is what stops a
+    /// shader that hardcoded one matrix from passing too.
+    ///
+    /// Also asserts the graph SHAPE, because the pixels alone cannot distinguish
+    /// "imported correctly" from "an upload node quietly allocated two textures and
+    /// someone fed them": `YuvUpload` must be absent from the execution order, and
+    /// the pool must have allocated exactly the one RGBA output.
+    ///
+    /// Holds `tests::cuda_lock()` for its whole body (gotcha 4): `CudaContext`
+    /// wraps the device's primary context, so every instance in the process is one
+    /// `CUcontext` and `cuCtxPushCurrent` needs it floating.
+    #[test]
+    fn interop_decoded_frames_carry_their_matrix_to_the_shader() {
+        let _cuda = crate::tests::cuda_lock();
+
+        let device = Arc::new(
+            pollster::block_on(GpuDevice::new_headless())
+                .expect("failed to create headless GpuDevice"),
+        );
+        let shaders = ShaderRegistry::compile_all(&device).expect("shader compilation failed");
+        let compute = ComputePipelineCache::new();
+
+        let path = scratch("interop_bt601");
+        write_source_video(&path, MatrixCoefficients::Bt601, 8);
+
+        let Some((_targets, frame)) = decode_first_frame_interop(&device, &path) else {
+            let _ = std::fs::remove_file(&path);
+            return; // a printed skip with a reason, never a false pass
+        };
+        // `_targets` is held for the whole test on purpose — see
+        // `decode_first_frame_interop`'s doc comment. Dropping it destroys the CUDA
+        // import of textures this test is still sampling.
+
+        // NVDEC emits NV12, and the layout must say so — a planar description of
+        // interleaved chroma is a green/magenta picture, not a subtle shift.
+        assert!(
+            frame.meta.layout.semi_planar,
+            "NVDEC's output is NV12; the interop arm reported planar chroma, so the \
+             shader will de-interleave nothing"
+        );
+        assert_eq!(
+            frame.meta.layout.bit_depth, 8,
+            "the fixture is 8-bit; a P010 layout here means the 10-bit gate let an \
+             8-bit source through"
+        );
+        assert_eq!(
+            (frame.width, frame.height), (W, H),
+            "the decoded frame is not the fixture's size"
+        );
+
+        // THE CLAIM: the file's own matrix survived the bypass.
+        assert_eq!(
+            frame.meta.color.matrix, MatrixCoefficients::Bt601,
+            "the interop path reported matrix {:?} for a file tagged BT.601 — the \
+             colour metadata is dropped when `YuvUploadNode` is bypassed, which is \
+             exactly the failure AGENTS.md gotcha 11 describes",
+            frame.meta.color.matrix
+        );
+        assert_eq!(
+            frame.meta.color.effective_range(), ColorRange::Limited,
+            "expected limited range, got {:?}",
+            frame.meta.color.effective_range()
+        );
+
+        // Did the copy actually land? An all-zero luma plane means
+        // `cuCtxPushCurrent` was refused and every CUDA call in the closure ran
+        // against the wrong context — reported as success, having copied nothing
+        // (gotcha 4). That is a host condition, not a colour bug, and the pixel
+        // assertions below cannot tell the two apart, so skip on it rather than
+        // failing for the wrong reason. `write_source_video`'s pattern includes a
+        // white band, so a landed copy has luma near 235 (limited range).
+        let peak = peak_luma(&device, &frame);
+        if peak < 200 {
+            eprintln!(
+                "[colour_plumbing] SKIP: the interop luma plane peaks at {peak}, so the \
+                 device→array copy wrote nothing (the CUDA context was not floating — \
+                 gotcha 4). Nothing about the colour path can be concluded from this run."
+            );
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+
+        let (correct, names, stats) =
+            render_interop_yuv_to_rgb(&device, &shaders, &compute, &frame, frame.meta.color);
+
+        // ── The graph SHAPE, which the pixels cannot check ────────────────────
+        assert!(
+            !names.iter().any(|n| n == "YuvUpload"),
+            "an interop clip's upload node must be ABSENT, not merely unfed: it \
+             creates both planes, so leaving it in allocates two pooled textures \
+             nobody writes and renders black. Order was {names:?}"
+        );
+        assert_eq!(
+            stats.pooled, 1,
+            "only the RGBA output may come from the pool; {} textures were pooled, \
+             so the graph allocated something for an imported plane",
+            stats.pooled
+        );
+        assert_eq!(
+            stats.misses, 1,
+            "exactly one allocation (the RGBA output) is expected; {} were made",
+            stats.misses
+        );
+
+        // ── The pixels ────────────────────────────────────────────────────────
+        let x = W / 2;
+        let ph = patch_height();
+        let mut worst = 0i32;
+        for (i, (name, want)) in PATCHES.iter().enumerate() {
+            let y = i as u32 * ph + ph / 2;
+            let got = correct[(y * W + x) as usize];
+            for c in 0..3 {
+                let delta = (got[c] as i32 - want[c] as i32).abs();
+                worst = worst.max(delta);
+                assert!(
+                    delta <= TOLERANCE,
+                    "interop patch '{name}' at ({x},{y}) channel {c}: shader produced \
+                     {got:?}, expected {want:?} (delta {delta} > {TOLERANCE})"
+                );
+            }
+        }
+
+        // ── The control: deliberately wrong metadata ──────────────────────────
+        let mut mistagged = frame.meta.color;
+        mistagged.matrix = MatrixCoefficients::Bt709;
+        let (wrong, _, _) =
+            render_interop_yuv_to_rgb(&device, &shaders, &compute, &frame, mistagged);
+        let mut worst_wrong = 0i32;
+        for (i, (_, want)) in PATCHES.iter().enumerate() {
+            let y = i as u32 * ph + ph / 2;
+            let got = wrong[(y * W + x) as usize];
+            for c in 0..3 {
+                worst_wrong = worst_wrong.max((got[c] as i32 - want[c] as i32).abs());
+            }
+        }
+        assert!(
+            worst_wrong > TOLERANCE,
+            "reading the interop frame as BT.709 changed the output by at most \
+             {worst_wrong} levels, inside the {TOLERANCE}-level tolerance — the \
+             assertions above cannot detect a matrix error on this path either"
+        );
+
+        eprintln!(
+            "[colour_plumbing] interop BT.601: worst delta with the signalled \
+             matrix {worst}/255, worst delta when mis-read as BT.709 {worst_wrong}/255; \
+             graph was {names:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ── 1. The wiring claim, without the GPU ──────────────────────────────────
 
     /// The metadata FFmpeg reported for a real decoded frame must be the metadata

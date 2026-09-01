@@ -986,6 +986,8 @@ fn run_benchmark(
                 color: color_info,
             },
             kind: ClipKind::Video,
+            // The synthetic sweep uploads from host memory, so nothing is imported.
+            interop_planes: None,
         });
     }
 
@@ -1757,6 +1759,9 @@ fn media_graph(
             // From the decoder, not a literal — see the doc comment.
             frame_meta: cache.meta,
             kind: ClipKind::Video,
+            // The media profile decodes to host memory and uploads, which is what
+            // its `GPU transfer` row measures.
+            interop_planes: None,
         }],
         test_textures: vec![],
         // Real coded frames, still through the CPU upload path (G2c is what makes
@@ -2720,6 +2725,13 @@ fn build_export_harness(
         Arc::clone(&sources),
         prefetch_tx,
         tb,
+        // The export profile measures the CPU upload path, which is what
+        // `ExportEngine` uses (its decode workers fill the CPU `FrameCache` ahead of
+        // the render cursor, and a one-frame interop target cannot serve that).
+        // Stated rather than left to whether this host has CUDA.
+        Arc::new(nexir::io::interop_decode::InteropDecodeTargets::disabled(
+            Arc::clone(device),
+        )),
     ));
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _ = nexir::io::prefetch::spawn_prefetch_worker(nexir::io::prefetch::PrefetchWorker::new(
