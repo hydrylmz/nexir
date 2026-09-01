@@ -3,6 +3,7 @@
 use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode, ClipEffects};
 use crate::timeline::ids::SourceId;
 use crate::timeline::source::DecodedFrameMeta;
+use crate::render::resource::ImportedResources;
 
 /// One clip's contribution to the current frame.
 #[derive(Clone, Debug)]
@@ -49,6 +50,14 @@ pub struct FrameState {
     pub clips:         Vec<ClipRenderEntry>,
     /// Pre-uploaded RGBA textures for test patterns (Phase 2 only).
     pub test_textures: Vec<wgpu::Texture>,
+    /// Textures supplied from outside the graph for this frame — the GPU decode
+    /// path's Y/UV planes, which the decoder owns and the graph only reads.
+    ///
+    /// G2b. Per frame rather than per compiled graph because the graph shape is
+    /// stable while the target holding a given source's planes is not. Empty is the
+    /// CPU upload path and means the graph allocates every resource from its pool,
+    /// exactly as before.
+    pub imported:      ImportedResources,
 }
 
 impl FrameState {
@@ -60,6 +69,7 @@ impl FrameState {
             canvas_height,
             clips: Vec::new(),
             test_textures: Vec::new(),
+            imported: ImportedResources::new(),
         }
     }
 

@@ -995,6 +995,8 @@ fn run_benchmark(
         canvas_height: config.canvas_h,
         clips: frame_clips,
         test_textures: vec![],
+        // The synthetic sweep drives the CPU upload path, so nothing is imported.
+        imported: Default::default(),
     };
 
     // ── Pipeline depth ────────────────────────────────────────────────────────
@@ -1757,6 +1759,9 @@ fn media_graph(
             kind: ClipKind::Video,
         }],
         test_textures: vec![],
+        // Real coded frames, still through the CPU upload path (G2c is what makes
+        // this class of row import its planes instead).
+        imported: Default::default(),
     };
     Ok((graph, upload_idx, frame_state))
 }

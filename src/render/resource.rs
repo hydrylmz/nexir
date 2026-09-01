@@ -3,6 +3,7 @@
 use crate::render::device::GpuDevice;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 static VIEW_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -88,6 +89,15 @@ pub struct ResourceBuilder {
     pub reads:   Vec<(ResourceId, TextureAccess)>,
     pub writes:  Vec<(ResourceId, TextureAccess)>,
     pub creates: Vec<(ResourceId, ResourceDescriptor)>,
+    /// Resources this node reads that are supplied from OUTSIDE the graph — an
+    /// NVDEC decode target, not a pooled intermediate. See [`ImportedTexture`].
+    ///
+    /// Separate from `creates` because the graph must not allocate one, and
+    /// separate from a bare `read` because a read with no producer is the
+    /// [`crate::render::graph::GraphError::MissingProducer`] diagnostic — an import
+    /// *is* its own producer, and saying so here is what keeps that error meaningful
+    /// for the case it was written for.
+    pub imports: Vec<(ResourceId, TextureAccess)>,
     id_counter:  u32,
 }
 
@@ -97,6 +107,7 @@ impl ResourceBuilder {
             reads: Vec::new(),
             writes: Vec::new(),
             creates: Vec::new(),
+            imports: Vec::new(),
             id_counter: id_counter_start,
         }
     }
@@ -109,6 +120,17 @@ impl ResourceBuilder {
     /// Declare that this node writes to an existing resource.
     pub fn write(&mut self, id: ResourceId, access: TextureAccess) {
         self.writes.push((id, access));
+    }
+
+    /// Declare that this node reads a texture the graph neither creates nor owns,
+    /// bound per frame via [`crate::render::frame_state::FrameState::imported`].
+    ///
+    /// The id is chosen by the caller, exactly like [`Self::read`], because the node
+    /// and whoever binds the texture must agree on it — the node holds it in a field
+    /// and the frame's [`ImportedResources`] is keyed by the same value.
+    pub fn import(&mut self, id: ResourceId, access: TextureAccess) {
+        self.imports.push((id, access));
+        self.reads.push((id, access));
     }
 
     /// Declare that this node creates a new transient resource and immediately writes it.
@@ -129,6 +151,183 @@ pub struct ResolvedResource<'a> {
     pub format:  wgpu::TextureFormat,
     pub width:   u32,
     pub height:  u32,
+}
+
+/// A texture the pool owns: handed out by [`TransientTexturePool::acquire`] and
+/// given back by [`TransientTexturePool::release`].
+pub type TransientResource = (wgpu::Texture, wgpu::TextureView, ViewId);
+
+/// A texture the graph BINDS but does not own.
+///
+/// G2b. The interop decode path makes NVDEC's destination surface *the* Y/UV
+/// texture a graph reads ([`crate::interop::decode_interop::DecodeInteropTarget`]),
+/// so the texture's lifetime belongs to whoever decoded into it — `IoLayer`'s
+/// per-source target, reused for every frame from that source — and not to the
+/// frame that happens to sample it. Two properties follow, and both are
+/// load-bearing:
+///
+/// - **It must never reach [`TransientTexturePool::release`].** The pool buckets by
+///   (format, usage, size) and hands textures to whoever asks next, so a released
+///   import would later be handed to an unrelated resource while the decoder still
+///   writes into it — a torn frame, with no error and nothing in the pool's own
+///   counters to show for it. [`GraphResource::into_transient`] is the single
+///   funnel that decides, and it is what `CompiledGraph::execute` releases through.
+/// - **Its [`ViewId`] is created ONCE, here, and cloned every frame.** Eleven nodes
+///   cache their bind group on the `ViewId`s they were handed (AGENTS.md gotcha 16);
+///   minting a fresh id per frame for the same underlying texture rebuilds every one
+///   of those caches every frame, which is exactly the cost the FIFO pool change
+///   removed.
+///
+/// `Arc` on both fields because a frame binds a texture the decoder owns: cloning
+/// into [`ImportedResources`] must not move it, and the view is created once
+/// alongside the id rather than per frame.
+#[derive(Clone)]
+pub struct ImportedTexture {
+    texture: Arc<wgpu::Texture>,
+    view:    Arc<wgpu::TextureView>,
+    view_id: ViewId,
+}
+
+impl ImportedTexture {
+    /// Import an externally-owned texture, creating its view and its one stable
+    /// `ViewId` now.
+    ///
+    /// The texture must already carry the usages the reading nodes need
+    /// (`TEXTURE_BINDING` for a sampled plane): the compiler aggregates usages only
+    /// for resources it *creates*, so an import's flags are the importer's
+    /// responsibility and a missing one surfaces as a wgpu validation error at bind
+    /// time rather than as a graph error.
+    pub fn new(texture: Arc<wgpu::Texture>) -> Self {
+        let view = Arc::new(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        Self { texture, view, view_id: ViewId::new() }
+    }
+
+    /// The stable id every bind-group cache keys on. Equal across clones, and
+    /// therefore across frames.
+    pub fn view_id(&self) -> ViewId {
+        self.view_id
+    }
+
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    pub fn resolved(&self) -> ResolvedResource<'_> {
+        ResolvedResource {
+            texture: &self.texture,
+            view:    &self.view,
+            view_id: self.view_id,
+            format:  self.texture.format(),
+            width:   self.texture.width(),
+            height:  self.texture.height(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ImportedTexture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedTexture")
+            .field("view_id", &self.view_id)
+            .field("format", &self.texture.format())
+            .field("width", &self.texture.width())
+            .field("height", &self.texture.height())
+            .finish()
+    }
+}
+
+/// One slot of a [`crate::render::context::RenderContext`]: either a texture the
+/// pool lent for this frame, or one the graph was lent from outside.
+///
+/// The distinction exists for exactly one reason — the release path. Everything
+/// else about the two is identical from a node's point of view, which is why
+/// [`Self::resolved`] erases it and no node has to know which kind it was handed.
+pub enum GraphResource {
+    /// Acquired from [`TransientTexturePool`] this frame; must be returned to it.
+    Transient(TransientResource),
+    /// Owned elsewhere, for longer than this frame; must NOT be returned.
+    Imported(ImportedTexture),
+}
+
+impl GraphResource {
+    pub fn resolved(&self) -> ResolvedResource<'_> {
+        match self {
+            Self::Transient((tex, view, view_id)) => ResolvedResource {
+                texture: tex,
+                view,
+                view_id: *view_id,
+                format:  tex.format(),
+                width:   tex.width(),
+                height:  tex.height(),
+            },
+            Self::Imported(imported) => imported.resolved(),
+        }
+    }
+
+    pub fn view_id(&self) -> ViewId {
+        match self {
+            Self::Transient((_, _, id)) => *id,
+            Self::Imported(imported) => imported.view_id,
+        }
+    }
+
+    pub fn is_imported(&self) -> bool {
+        matches!(self, Self::Imported(_))
+    }
+
+    /// The pool-release filter, and the whole point of this enum.
+    ///
+    /// `Some` only for a texture the pool lent. An import yields `None` and is
+    /// dropped here, which releases this frame's `Arc` share and nothing else —
+    /// the decoder's target stays alive and stays out of the pool's buckets.
+    pub fn into_transient(self) -> Option<TransientResource> {
+        match self {
+            Self::Transient(res) => Some(res),
+            Self::Imported(_) => None,
+        }
+    }
+}
+
+/// The imported textures one frame binds, keyed by the [`ResourceId`] the reading
+/// node declared with [`ResourceBuilder::import`].
+///
+/// Carried on [`crate::render::frame_state::FrameState`] rather than on the
+/// compiled graph, because the binding is per frame: the same graph shape reads
+/// source 0's Y plane every frame, but *which* decode target currently holds that
+/// plane is a property of the frame being scheduled. An empty set (the default) is
+/// the CPU upload path, unchanged.
+#[derive(Clone, Default, Debug)]
+pub struct ImportedResources {
+    entries: Vec<(ResourceId, ImportedTexture)>,
+}
+
+impl ImportedResources {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bind (or rebind) `id` to an externally-owned texture for this frame.
+    pub fn bind(&mut self, id: ResourceId, texture: ImportedTexture) {
+        match self.entries.iter_mut().find(|(existing, _)| *existing == id) {
+            Some(slot) => slot.1 = texture,
+            None => self.entries.push((id, texture)),
+        }
+    }
+
+    pub fn get(&self, id: ResourceId) -> Option<&ImportedTexture> {
+        self.entries.iter().find(|(existing, _)| *existing == id).map(|(_, tex)| tex)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (ResourceId, &ImportedTexture)> {
+        self.entries.iter().map(|(id, tex)| (*id, tex))
+    }
 }
 
 /// Pre-allocated pool of wgpu textures for transient resources.
@@ -548,5 +747,163 @@ mod tests {
         for res in frame2.drain(..) {
             pool.release(res);
         }
+    }
+
+    // ── G2b — imported resources ────────────────────────────────────────────
+
+    /// An imported texture must never be parked in a pool bucket.
+    ///
+    /// THE BUG THIS PINS, and it has no error message of its own. The pool buckets
+    /// by (format, usage, size) and hands a texture to whoever asks for that key
+    /// next, so a released import is handed to an *unrelated* resource one or more
+    /// frames later — while the decoder that owns it keeps writing new frames into
+    /// it. The symptom is a torn or wrong-content intermediate; the pool reports an
+    /// ordinary hit, `evicted` stays 0, and nothing fails.
+    ///
+    /// Stated where it can actually fail: the import is given the **same key** as
+    /// the transient beside it, so a leak lands in the same bucket and shows up as
+    /// `pooled == 2`. With a different key the assertion would pass for the wrong
+    /// reason.
+    #[test]
+    fn an_imported_resource_is_never_released_to_the_pool() {
+        use crate::render::context::RenderContext;
+
+        let Ok(device) = pollster::block_on(GpuDevice::new_headless()) else {
+            eprintln!("SKIP: no GPU on this machine");
+            return;
+        };
+        let fmt = wgpu::TextureFormat::Rgba16Float;
+        let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING;
+        let mut pool = TransientTexturePool::new();
+
+        // One pooled slot and one import that would land in the very same bucket.
+        let transient = pool.acquire(&device, fmt, usage, 64, 64);
+        let transient_id = transient.2;
+        let imported = ImportedTexture::new(Arc::new(
+            device.create_texture(Some("decoder_owned"), 64, 64, fmt, usage),
+        ));
+        let imported_id = imported.view_id();
+        assert_ne!(transient_id, imported_id);
+
+        let ctx = RenderContext::from_slots(vec![
+            Some(GraphResource::Transient(transient)),
+            Some(GraphResource::Imported(imported.clone())),
+        ]);
+        assert!(!ctx.is_imported(ResourceId(0)));
+        assert!(ctx.is_imported(ResourceId(1)));
+
+        let released: Vec<_> = ctx.into_pooled().collect();
+        assert_eq!(
+            released.len(),
+            1,
+            "only the pool's own texture may come back; {} slots were handed to \
+             release",
+            released.len()
+        );
+        assert_eq!(released[0].2, transient_id, "the wrong slot was released");
+        for res in released {
+            pool.release(res);
+        }
+
+        let stats = pool.stats();
+        assert_eq!(
+            stats.pooled, 1,
+            "the imported texture leaked into a bucket: {} textures pooled for one \
+             released resource. A later frame would be handed the decoder's target \
+             for an unrelated intermediate, with no error and no counter to show it.",
+            stats.pooled
+        );
+        assert_eq!(stats.peak_bucket, 1);
+
+        // And the import is still alive and still usable — it was dropped from the
+        // frame, not freed. Its `ViewId` is unchanged, which is the property every
+        // bind-group cache depends on.
+        assert_eq!(imported.view_id(), imported_id);
+        assert_eq!(imported.resolved().view_id, imported_id);
+
+        // The next frame must be handed the pool's texture back, never the import's.
+        let next = pool.acquire(&device, fmt, usage, 64, 64);
+        assert_eq!(next.2, transient_id);
+    }
+
+    /// An import's `ViewId` is minted once and survives every per-frame clone.
+    ///
+    /// Eleven nodes cache their bind group on the `ViewId`s they were handed
+    /// (AGENTS.md gotcha 16), so a fresh id per frame for the same underlying
+    /// texture rebuilds all of them every frame — the exact cost the FIFO pool
+    /// change removed, reintroduced through the other door. Cloning is what binding
+    /// into a frame does, so the clone is what has to hold the id stable.
+    #[test]
+    fn an_imported_textures_view_id_survives_the_per_frame_clone() {
+        let Ok(device) = pollster::block_on(GpuDevice::new_headless()) else {
+            eprintln!("SKIP: no GPU on this machine");
+            return;
+        };
+        let imported = ImportedTexture::new(Arc::new(device.create_texture(
+            Some("decoder_owned"),
+            64,
+            64,
+            wgpu::TextureFormat::R8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+        )));
+        let id = imported.view_id();
+
+        for frame in 0..3 {
+            let bound = imported.clone();
+            assert_eq!(
+                bound.view_id(),
+                id,
+                "frame {frame} was handed a new ViewId for the same texture, so every \
+                 bind group keyed on it is rebuilt"
+            );
+            assert_eq!(GraphResource::Imported(bound).view_id(), id);
+        }
+
+        // Two separate imports of two textures are still distinct.
+        let other = ImportedTexture::new(Arc::new(device.create_texture(
+            Some("other"),
+            64,
+            64,
+            wgpu::TextureFormat::R8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+        )));
+        assert_ne!(other.view_id(), id);
+    }
+
+    /// Rebinding an id replaces the texture rather than accumulating a second entry.
+    ///
+    /// The per-frame binding is a rebind of the same ids every frame (source 0's Y
+    /// plane is always the same `ResourceId`), so an append-only set would grow
+    /// without bound and `get` would keep answering with the first frame's texture.
+    #[test]
+    fn rebinding_an_import_replaces_it_rather_than_shadowing_it() {
+        let Ok(device) = pollster::block_on(GpuDevice::new_headless()) else {
+            eprintln!("SKIP: no GPU on this machine");
+            return;
+        };
+        let make = |label: &'static str| {
+            ImportedTexture::new(Arc::new(device.create_texture(
+                Some(label),
+                64,
+                64,
+                wgpu::TextureFormat::R8Unorm,
+                wgpu::TextureUsages::TEXTURE_BINDING,
+            )))
+        };
+        let first = make("frame0");
+        let second = make("frame1");
+
+        let mut set = ImportedResources::new();
+        assert!(set.is_empty());
+        set.bind(ResourceId(7), first.clone());
+        set.bind(ResourceId(7), second.clone());
+        assert_eq!(set.len(), 1, "a rebind must replace, not append");
+        assert_eq!(set.get(ResourceId(7)).map(|t| t.view_id()), Some(second.view_id()));
+        assert!(set.get(ResourceId(8)).is_none());
+
+        set.bind(ResourceId(8), first.clone());
+        assert_eq!(set.len(), 2);
+        let ids: Vec<_> = set.iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![ResourceId(7), ResourceId(8)]);
     }
 }

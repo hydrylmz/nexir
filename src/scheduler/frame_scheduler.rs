@@ -67,6 +67,9 @@ impl FrameScheduler {
             canvas_height: self.canvas_h,
             clips: all,
             test_textures: vec![],
+            // The CPU upload path: nothing is imported, so the graph allocates
+            // every resource from its own pool. G2c is what fills this in.
+            imported: Default::default(),
         }
     }
 
@@ -113,6 +116,8 @@ impl FrameScheduler {
             canvas_height: self.canvas_h,
             clips: all,
             test_textures: vec![],
+            // As above: the CPU upload path imports nothing.
+            imported: Default::default(),
         }
     }
 

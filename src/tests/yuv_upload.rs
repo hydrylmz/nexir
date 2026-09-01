@@ -105,6 +105,7 @@ mod yuv_upload {
             canvas_height: frame_h,
             clips: vec![],
             test_textures: vec![],
+            imported: Default::default(),
         };
 
         // Texture-to-buffer readback needs a 256-aligned row stride of its own.

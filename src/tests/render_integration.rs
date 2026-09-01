@@ -553,4 +553,223 @@ mod render_integration {
             "the timed path must hold the same textures simultaneously"
         );
     }
+
+    // ── G2b — an imported resource, driven through a real graph ───────────────
+
+    /// Reads an imported plane and copies it into FINAL_COLOR, so what the graph
+    /// did is checkable in pixels rather than only in the pool's counters.
+    struct ImportReaderNode {
+        import: ResourceId,
+    }
+    impl RenderNode for ImportReaderNode {
+        fn name(&self) -> &str { "ImportReader" }
+        fn declare_resources(&self, builder: &mut ResourceBuilder) {
+            // The whole point: declared as an import, so the graph must NOT
+            // allocate it and must not release it.
+            builder.import(self.import, TextureAccess::CopySrc);
+            builder.creates.push((ResourceId::FINAL_COLOR, ResourceDescriptor {
+                label: Some("FinalColor".into()),
+                size: ResolutionSource::Fixed(W, H),
+                format: wgpu::TextureFormat::Rgba8Unorm,
+            }));
+            builder.write(ResourceId::FINAL_COLOR, TextureAccess::CopyDst);
+        }
+        fn record(&self, encoder: &mut wgpu::CommandEncoder, ctx: &RenderContext, _f: &FrameState) {
+            let src = ctx.get(self.import);
+            let dst = ctx.get(ResourceId::FINAL_COLOR);
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture { texture: src.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::ImageCopyTexture { texture: dst.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+            );
+        }
+    }
+
+    /// A graph reading an externally-owned texture must sample the importer's
+    /// pixels, keep the import out of the pool, and hand the same `ViewId` to every
+    /// frame.
+    ///
+    /// G2b, stated through `execute` rather than over the pool alone: the unit test
+    /// in `render::resource::tests` pins the release filter, this pins that the
+    /// compiler agrees — no descriptor is created for an import (so nothing is
+    /// allocated for it), `MissingProducer` does not fire for a resource no node
+    /// writes, and the bytes a node samples are the importer's.
+    ///
+    /// The pixel check is what makes it more than a bookkeeping test: if the graph
+    /// had quietly pooled a texture for the import instead, the copy would read an
+    /// uninitialised transient and the colour would not be the one written here.
+    #[test]
+    fn an_imported_resource_is_read_but_never_pooled() {
+        use crate::render::resource::{ImportedResources, ImportedTexture};
+
+        let device = pollster::block_on(GpuDevice::new_headless()).unwrap();
+
+        // The "decoder's" texture: owned out here, for longer than any one frame.
+        let decoder_owned = Arc::new(device.create_texture(
+            Some("decoder_owned"),
+            W, H,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+        ));
+        const MAGENTA: [u8; 4] = [200, 40, 180, 255];
+        device.queue.write_texture(
+            wgpu::ImageCopyTexture { texture: &decoder_owned, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &MAGENTA.repeat((W * H) as usize),
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(W * 4), rows_per_image: Some(H) },
+            wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        );
+        let imported = ImportedTexture::new(Arc::clone(&decoder_owned));
+        let stable_view_id = imported.view_id();
+
+        let mut id_counter = 2u32;
+        let import_id = ResourceId::next(&mut id_counter);
+
+        let readback = Arc::new(device.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("import_readback"),
+            size: (W * H * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        }));
+
+        let mut compiler = RenderGraphCompiler::new();
+        compiler.add_node(Box::new(ImportReaderNode { import: import_id }));
+        compiler.add_node(Box::new(ReadbackNode { buf: Arc::clone(&readback) }));
+        let graph = compiler
+            .compile(W, H)
+            .expect("an import is its own producer, so this must compile");
+
+        let mut frame = FrameState::test_empty(W, H);
+        let mut binding = ImportedResources::new();
+        binding.bind(import_id, imported.clone());
+        frame.imported = binding;
+
+        // Three frames, because the failure this guards is periodic: an import
+        // released into the pool is handed out on a LATER frame, not this one.
+        for pass in 0..3 {
+            let mut encoder = device.begin_frame();
+            graph.execute(&mut encoder, &device, &frame);
+            let sid = device.submit(encoder);
+            device.device.poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+
+            let stats = graph.pool_stats();
+            // FINAL_COLOR is the only pooled resource in this graph. If the import
+            // were pooled too, this would be 2 — and the second one would be handed
+            // to FINAL_COLOR on a later frame, which is the torn-frame bug.
+            assert_eq!(
+                stats.pooled, 1,
+                "pass {pass}: {} textures pooled; only FINAL_COLOR may be, the \
+                 import is owned by the decoder",
+                stats.pooled
+            );
+            assert_eq!(
+                stats.peak_bucket, 1,
+                "pass {pass}: a bucket held {} textures; the import leaked into it",
+                stats.peak_bucket
+            );
+            // One allocation on the first frame, none after: the import never
+            // enters the accounting at all.
+            assert_eq!(stats.misses, 1, "pass {pass}: only FINAL_COLOR is allocated, once");
+
+            // The importer's ViewId is stable, so every bind-group cache keyed on
+            // it survives (AGENTS.md gotcha 16).
+            assert_eq!(imported.view_id(), stable_view_id, "pass {pass}");
+        }
+
+        // And the pixels came from the imported texture rather than from an
+        // uninitialised transient the graph allocated behind our back.
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        assert_eq!(
+            &data[0..4], &MAGENTA,
+            "FINAL_COLOR does not hold the imported texture's pixels: {:?}",
+            &data[0..4]
+        );
+        let last = (W * H * 4 - 4) as usize;
+        assert_eq!(&data[last..last + 4], &MAGENTA, "only part of the import was read");
+        drop(data);
+        readback.unmap();
+
+        // The decoder still owns its texture: nothing here freed it or moved it.
+        assert!(
+            Arc::strong_count(&decoder_owned) >= 2,
+            "the import must hold a share of the decoder's texture, not a copy of it"
+        );
+    }
+
+    /// A resource cannot be both created by the graph and imported into it.
+    ///
+    /// The two ownerships are mutually exclusive and the run-time consequence is
+    /// silent: the pool allocates a texture the import shadows, and then the import
+    /// is reclaimed into a bucket at end of frame because the slot's variant is what
+    /// drives the release. Rejected at compile time instead.
+    #[test]
+    fn a_resource_cannot_be_both_created_and_imported() {
+        struct BothNode(ResourceId);
+        impl RenderNode for BothNode {
+            fn name(&self) -> &str { "BothNode" }
+            fn declare_resources(&self, builder: &mut ResourceBuilder) {
+                builder.creates.push((self.0, ResourceDescriptor {
+                    label: None,
+                    size: ResolutionSource::Fixed(W, H),
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                }));
+                builder.write(self.0, TextureAccess::StorageWrite);
+                builder.import(self.0, TextureAccess::Sampled);
+            }
+            fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
+        }
+
+        let mut compiler = RenderGraphCompiler::new();
+        compiler.add_node(Box::new(BothNode(ResourceId(4))));
+        match compiler.compile(W, H).err() {
+            Some(GraphError::IncompatibleAccess { node_name, resource, reason, .. }) => {
+                assert_eq!(node_name, "BothNode");
+                assert_eq!(resource, ResourceId(4));
+                assert!(
+                    reason.contains("imported"),
+                    "the diagnostic must say what the conflict is: {reason}"
+                );
+            }
+            other => panic!(
+                "a create+import must be rejected at compile time; got {other:?}"
+            ),
+        }
+    }
+
+    /// An import the frame forgot to bind must fail with a message naming it.
+    ///
+    /// The graph does not allocate imports, so an unbound one leaves the slot empty
+    /// and the next thing to touch it is `ctx.get` inside whichever node happened to
+    /// sample it first — a panic naming a bare `ResourceId` and no cause. The
+    /// resolve step checks up front instead.
+    #[test]
+    fn an_unbound_import_names_itself() {
+        let device = pollster::block_on(GpuDevice::new_headless()).unwrap();
+        let mut id_counter = 2u32;
+        let import_id = ResourceId::next(&mut id_counter);
+
+        let mut compiler = RenderGraphCompiler::new();
+        compiler.add_node(Box::new(ImportReaderNode { import: import_id }));
+        let graph = compiler.compile(W, H).expect("compiles");
+
+        // Deliberately no `frame.imported.bind(...)`.
+        let frame = FrameState::test_empty(W, H);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut encoder = device.begin_frame();
+            graph.execute(&mut encoder, &device, &frame);
+        }));
+        let err = result.expect_err("an unbound import must not silently render");
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("import") && msg.contains(&format!("{:?}", import_id)),
+            "the panic must name the unbound resource and say it was an import: {msg}"
+        );
+    }
 }

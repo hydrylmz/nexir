@@ -36,6 +36,8 @@ struct NodeMeta {
     #[allow(dead_code)]
     writes:       Vec<(ResourceId, TextureAccess)>,
     creates:      Vec<(ResourceId, ResourceDescriptor)>,
+    /// Resources read from outside the graph — see [`ResourceBuilder::import`].
+    imports:      Vec<(ResourceId, TextureAccess)>,
     in_degree:    usize,
     /// Indices of nodes that depend on this node's outputs.
     dependents:   Vec<usize>,
@@ -107,6 +109,7 @@ impl RenderGraphCompiler {
                 reads: builder.reads,
                 writes: builder.writes,
                 creates: builder.creates,
+                imports: builder.imports,
                 in_degree: 0,
                 dependents: Vec::new(),
             });
@@ -124,6 +127,14 @@ impl RenderGraphCompiler {
             }
             for (id, _) in &meta.creates {
                 produced_resources.insert(*id);
+            }
+            // An imported resource is produced OUTSIDE the graph — by the decoder
+            // that wrote into it — so it satisfies the reader it was declared for
+            // without any node writing it. Registering it here rather than
+            // exempting imports from the check keeps `MissingProducer` meaningful
+            // for the case it exists to catch: a read of a resource nobody fills.
+            for &(id, _) in &meta.imports {
+                produced_resources.insert(id);
             }
         }
 
@@ -292,10 +303,52 @@ impl RenderGraphCompiler {
             }
         }
 
+        // Step 7: Record which resources are supplied from outside.
+        //
+        // Held on the compiled graph rather than re-derived per frame so `execute`
+        // can assert the frame bound every one of them: an import the frame forgot
+        // would otherwise surface as `ctx.get` panicking inside whichever node
+        // happened to sample it first, naming a ResourceId and no cause.
+        //
+        // Deliberately NOT given a descriptor: `descriptors[id]` stays `None` for an
+        // import, which is what keeps the acquire loop from allocating one.
+        let mut imported_ids: Vec<ResourceId> = node_metas
+            .iter()
+            .flat_map(|m| m.imports.iter().map(|(id, _)| *id))
+            .collect();
+        imported_ids.sort_unstable_by_key(|id| id.0);
+        imported_ids.dedup();
+
+        // A resource cannot be both. The pool would allocate a texture the frame's
+        // import then shadows, and — worse — the import would be released into the
+        // pool at the end of the frame, since the slot's variant is what drives the
+        // release. Caught at compile time because at run time it is a torn frame
+        // with no error.
+        for id in &imported_ids {
+            if descriptors.get(id.0 as usize).is_some_and(|d| d.is_some()) {
+                let creator = node_names
+                    .iter()
+                    .zip(&node_metas)
+                    .find(|(_, m)| m.creates.iter().any(|(cid, _)| cid == id))
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                return Err(GraphError::IncompatibleAccess {
+                    node_name: creator,
+                    resource: *id,
+                    access: TextureAccess::Sampled,
+                    reason: "resource is both created by the graph and imported from \
+                             outside it: the pool would allocate a texture the import \
+                             shadows, then reclaim the import at end of frame"
+                        .into(),
+                });
+            }
+        }
+
         Ok(CompiledGraph {
             nodes: self.nodes,
             order: sorted_order,
             descriptors,
+            imported_ids,
             canvas_width,
             canvas_height,
             texture_pool: Mutex::new(TransientTexturePool::new()),
@@ -386,6 +439,9 @@ pub struct CompiledGraph {
     nodes: Vec<Box<dyn RenderNode>>,
     order: Vec<usize>,
     descriptors: Vec<Option<(ResourceDescriptor, wgpu::TextureUsages)>>,
+    /// Resources every frame must bind from outside — see [`ResourceBuilder::import`].
+    /// Empty for every graph that does not use the interop decode path.
+    imported_ids: Vec<ResourceId>,
     canvas_width: u32,
     canvas_height: u32,
     texture_pool: Mutex<TransientTexturePool>,
@@ -429,19 +485,27 @@ impl CompiledGraph {
         self.texture_pool.lock().unwrap().stats()
     }
 
-    /// Acquire a pooled texture for every declared resource, for one frame.
+    /// Resolve every declared resource for one frame: pooled textures acquired from
+    /// the graph's own pool, imported ones bound from the frame.
     ///
     /// Shared by all three `execute*` bodies. The acquire loop is the one part of
     /// them that must stay identical — a divergence is a resource the timed path
     /// pools and the untimed one does not, which the pool's counters would then
     /// disagree about between runs — so it lives here rather than being copied a
     /// third time.
+    ///
+    /// # Panics
+    /// Panics if a resource declared with [`ResourceBuilder::import`] was not bound
+    /// by this frame. The alternative is `ctx.get` panicking later inside whichever
+    /// node sampled it first, naming a bare `ResourceId` and no cause.
     fn resolve_resources(
         &self,
         device: &GpuDevice,
-    ) -> Vec<Option<(wgpu::Texture, wgpu::TextureView, crate::render::resource::ViewId)>> {
-        let mut slots: Vec<Option<(wgpu::Texture, wgpu::TextureView, crate::render::resource::ViewId)>> =
-            (0..self.descriptors.len()).map(|_| None).collect();
+        frame: &FrameState,
+    ) -> Vec<Option<crate::render::resource::GraphResource>> {
+        use crate::render::resource::GraphResource;
+
+        let mut slots = crate::render::context::empty_slots(self.descriptors.len());
 
         let mut pool = self.texture_pool.lock().unwrap();
         for (id_usize, desc_opt) in self.descriptors.iter().enumerate() {
@@ -450,10 +514,25 @@ impl CompiledGraph {
                     ResolutionSource::Canvas => (self.canvas_width, self.canvas_height),
                     ResolutionSource::Fixed(fw, fh) => (fw, fh),
                 };
-                slots[id_usize] = Some(pool.acquire(device, desc.format, *usage, w, h));
+                slots[id_usize] =
+                    Some(GraphResource::Transient(pool.acquire(device, desc.format, *usage, w, h)));
             }
         }
         drop(pool);
+
+        for &id in &self.imported_ids {
+            let texture = frame.imported.get(id).unwrap_or_else(|| {
+                panic!(
+                    "resource {:?} was declared as an import but this frame bound \
+                     nothing to it (frame binds {} import(s)); the graph does not \
+                     allocate imports, so there is no texture for the reading node \
+                     to sample",
+                    id,
+                    frame.imported.len()
+                )
+            });
+            crate::render::context::bind_import(&mut slots, id, texture);
+        }
 
         slots
     }
@@ -465,8 +544,8 @@ impl CompiledGraph {
         device: &GpuDevice,
         frame: &FrameState,
     ) {
-        // Step 1 & 2: Acquire transient textures and create views
-        let ctx = RenderContext::new(self.resolve_resources(device));
+        // Step 1 & 2: Acquire transient textures, bind imported ones
+        let ctx = RenderContext::from_slots(self.resolve_resources(device, frame));
 
         // Step 3: Execute nodes
         for &node_idx in &self.order {
@@ -476,9 +555,12 @@ impl CompiledGraph {
             encoder.pop_debug_group();
         }
 
-        // Step 4: Release transient textures
+        // Step 4: Return the POOLED textures — and only those. An imported texture
+        // is owned by the decoder that wrote into it and is dropped by `into_pooled`
+        // instead of released; parking one in a bucket would hand it to an unrelated
+        // resource on a later frame while the decoder still writes to it.
         let mut pool = self.texture_pool.lock().unwrap();
-        for res in ctx.into_resources().into_iter().flatten() {
+        for res in ctx.into_pooled() {
             pool.release(res);
         }
     }
@@ -516,7 +598,7 @@ impl CompiledGraph {
         // Acquire exactly as `execute` does — through the same helper, so the two
         // cannot drift. That the pool interaction is identical is checkable: a timed
         // run and an untimed one must report the same hit/miss/evicted numbers.
-        let ctx = RenderContext::new(self.resolve_resources(device));
+        let ctx = RenderContext::from_slots(self.resolve_resources(device, frame));
 
         let mut names: Vec<&'a str> = Vec::with_capacity(self.order.len());
         for &node_idx in &self.order {
@@ -539,7 +621,7 @@ impl CompiledGraph {
         timer.record_resolve(encoder);
 
         let mut pool = self.texture_pool.lock().unwrap();
-        for res in ctx.into_resources().into_iter().flatten() {
+        for res in ctx.into_pooled() {
             pool.release(res);
         }
         names
@@ -554,7 +636,7 @@ impl CompiledGraph {
     ) where
         F: FnOnce(&mut wgpu::CommandEncoder, &RenderContext),
     {
-        let ctx = RenderContext::new(self.resolve_resources(device));
+        let ctx = RenderContext::from_slots(self.resolve_resources(device, frame));
 
         for &node_idx in &self.order {
             let node = &self.nodes[node_idx];
@@ -566,7 +648,7 @@ impl CompiledGraph {
         callback(encoder, &ctx);
 
         let mut pool = self.texture_pool.lock().unwrap();
-        for res in ctx.into_resources().into_iter().flatten() {
+        for res in ctx.into_pooled() {
             pool.release(res);
         }
     }
