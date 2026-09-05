@@ -38,7 +38,9 @@ use crate::interop::cuda_context::{CudaContext, CudaError};
 use crate::interop::external_buffer::SharedBuffer;
 use crate::interop::nv12_encode::Nv12EncodeNode;
 use crate::interop::ffi::nvenc::*;
-use crate::interop::ffi::cuda_driver::{cuCtxPushCurrent, cuCtxPopCurrent, CUcontext};
+use crate::interop::ffi::cuda_driver::{
+    cuCtxGetCurrent, cuCtxSetCurrent, CUcontext, CUDA_SUCCESS,
+};
 use crate::render::device::GpuDevice;
 use crate::export::job::{ExportJob, VideoCodec};
 use std::sync::Arc;
@@ -649,11 +651,31 @@ impl EncodeInterop {
         };
         log::info!("[export] Opening NVENC session (params.version=0x{:08x}, api_version={})",
             open_params_ver, probed_api_version);
-        // Push CUDA context onto this thread's stack before calling into NVENC driver.
-        let mut _popped_ctx: CUcontext = std::ptr::null_mut();
-        unsafe { cuCtxPushCurrent(cuda_ctx.raw_context()); }
-        let ret = unsafe { (funcs.open_session)(&params, &mut session) };
-        unsafe { cuCtxPopCurrent(&mut _popped_ctx); }
+        // Bind the CUDA context to this thread before calling into the NVENC driver,
+        // and restore whatever was current afterwards.
+        //
+        // `cuCtxSetCurrent`, not `cuCtxPushCurrent`: push requires the context to be
+        // FLOATING, and once a decoder has been opened with
+        // `AV_CUDA_USE_PRIMARY_CONTEXT` this same context is current on FFmpeg's
+        // threads, so the push returns `CUDA_ERROR_INVALID_CONTEXT` (201) and the
+        // matching pop removes a context this function never put there. Measured in
+        // `examples/g2e_interop_target_probe.rs`; see `CudaContext::with_context`,
+        // which is the same fix and the fuller explanation. An export in the same
+        // process as a preview `IoLayer` is exactly the ordering that reaches it.
+        let ret = unsafe {
+            let mut previous: CUcontext = std::ptr::null_mut();
+            let had_previous = cuCtxGetCurrent(&mut previous) == CUDA_SUCCESS;
+            let bound = cuCtxSetCurrent(cuda_ctx.raw_context());
+            if bound != CUDA_SUCCESS {
+                log::error!(
+                    "[export] cuCtxSetCurrent before nvEncOpenEncodeSessionEx failed \
+                     ({bound}) — the session would be opened against the wrong context"
+                );
+            }
+            let r = (funcs.open_session)(&params, &mut session);
+            cuCtxSetCurrent(if had_previous { previous } else { std::ptr::null_mut() });
+            r
+        };
         if ret != NV_ENC_SUCCESS {
             log::error!("[export] nvEncOpenEncodeSessionEx returned error {}", ret);
             return Err(EncodeInteropError::SessionOpen(ret));
@@ -910,10 +932,14 @@ impl EncodeInterop {
                         close_all(&evs);
                         (funcs.destroy_encoder)(session);
 
-                        let mut popped: CUcontext = std::ptr::null_mut();
-                        cuCtxPushCurrent(cuda_ctx.raw_context());
+                        // Same `cuCtxSetCurrent` reasoning as the first open above: a
+                        // push would be refused whenever a decoder already holds this
+                        // context, and the pop would then unbind someone else's.
+                        let mut previous: CUcontext = std::ptr::null_mut();
+                        let had_previous = cuCtxGetCurrent(&mut previous) == CUDA_SUCCESS;
+                        cuCtxSetCurrent(cuda_ctx.raw_context());
                         let reopen = (funcs.open_session)(&params, &mut session);
-                        cuCtxPopCurrent(&mut popped);
+                        cuCtxSetCurrent(if had_previous { previous } else { std::ptr::null_mut() });
                         if reopen != NV_ENC_SUCCESS {
                             log::error!("[export] reopening NVENC session failed with error {}", reopen);
                             return Err(EncodeInteropError::SessionOpen(reopen));

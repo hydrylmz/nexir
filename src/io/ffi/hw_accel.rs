@@ -33,6 +33,36 @@ impl HwDeviceType {
             HwDeviceType::None         => 0,
         }
     }
+
+    /// `av_hwdevice_ctx_create` flags for this type.
+    ///
+    /// **`AV_CUDA_USE_PRIMARY_CONTEXT` for CUDA, and it is load-bearing for the
+    /// interop decode path.** With `flags = 0` FFmpeg calls `cuCtxCreate` and gets a
+    /// context of its own, while [`crate::interop::cuda_context::CudaContext`]
+    /// retains the device's *primary* context — two `CUcontext`s on one device. The
+    /// copy in `DecodeInteropTarget::copy_from_nvdec_frame` still succeeds, because
+    /// unified addressing makes a device pointer valid process-wide, but **no
+    /// synchronisation in our context can order against work in FFmpeg's**:
+    /// `cuCtxSynchronize` waits for the current context only, and
+    /// `cuStreamSynchronize` waits for one stream in it.
+    ///
+    /// Measured symptom, on `bench --interop` with the two contexts: 15-22% of the
+    /// pixels that move between consecutive frames came back holding the previous
+    /// frame's content, concentrated on moving edges, and the interop arm's output
+    /// varied run to run while the CPU arm was bit-identical across runs. No error,
+    /// no counter, no failing test — the same shape as gotchas 14, 16 and 18.
+    ///
+    /// The flag is what makes `cuda_context.rs`'s claim ("shares the same context as
+    /// FFmpeg's hwcontext_cuda") true rather than aspirational. `1 << 0` from
+    /// `libavutil/hwcontext_cuda.h`; the value is stable API, and passing it to a
+    /// non-CUDA device type would be meaningless, so every other arm passes 0.
+    pub fn create_flags(self) -> std::ffi::c_int {
+        match self {
+            // AV_CUDA_USE_PRIMARY_CONTEXT
+            HwDeviceType::Cuda => 1,
+            _ => 0,
+        }
+    }
 }
 
 #[link(name = "avutil")]
@@ -86,7 +116,10 @@ pub fn probe_hardware_device()
                 hw_type.ffi_value(),
                 std::ptr::null(),
                 std::ptr::null_mut(),
-                0,
+                // CUDA gets AV_CUDA_USE_PRIMARY_CONTEXT — see `create_flags`. Without
+                // it FFmpeg makes its own context and nothing in ours can synchronise
+                // against the decode.
+                hw_type.create_flags(),
             )
         };
         if ret == 0 {

@@ -187,6 +187,83 @@ pub const MEDIA_CLASSES: &[MediaClass] = &[
     },
 ];
 
+/// Four DISTINCT 4K60 sources, for the multi-source interop rows (Task G2f).
+///
+/// **Why a second list rather than a loop over `MEDIA_CLASSES`.** G2f.1 asks for N
+/// clips over N distinct sources at ONE geometry, because that is benchmark 5's
+/// shape (`distinct_sources: 4`, four layers of 4K). `MEDIA_CLASSES` is the
+/// opposite by design — five different geometries, one per row — so a loop over it
+/// would compare a 1080p decode against a 4K one inside a single frame and no
+/// figure from it could be read against benchmark 5.
+///
+/// **Four files, not one file opened four times**, and that distinction is the
+/// whole test: one `SourceId` means one target and one decoder mutex, which is the
+/// case `--interop`'s single-source rows already measured. Four labels mean four
+/// demuxers, four decoders, four `DecodeInteropTarget`s and four `SourceId`s.
+///
+/// **THE FOUR ARE NOT COMPARABLE DECODES, and any row built on them has to say so.**
+/// `cam_4k60_grain` is ~975 Mb/s against the others' 20-30 (243.6 MB against
+/// 4.9-7.4), i.e. ~35× the bitrate — so this set is *one very heavy source plus
+/// three ordinary ones*, never "4 × an average 4K60 clip". Two consequences,
+/// both measured (AGENTS.md gotcha 25):
+///   * its demux costs 1.5 ms/frame against the others' 0.04, and `bench --interop`'s
+///     per-source block cannot see that at all — `decode_into_target`'s timer starts
+///     after the packet is in hand;
+///   * the four share one NVDEC engine, so the per-source *decode* split reports who
+///     waited rather than who costs. Single-source, grain is the DEAREST of the four
+///     (17.0 ms/frame against 4.8-5.1); in the four-source run it reports as the
+///     CHEAPEST (2.5 against 5.4-12.1) while the total is unchanged.
+/// A claim about one source's decode cost therefore has to come from a
+/// single-source pass, not from this set.
+///
+/// The first entry deliberately repeats `cam_4k60`'s recipe **exactly**, so it
+/// resolves to the same generated file rather than encoding a fifth 4K60 clip;
+/// `a_shared_label_means_a_shared_recipe` is what keeps that from becoming a
+/// silent mismatch. The other three differ in content so no two sources hand the
+/// decoder the same bitstream.
+pub const MULTI_4K60_SOURCES: &[MediaClass] = &[
+    MediaClass {
+        label: "cam_4k60",
+        width: 3840,
+        height: 2160,
+        fps: 60,
+        seconds: 2,
+        source_filter: "testsrc2=size=3840x2160:rate=60",
+        encoder_args: &["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p"],
+        why: "4K60 — the target workload, on real coded frames",
+    },
+    MediaClass {
+        label: "cam_4k60_rot",
+        width: 3840,
+        height: 2160,
+        fps: 60,
+        seconds: 2,
+        source_filter: "testsrc2=size=3840x2160:rate=60,rotate=a=t*0.6:c=black:ow=3840:oh=2160",
+        encoder_args: &["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p"],
+        why: "4K60, non-translational motion — a second distinct source",
+    },
+    MediaClass {
+        label: "cam_4k60_grain",
+        width: 3840,
+        height: 2160,
+        fps: 60,
+        seconds: 2,
+        source_filter: "testsrc2=size=3840x2160:rate=60,noise=alls=30:allf=t",
+        encoder_args: &["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p"],
+        why: "4K60, grain — incompressible, the dearest of the four to decode",
+    },
+    MediaClass {
+        label: "cam_4k60_flip",
+        width: 3840,
+        height: 2160,
+        fps: 60,
+        seconds: 2,
+        source_filter: "testsrc2=size=3840x2160:rate=60,vflip",
+        encoder_args: &["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p"],
+        why: "4K60, same detail inverted — a fourth distinct bitstream",
+    },
+];
+
 /// The INPUT half of a fixture's ffmpeg command line, up to and including the
 /// source.
 ///
@@ -293,7 +370,7 @@ mod tests {
     /// exactly the kind of unfalsifiable number gotcha 9 exists to prevent.
     #[test]
     fn declared_geometry_matches_the_filter() {
-        for c in MEDIA_CLASSES {
+        for c in MEDIA_CLASSES.iter().chain(MULTI_4K60_SOURCES) {
             let expect = format!("size={}x{}", c.width, c.height);
             assert!(
                 c.source_filter.contains(&expect),
@@ -310,6 +387,68 @@ mod tests {
                 c.label,
                 c.fps,
                 c.source_filter
+            );
+        }
+    }
+
+    /// The multi-source list must name FOUR DISTINCT files at ONE geometry.
+    ///
+    /// **Both halves are the test, and each guards a different silent failure.**
+    /// Four labels that collapsed to fewer files would mean fewer `SourceId`s,
+    /// fewer decoders and fewer interop targets than the row claims — i.e. the
+    /// single-source case already measured, printed under a four-source heading
+    /// (`live targets 4` is what the acceptance criterion reads, and it would say
+    /// 1). And a geometry that drifted between entries would put a 1080p decode
+    /// inside a frame labelled 4K, so the row could not be read against benchmark
+    /// 5 at all.
+    #[test]
+    fn the_multi_source_list_is_four_distinct_4k_files() {
+        assert_eq!(
+            MULTI_4K60_SOURCES.len(),
+            4,
+            "benchmark 5's shape is four layers over four distinct sources"
+        );
+        let mut names: Vec<String> = MULTI_4K60_SOURCES.iter().map(|c| c.file_name()).collect();
+        names.sort();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(
+            before,
+            names.len(),
+            "two entries share a file, so they would share one SourceId, one \
+             decoder and one interop target: {names:?}"
+        );
+        for c in MULTI_4K60_SOURCES {
+            assert_eq!(
+                (c.width, c.height, c.fps),
+                (3840, 2160, 60),
+                "{}: every source in this list must be 4K60, or the frame mixes \
+                 geometries and cannot be read against benchmark 5",
+                c.label
+            );
+        }
+    }
+
+    /// A label shared with `MEDIA_CLASSES` must carry the SAME recipe.
+    ///
+    /// `MULTI_4K60_SOURCES[0]` reuses `cam_4k60`'s label on purpose, so
+    /// `ensure_fixture` finds the file the single-source rows already generated
+    /// instead of encoding a fifth 4K60 clip. That reuse is keyed on the FILE NAME,
+    /// which is derived from the label alone — so two entries sharing a label while
+    /// differing in filter or encoder args would have whichever profile ran first
+    /// silently decide what the other one measured, with no error anywhere.
+    #[test]
+    fn a_shared_label_means_a_shared_recipe() {
+        for m in MULTI_4K60_SOURCES {
+            let Some(c) = MEDIA_CLASSES.iter().find(|c| c.label == m.label) else {
+                continue;
+            };
+            assert_eq!(
+                (c.source_filter, c.encoder_args, c.seconds),
+                (m.source_filter, m.encoder_args, m.seconds),
+                "{}: the same label describes two different files, and the fixture \
+                 cache keys on the label",
+                m.label
             );
         }
     }
@@ -344,7 +483,7 @@ mod tests {
             return;
         };
 
-        for c in MEDIA_CLASSES {
+        for c in MEDIA_CLASSES.iter().chain(MULTI_4K60_SOURCES) {
             // `input_args` — the SAME arguments `ensure_fixture` passes, not a
             // re-derivation. Then discard the output: the recipe is what is under
             // test, so `-f null` and 0.1 s of it.

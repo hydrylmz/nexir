@@ -281,7 +281,9 @@ impl Decoder {
         // Feed the decoder, then take at most ONE frame back out.
         //
         // P2.3 — two coupled bugs lived here, and the second is only reachable
-        // once the first is fixed.
+        // once the first is fixed. Both are now contained by the two halves this
+        // delegates to, and the reasoning has to stay because the shape of those
+        // halves is the fix:
         //
         // 1. The old loop latched a `got_frame` flag and kept iterating. With
         //    `avcodec_send_packet` returning EAGAIN (input queue full, which
@@ -295,23 +297,52 @@ impl Decoder {
         //    -1 to `sws_getContext`, which aborts the process inside libswscale
         //    (`Assertion desc failed at swscale_internal.h:778`,
         //    STATUS_STACK_BUFFER_OVERRUN). Every codec can reach it; AV1 got there
-        //    first because libdav1d fills its input queue fastest.
+        //    first because libdav1d fills its input queue fastest. Hence
+        //    [`Self::receive_into`] receives EXACTLY ONCE, and `emit_frame` reads
+        //    `self.frame` immediately afterwards.
         // 2. Returning without keeping the refused packet DROPS it, because the
         //    caller moves on to the next one. For AV1 that is a gap in the OBU
         //    sequence and the next send fails with "Invalid data found when
-        //    processing input".
-        //
-        // Hence: drain the backlog first, offer the new packet, keep it if it is
-        // refused, and receive exactly once. Receive is the only call that touches
-        // `self.frame`, and `emit_frame` reads it immediately afterwards.
+        //    processing input". Hence [`Self::send_packet_only`]'s backlog, and its
+        //    front/back ordering.
+        self.send_packet_only(packet)?;
+        self.receive_into(dst, interop)
+    }
+
+    /// Offer one packet to the decoder and return WITHOUT receiving.
+    ///
+    /// Split out of [`Self::decode_into`], which is now this plus
+    /// [`Self::receive_into`] — the two halves in the same order, so the ordinary
+    /// caller's behaviour is unchanged.
+    ///
+    /// **Why a caller would want the halves apart: input queue depth.** The
+    /// one-packet-one-receive pattern gives NVDEC an input queue of exactly one, so
+    /// every `avcodec_receive_frame` waits out the hardware's whole latency for the
+    /// picture it is asking for, and nothing is decoding while the caller copies the
+    /// result. Measured on `examples/b_decode_split_probe.rs`, one 4K60 source, 90
+    /// frames: the per-frame decode series alternates 0.6 ms / 5-15 ms with the
+    /// cheap frames being the receives that found a picture already finished. A
+    /// caller that sends several packets before receiving keeps the hardware fed.
+    ///
+    /// **The caller MUST bound how far it runs ahead.** A send the decoder refuses
+    /// with EAGAIN is queued in `self.pending` and retried by the next send, so
+    /// sending without ever receiving grows that queue without limit — one
+    /// `av_packet_ref` per packet, which is a reference to the demuxer's buffer
+    /// rather than a copy, but unbounded all the same.
+    ///
+    /// The packet order this preserves is the same one [`Self::decode_into`]
+    /// preserves and for the same reason (P2.3): a refused packet goes to the FRONT
+    /// of the backlog and the new one behind it, because for AV1 a gap in the OBU
+    /// sequence makes the following send fail outright.
+    pub fn send_packet_only(&mut self, packet: &Packet) -> Result<(), DecodeError> {
         while let Some(front) = self.pending.pop_front() {
             let ret = unsafe { avcodec_send_packet(self.ctx, front.as_ptr()) };
             if ret == AVERROR_EAGAIN {
                 // Still no room. Put it back at the FRONT to preserve order, and
-                // do not offer the caller's packet yet — it goes behind this one.
+                // queue the caller's packet behind it rather than dropping it.
                 self.pending.push_front(front);
                 self.pending.push_back(packet.clone_ref());
-                return self.receive_one(dst, interop);
+                return Ok(());
             }
             if ret < 0 {
                 return Err(DecodeError::Send(av_err_to_string(ret)));
@@ -324,7 +355,23 @@ impl Decoder {
         } else if send_ret < 0 {
             return Err(DecodeError::Send(av_err_to_string(send_ret)));
         }
+        Ok(())
+    }
 
+    /// Take at most one frame out of the decoder, without offering a packet first.
+    ///
+    /// The other half of [`Self::decode_into`] — see [`Self::send_packet_only`] for
+    /// why the two are separable. `Ok(None)` means the decoder has nothing ready and
+    /// wants more input; it is not end-of-stream (that is [`Self::drain_into`]).
+    pub fn receive_into(
+        &mut self,
+        dst: &mut [u8],
+        interop: Option<(
+            &crate::interop::cuda_context::CudaContext,
+            &crate::interop::decode_interop::DecodeInteropTarget,
+            &crate::interop::capability::InteropCapability,
+        )>,
+    ) -> Result<Option<DecodedFrame>, DecodeError> {
         self.receive_one(dst, interop)
     }
 
@@ -637,7 +684,33 @@ impl Decoder {
 
         // Step 5 — Read colour metadata and PTS, then clean up frame references.
         let (pts, actual_w, actual_h, color) = unsafe {
-            let raw_pts = av_frame_get_pts(src_frame);
+            // PTS COMES FROM `self.frame`, NOT FROM `src_frame`, AND THAT IS THE
+            // WHOLE POINT OF THIS LINE.
+            //
+            // `av_hwframe_transfer_data` copies PIXELS ONLY — the same reason
+            // `copy_color_props` exists two functions down. It sets `format`,
+            // `width` and `height` on the destination and touches nothing else, so
+            // `sw_frame.pts` is whatever it was initialised to: **zero, on every
+            // frame of every hardware decode.** Measured with
+            // `examples/g3_drain_probe.rs` on a 60-frame H.264 file with NVDEC
+            // attached: `decode_into` produced 58 frames whose pts were
+            // `[0, 0, 0, 0, 0, 0]`, and the two drained frames were `[0, 0]` too.
+            //
+            // The read-forward loops in `IoLayer` hid it: both have an
+            // `if frame.pts == 0 { pkt_pts }` fallback, so a decoder that timestamps
+            // nothing is indistinguishable from one that does — until something asks
+            // for a frame with NO packet beside it. That is exactly the G3 drain:
+            // `drain_into` compares `frame.pts >= target_stream_pts`, which with a
+            // zeroed pts is `0 >= target`, so every drained frame was discarded and
+            // the last frames of every clip stayed unreachable *after* the drain
+            // landed. `playback_smoke::decode_30_frames_monotonic_pts` asserts
+            // strictly increasing pts on this same path and would have caught it, but
+            // it needs `VE_TEST_FILE` and does not run by default.
+            //
+            // `self.frame` is what `avcodec_receive_frame` filled, so it carries the
+            // decoder's own timestamp on both paths — and on the software path the
+            // two pointers are the same frame, so this is a no-op there.
+            let raw_pts = av_frame_get_pts(self.frame);
             let pts = if raw_pts == AV_NOPTS_VALUE { 0i64 } else { raw_pts };
             let aw = av_frame_get_width(src_frame) as u32;
             let ah = av_frame_get_height(src_frame) as u32;

@@ -10,6 +10,14 @@ use crate::render::device::GpuDevice;
 /// `map_async` + `poll(Wait)` stall and two host copies per frame — measured at 4K
 /// as `strip_padding` alone moving 66 MB. The separate `ExecutionPath` is
 /// deliberate: this file exists for the encoders that can only accept host memory.
+///
+/// **Closed, and no code is owed.** P2.6 is a decision rather than a task, and the
+/// measurements that settle it live elsewhere: `bench --export` reports the real
+/// `ExportEngine` at 66.9 FPS on 4K30 and 83.6 on 4K60 with every output decoded and
+/// frame-counted (`target/bench_F2.txt`), on a pipeline that does NOT pass through
+/// here. Anyone re-opening this needs a reading against that row, not an argument
+/// about symmetry with the preview path — which is latency-bound with per-frame GPU
+/// residency, where export is throughput-bound with a 16-frame host lookahead.
 pub struct FrameReadback {
     buffers:      [wgpu::Buffer; 2],
     width:        u32,

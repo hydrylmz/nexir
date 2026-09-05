@@ -66,9 +66,11 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::interop::capability::InteropCapability;
 use crate::interop::cuda_context::CudaContext;
+use crate::interop::decode_interop::CopyTimingSnapshot;
 use crate::interop::decode_interop::DecodeInteropTarget;
 use crate::io::decoder::Decoder;
 use crate::io::demuxer::Packet;
@@ -156,6 +158,103 @@ struct SourceTarget {
     last_read: Option<wgpu::SubmissionIndex>,
 }
 
+/// What a registry has actually done, for reporting.
+///
+/// Counted and timed rather than inferred (gotcha 9). Two of these fields exist
+/// because of a specific open question the plan names: the read-after-write wait in
+/// [`InteropDecodeTargets::decode_into_target`] is a `WaitForSubmissionIndex` on a
+/// submission that *should* already be complete on a pipelined loop, and if the
+/// interop path ever measures slower than the CPU one that wait is the first
+/// suspect. `waits` and `wait_total` turn "should already be complete" into a
+/// reading, so the answer comes from the counters rather than from an argument
+/// about the code — and so a `0.00 ms` wait is distinguishable from a wait nobody
+/// measured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InteropDecodeStats {
+    /// Frames copied into a target's textures by NVDEC.
+    pub decodes: u64,
+    /// Requests answered from the frame already resident in the textures.
+    pub cached: u64,
+    /// Packets the decoder swallowed without emitting a frame.
+    pub pending: u64,
+    /// Decodes that consulted the read-after-write guard, i.e. found a previous
+    /// submission stamped on the target and polled it before overwriting.
+    ///
+    /// **This is the read-after-write guard's own cost**, and the number the
+    /// structural fix (a second target per source, ping-pong) would have to be
+    /// justified by. Paired with [`Self::wait_total`]: a large count with a
+    /// negligible total means the guard is doing its job for free, which is what a
+    /// loop that finished reading before decoding again is expected to produce.
+    pub waits: u64,
+    /// Total time spent inside those polls.
+    pub wait_total: Duration,
+    /// Total time spent in `decode_into_target`, i.e. the interop decode's whole
+    /// cost including the wait and the device→array copy.
+    pub decode_total: Duration,
+    /// Where the device→array copies' time went, summed over every target — see
+    /// [`crate::interop::decode_interop::CopyTiming`].
+    ///
+    /// Read from the targets rather than accumulated here, so it cannot drift out of
+    /// step with what the copies actually did. `calls` is the copy count and is not
+    /// the same as [`Self::decodes`]: a decode that returns `Pending` performs no
+    /// copy, and a read-forward performs one per frame passed through.
+    pub copy: CopyTimingSnapshot,
+}
+
+impl InteropDecodeStats {
+    /// Mean wait per decode in milliseconds, or `None` before any decode.
+    ///
+    /// `None` rather than 0.0 for zero decodes: a rate over nothing is undefined,
+    /// the same rule [`crate::render::resource::PoolStats::miss_rate`] follows.
+    pub fn wait_ms_per_decode(&self) -> Option<f64> {
+        (self.decodes > 0)
+            .then(|| self.wait_total.as_secs_f64() * 1000.0 / self.decodes as f64)
+    }
+
+    /// Mean whole-decode cost in milliseconds, or `None` before any decode.
+    pub fn decode_ms_per_frame(&self) -> Option<f64> {
+        (self.decodes > 0)
+            .then(|| self.decode_total.as_secs_f64() * 1000.0 / self.decodes as f64)
+    }
+
+    /// Mean per-copy cost of the three phases, in milliseconds, or `None` before any
+    /// copy.
+    ///
+    /// `(barrier, issue, sync)`: waiting for the DECODER, enqueuing the two
+    /// `cuMemcpy2DAsync` calls, and waiting for the transfer itself. `None` rather
+    /// than zeros for zero copies, the same rule
+    /// [`crate::render::resource::PoolStats::miss_rate`] follows — a mean over
+    /// nothing is undefined, and printing `0.00` for it is how an unexercised path
+    /// gets read as a fast one.
+    pub fn copy_ms_per_call(&self) -> Option<(f64, f64, f64)> {
+        let n = self.copy.calls;
+        (n > 0).then(|| {
+            let per = |d: Duration| d.as_secs_f64() * 1000.0 / n as f64;
+            (per(self.copy.barrier), per(self.copy.issue), per(self.copy.sync))
+        })
+    }
+
+    /// Add another source's counters into this one.
+    ///
+    /// **Used to prove the per-source breakdown adds up to the registry-wide
+    /// figure** — `the_per_source_counters_sum_to_the_registry_wide_ones` compares
+    /// the two, because a second set of counters on the hot path is a second thing
+    /// to keep in step (the reason [`InteropDecodeTargets::stats`] reads the copy
+    /// phases from the targets rather than accumulating them).
+    pub fn add(&mut self, other: &Self) {
+        self.decodes += other.decodes;
+        self.cached += other.cached;
+        self.pending += other.pending;
+        self.waits += other.waits;
+        self.wait_total += other.wait_total;
+        self.decode_total += other.decode_total;
+        self.copy.calls += other.copy.calls;
+        self.copy.barrier += other.copy.barrier;
+        self.copy.issue += other.copy.issue;
+        self.copy.sync += other.copy.sync;
+    }
+}
+
 /// Per-source NVDEC decode targets, and the capability gate in front of them.
 ///
 /// Cheap to construct and inert when the host has no CUDA: [`Self::new`] takes the
@@ -176,6 +275,26 @@ pub struct InteropDecodeTargets {
     /// per-frame call does not retry a `SharedTexture` allocation that already
     /// failed.
     rejected: Mutex<HashMap<SourceId, &'static str>>,
+    /// What this registry has done — see [`InteropDecodeStats`].
+    ///
+    /// Its own lock rather than a field inside `targets`, so a reader
+    /// ([`Self::stats`], called from a benchmark's reporting) never contends with
+    /// the decode path for the target map.
+    stats: Mutex<InteropDecodeStats>,
+    /// The same counters, split by source — G2f.3.
+    ///
+    /// **A registry-wide figure cannot answer the question four sources raise.**
+    /// `InteropDecodeStats` sums every source's decodes, waits and copies into one
+    /// number, so at four sources one slow source is invisible: a per-frame decode
+    /// mean of 6 ms is equally consistent with four sources at 1.5 ms each and with
+    /// three at 0.5 and one at 4.5. Those lead to opposite fixes (a shared-stream
+    /// problem vs one expensive bitstream), which is precisely the attribution
+    /// `bench --interop` built for one source and would otherwise lose at the point
+    /// it becomes interesting.
+    ///
+    /// Written under the same lock acquisition as `stats` so the two cannot
+    /// disagree; `the_per_source_counters_sum_to_the_registry_wide_ones` pins that.
+    per_source: Mutex<HashMap<SourceId, InteropDecodeStats>>,
 }
 
 impl InteropDecodeTargets {
@@ -243,6 +362,8 @@ impl InteropDecodeTargets {
             cuda,
             targets: Mutex::new(HashMap::new()),
             rejected: Mutex::new(HashMap::new()),
+            stats: Mutex::new(InteropDecodeStats::default()),
+            per_source: Mutex::new(HashMap::new()),
         }
     }
 
@@ -258,6 +379,8 @@ impl InteropDecodeTargets {
             cuda: None,
             targets: Mutex::new(HashMap::new()),
             rejected: Mutex::new(HashMap::new()),
+            stats: Mutex::new(InteropDecodeStats::default()),
+            per_source: Mutex::new(HashMap::new()),
         }
     }
 
@@ -280,9 +403,109 @@ impl InteropDecodeTargets {
         self.targets.lock().unwrap().len()
     }
 
+    /// Bytes of VRAM this registry's Y/UV pairs occupy, counted from the
+    /// dimensions each target was actually allocated at — G2f.2.
+    ///
+    /// **A lower bound, and labelled one wherever it is printed**, for exactly the
+    /// reason [`crate::profiling::SystemMetrics::allocated_gpu_bytes`] is: it counts
+    /// what this process asked D3D12 for (`w*h` luma + `w/2 * h/2 * 2` chroma per
+    /// source) and knows nothing about alignment padding or the driver's own
+    /// overhead. It is NOT a driver query — `vram_used_bytes` is the row that comes
+    /// from NVML, and this must never be printed as if it were that.
+    ///
+    /// Counted from the live targets rather than from `live_targets() * a constant`,
+    /// so a run whose sources are not all the same geometry still reports the truth.
+    pub fn target_bytes(&self) -> u64 {
+        self.targets
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| {
+                let (w, h) = e.target.dimensions();
+                let luma = w as u64 * h as u64;
+                // NV12 chroma: half resolution, two bytes per sample.
+                luma + (w as u64 / 2) * (h as u64 / 2) * 2
+            })
+            .sum()
+    }
+
     /// Why a source is on the CPU path, if it is.
     pub fn rejection_reason(&self, source_id: SourceId) -> Option<&'static str> {
         self.rejected.lock().unwrap().get(&source_id).copied()
+    }
+
+    /// Every source this registry has refused, with its reason.
+    ///
+    /// For a caller that must report the fallbacks rather than silently measure
+    /// the CPU path: a benchmark row whose sources all fell back is measuring the
+    /// path it meant to replace, which is the same class of untruth as gotcha 9's
+    /// fabricated utilisation figure. Sorted by source id so a printed list is
+    /// stable between runs.
+    pub fn rejections(&self) -> Vec<(SourceId, &'static str)> {
+        let mut out: Vec<(SourceId, &'static str)> = self
+            .rejected
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, reason)| (*id, *reason))
+            .collect();
+        out.sort_by_key(|(id, _)| id.index());
+        out
+    }
+
+    /// What this registry has counted and timed — see [`InteropDecodeStats`].
+    ///
+    /// The copy breakdown is collected from the live targets at read time rather
+    /// than accumulated per frame: a `DecodeInteropTarget` already counts its own
+    /// copies, and a second running total in the decode path is a second thing to
+    /// keep in step. **A target evicted before this is called takes its copy times
+    /// with it**, which is why `copy.calls` is printed rather than assumed equal to
+    /// `decodes`.
+    pub fn stats(&self) -> InteropDecodeStats {
+        let mut stats = *self.stats.lock().unwrap();
+        let mut copy = crate::interop::decode_interop::CopyTimingSnapshot::default();
+        for entry in self.targets.lock().unwrap().values() {
+            let t = entry.target.timing();
+            copy.calls += t.calls;
+            copy.barrier += t.barrier;
+            copy.issue += t.issue;
+            copy.sync += t.sync;
+        }
+        stats.copy = copy;
+        stats
+    }
+
+    /// The same counters split by source, sorted by source id — G2f.3.
+    ///
+    /// **This is the reading G2f.3 gates G4 on**, and it needs the split because
+    /// the two candidate fixes are told apart by *how the numbers scale with N*: a
+    /// large `waits`/`wait_total` on one source means the graph is still reading
+    /// that source's textures when the decoder comes back (double buffering is the
+    /// fix, at one more Y/UV pair of VRAM per source); a `copy.barrier` that grows
+    /// with N on *every* source means the contention is the shared stream and
+    /// `cuCtxSynchronize`'s context-wide scope, which a second target does nothing
+    /// about. A registry-wide sum shows the same total either way.
+    ///
+    /// Each entry's `copy` comes from that source's own target, exactly as
+    /// [`Self::stats`] takes the aggregate from the targets rather than from a
+    /// second running total — so a source whose target was evicted reports the
+    /// decodes it performed with `copy.calls == 0`, which is a true statement about
+    /// what is still knowable rather than a zero standing in for a measurement.
+    pub fn per_source_stats(&self) -> Vec<(SourceId, InteropDecodeStats)> {
+        let per_source = self.per_source.lock().unwrap().clone();
+        let targets = self.targets.lock().unwrap();
+        let mut out: Vec<(SourceId, InteropDecodeStats)> = per_source
+            .into_iter()
+            .map(|(id, mut s)| {
+                s.copy = targets
+                    .get(&id)
+                    .map(|e| e.target.timing())
+                    .unwrap_or_default();
+                (id, s)
+            })
+            .collect();
+        out.sort_by_key(|(id, _)| id.index());
+        out
     }
 
     /// Forget every target and every rejection.
@@ -291,9 +514,14 @@ impl InteropDecodeTargets {
     /// sized for the old project's sources, and a `SourceId` is an index into a
     /// registry that has just been replaced — so keeping them would hand a new
     /// source the previous occupant's textures.
+    ///
+    /// The per-source counters go too, for the same reason: a `SourceId` after the
+    /// swap names a different file, so carrying its decode count forward would
+    /// attribute one project's work to another's source.
     pub fn clear(&self) {
         self.targets.lock().unwrap().clear();
         self.rejected.lock().unwrap().clear();
+        self.per_source.lock().unwrap().clear();
     }
 
     /// Drop one source's target, releasing its VRAM.
@@ -390,7 +618,23 @@ impl InteropDecodeTargets {
         let targets = self.targets.lock().unwrap();
         let entry = targets.get(&source_id)?;
         if entry.held_pts == Some(pts) {
-            entry.held.clone()
+            let held = entry.held.clone();
+            if held.is_some() {
+                // Counted here rather than at the call site so a second caller
+                // cannot forget: a `Cached` hit is the mechanism that makes a
+                // one-frame target usable at all (two layers over one source, a
+                // paused playhead, a graph recompile), and a run reporting zero of
+                // them on a two-layer timeline would mean the read-forward is being
+                // re-run per layer.
+                self.stats.lock().unwrap().cached += 1;
+                self.per_source
+                    .lock()
+                    .unwrap()
+                    .entry(source_id)
+                    .or_default()
+                    .cached += 1;
+            }
+            held
         } else {
             None
         }
@@ -410,13 +654,16 @@ impl InteropDecodeTargets {
     ///
     /// **Concurrency.** The copy is issued while the target map is locked, which
     /// serialises distinct sources against each other. That is deliberate rather
-    /// than incidental: `CudaContext::with_context` is `cuCtxPushCurrent`, the
-    /// driver requires the context to be floating, and every `CudaContext` in this
-    /// process wraps the same primary context (gotcha 4). Two sources copying
-    /// concurrently is precisely the case where the second push fails, the pop
-    /// takes the wrong context, and every driver call runs against it — silently,
-    /// in release. The serialised part is a ~0.2 ms VRAM copy; the decode itself is
-    /// already serialised per source by the decoder's own mutex.
+    /// than incidental, and the reason is the CUDA WORK rather than the binding:
+    /// every `CudaContext` in this process wraps the same primary context on one
+    /// stream (gotcha 4), and the copy's pre-barrier is `cuCtxSynchronize`, which is
+    /// context-wide. Two sources copying concurrently would each wait for the
+    /// other's decode and each issue onto the same stream, so the barrier no longer
+    /// means "this source's decode has landed". (Making the context current is safe
+    /// concurrently — `with_context` is `cuCtxSetCurrent`, which has no floating
+    /// requirement; the old `cuCtxPushCurrent` was the call that failed outright.)
+    /// The serialised part is a ~0.2 ms VRAM copy; the decode itself is already
+    /// serialised per source by the decoder's own mutex.
     pub fn decode_into_target(
         &self,
         source_id: SourceId,
@@ -439,6 +686,13 @@ impl InteropDecodeTargets {
             return InteropDecode::Unavailable("the source's target was evicted mid-decode");
         };
 
+        // TIMED, from here, because this is where the interop decode's own cost
+        // begins: the read-after-write wait plus `decode_into`'s NVDEC decode and
+        // device→array copy. Reported by [`Self::stats`] rather than reasoned about
+        // — the wait below is the one part of this path that could cost more than
+        // it saves, and a counter is the only thing that can say whether it did.
+        let decode_start = Instant::now();
+
         // READ-AFTER-WRITE. The textures about to be overwritten may still be being
         // sampled by a submitted graph: `cuStreamSynchronize` inside the copy proves
         // CUDA finished WRITING, and says nothing about wgpu having finished
@@ -446,10 +700,21 @@ impl InteropDecodeTargets {
         // `ExportRenderer` satisfies before handing a slot to NVENC, and the same
         // fix. Usually already complete, so this returns at once; when it is not,
         // waiting is the only alternative to a torn frame.
+        //
+        // Timed separately from the decode: "usually already complete" is a claim,
+        // and `stats().waits` / `wait_total` are what make it falsifiable.
+        //
+        // `Option` rather than a zero default, so the counter distinguishes "the
+        // guard had nothing stamped and did not poll" from "the guard polled and it
+        // returned in under a nanosecond". Both are good outcomes; only the second
+        // is evidence that the guard is cheap.
+        let mut wait_time: Option<Duration> = None;
         if let Some(sid) = entry.last_read.take() {
+            let t = Instant::now();
             self.device
                 .device
                 .poll(wgpu::Maintain::WaitForSubmissionIndex(sid));
+            wait_time = Some(t.elapsed());
         }
 
         // Whatever the textures held is about to be overwritten. Cleared BEFORE the
@@ -471,17 +736,55 @@ impl InteropDecodeTargets {
         );
 
         match decoded {
-            Ok(Some(frame)) => InteropDecode::Decoded(InteropFrame {
-                planes: InteropPlanes {
+            Ok(Some(frame)) => {
+                let planes = InteropPlanes {
                     y: entry.target.y_import().clone(),
                     uv: entry.target.uv_import().clone(),
-                },
-                meta: frame.meta,
-                pts: frame.pts,
-                width: frame.width,
-                height: frame.height,
-            }),
-            Ok(None) => InteropDecode::Pending,
+                };
+                // Recorded under the target lock's scope but into its own lock, so
+                // the reader never contends with the decode path.
+                //
+                // The registry-wide and per-source counters are written from the
+                // same values in the same place, which is what keeps
+                // `per_source_stats()` summing to `stats()` — a second update site
+                // for either is how the two would drift.
+                {
+                    let elapsed = decode_start.elapsed();
+                    let mut stats = self.stats.lock().unwrap();
+                    stats.decodes += 1;
+                    stats.decode_total += elapsed;
+                    if let Some(waited) = wait_time {
+                        stats.waits += 1;
+                        stats.wait_total += waited;
+                    }
+                    drop(stats);
+                    let mut per = self.per_source.lock().unwrap();
+                    let s = per.entry(source_id).or_default();
+                    s.decodes += 1;
+                    s.decode_total += elapsed;
+                    if let Some(waited) = wait_time {
+                        s.waits += 1;
+                        s.wait_total += waited;
+                    }
+                }
+                InteropDecode::Decoded(InteropFrame {
+                    planes,
+                    meta: frame.meta,
+                    pts: frame.pts,
+                    width: frame.width,
+                    height: frame.height,
+                })
+            }
+            Ok(None) => {
+                self.stats.lock().unwrap().pending += 1;
+                self.per_source
+                    .lock()
+                    .unwrap()
+                    .entry(source_id)
+                    .or_default()
+                    .pending += 1;
+                InteropDecode::Pending
+            }
             Err(e) => {
                 log::warn!(
                     "[interop] decode into source {}'s target failed ({e:?}) — this \
@@ -776,5 +1079,116 @@ mod tests {
         assert_eq!(targets.live_targets(), 0);
         targets.clear();
         assert_eq!(targets.live_targets(), 0);
+    }
+
+    /// The VRAM figure must be COUNTED from the allocation, not from a constant.
+    ///
+    /// G2f.2 asks what four interop sources cost in VRAM. The plan's own arithmetic
+    /// ("~12.4 MB per 4K pair, so four is ~50 MB") is what
+    /// [`InteropDecodeTargets::target_bytes`] exists to replace with a reading — and
+    /// the failure mode of a constant is silent: a run whose sources are 1080p would
+    /// report 4K figures and nothing would disagree with it.
+    ///
+    /// Checked on the geometry rather than on hardware, so it runs without CUDA:
+    /// NV12 is 1.5 bytes per pixel, so a 1920x1080 pair is exactly 3 110 400 bytes
+    /// and a 4K pair 12 441 600.
+    #[test]
+    fn the_vram_figure_is_counted_from_each_targets_own_dimensions() {
+        let _cuda = crate::tests::cuda_lock();
+        let Ok(device) = pollster::block_on(GpuDevice::new_headless()) else {
+            eprintln!("SKIP: no GPU on this machine");
+            return;
+        };
+        let device = Arc::new(device);
+
+        // A registry with no targets counts nothing — never a plausible-looking
+        // figure derived from a source count.
+        let disabled = InteropDecodeTargets::disabled(Arc::clone(&device));
+        assert_eq!(disabled.target_bytes(), 0);
+
+        let targets = live_registry(&device);
+        if !targets.is_available() {
+            eprintln!("SKIP: no CUDA interop on this machine");
+            return;
+        }
+        // Two DIFFERENT geometries, which is the case a constant cannot express.
+        let shapes = [(SourceId::new(0), 1920u32, 1080u32), (SourceId::new(1), 3840, 2160)];
+        let mut expect = 0u64;
+        for (sid, w, h) in shapes {
+            if targets
+                .ensure_target(sid, &info(w, h, PixelFormat::Nv12), HwDeviceType::Cuda)
+                .is_err()
+            {
+                eprintln!("SKIP: a {w}x{h} shared texture pair could not be allocated");
+                return;
+            }
+            expect += w as u64 * h as u64 * 3 / 2;
+        }
+        assert_eq!(targets.live_targets(), 2);
+        assert_eq!(
+            targets.target_bytes(),
+            expect,
+            "the VRAM figure must be the sum of each target's own NV12 size \
+             (1920x1080 = 3110400, 3840x2160 = 12441600)"
+        );
+
+        // And it must fall when a target is released, or a run that evicted a source
+        // would keep reporting its VRAM.
+        targets.evict(SourceId::new(1));
+        assert_eq!(targets.target_bytes(), 1920 * 1080 * 3 / 2);
+    }
+
+    /// The per-source split must sum to the registry-wide figure — G2f.3.
+    ///
+    /// **This is what makes the breakdown trustworthy rather than a second opinion.**
+    /// `decode_into_target` writes both sets of counters, and two update sites for
+    /// one quantity is how they drift; the failure would be silent and would land
+    /// exactly on the attribution G2f.3 gates G4 on ("is one source waiting, or is
+    /// every source's barrier growing"). Checked on `cached`, which is the one
+    /// counter reachable without a decoder, a file or CUDA: `held_frame` increments
+    /// both.
+    #[test]
+    fn the_per_source_counters_sum_to_the_registry_wide_ones() {
+        let Ok(device) = pollster::block_on(GpuDevice::new_headless()) else {
+            eprintln!("SKIP: no GPU on this machine");
+            return;
+        };
+        let targets = InteropDecodeTargets::disabled(Arc::new(device));
+
+        // No target, so `held_frame` answers nothing and neither counter moves — the
+        // baseline that keeps the assertion below from passing vacuously.
+        assert!(targets.held_frame(SourceId::new(0), 0).is_none());
+        assert!(targets.per_source_stats().is_empty());
+
+        // Inject two sources' resident frames directly. `mark_held` requires a
+        // target, which needs CUDA, so the map is seeded here instead: the property
+        // under test is the counter bookkeeping, not the allocation.
+        let mut per = targets.per_source.lock().unwrap();
+        per.entry(SourceId::new(0)).or_default().decodes += 3;
+        per.entry(SourceId::new(0)).or_default().cached += 1;
+        per.entry(SourceId::new(2)).or_default().decodes += 5;
+        drop(per);
+        let mut stats = targets.stats.lock().unwrap();
+        stats.decodes += 8;
+        stats.cached += 1;
+        drop(stats);
+
+        let split = targets.per_source_stats();
+        assert_eq!(
+            split.iter().map(|(id, _)| id.index()).collect::<Vec<_>>(),
+            vec![0, 2],
+            "the breakdown must be sorted by source id so a printed list is stable"
+        );
+        let mut summed = InteropDecodeStats::default();
+        for (_, s) in &split {
+            summed.add(s);
+        }
+        let whole = targets.stats();
+        assert_eq!(
+            (summed.decodes, summed.cached),
+            (whole.decodes, whole.cached),
+            "the per-source counters must add up to the registry-wide ones, or the \
+             G2f.3 attribution is reading a different run from the summary row"
+        );
     }
 }

@@ -35,11 +35,16 @@ cuDeviceGet
 cuDeviceGetAttribute
 cuDevicePrimaryCtxRetain
 cuDevicePrimaryCtxRelease
+cuDevicePrimaryCtxGetState
+cuDevicePrimaryCtxSetFlags_v2
 cuCtxPushCurrent
 cuCtxPopCurrent
+cuCtxGetCurrent
+cuCtxSetCurrent
 cuStreamCreate
 cuStreamDestroy
 cuStreamSynchronize
+cuCtxSynchronize
 cuGetErrorString
 
 ; --- memory (cuda_driver.rs) ---

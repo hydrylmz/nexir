@@ -5,10 +5,66 @@
 use crate::interop::cuda_context::{CudaContext, CudaError};
 use crate::interop::external_texture::SharedTexture;
 use crate::interop::ffi::cuda_gl_vk_interop::{CudaMemcpy2D, cuMemcpy2DAsync_v2};
-use crate::interop::ffi::cuda_driver::{CUdeviceptr, CUDA_SUCCESS, cuStreamSynchronize};
+use crate::interop::ffi::cuda_driver::{CUdeviceptr, CUDA_SUCCESS, cuCtxSynchronize, cuStreamSynchronize};
 use crate::render::device::GpuDevice;
 use crate::render::resource::ImportedTexture;
 use crate::io::ffi::avutil::{AVFrame, av_frame_get_data, av_frame_get_linesize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// Where one device→array copy's time went, accumulated over every copy this
+/// target has performed.
+///
+/// **Three separate counters because the three waits have three different causes
+/// and only one of them is this crate's to remove.** `bench --interop` found
+/// `grain_1080p60` — the class whose decode costs 2.5× the same geometry —
+/// measuring *slower* on the interop path, and a single "decode cost" figure cannot
+/// say whether that is the barrier ahead of the copy, the copy itself, or the sync
+/// after it.
+///
+/// Nanoseconds in `AtomicU64` rather than a `Mutex<Duration>`: this is on the
+/// per-frame path, the target is shared behind `&self`, and a lock here would
+/// serialise the copy against the registry's own reporting.
+#[derive(Default)]
+pub struct CopyTiming {
+    calls:      AtomicU64,
+    barrier_ns: AtomicU64,
+    issue_ns:   AtomicU64,
+    sync_ns:    AtomicU64,
+}
+
+/// A readable snapshot of [`CopyTiming`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CopyTimingSnapshot {
+    /// Copies performed.
+    pub calls: u64,
+    /// Time in the pre-copy barrier that orders this copy after the decode.
+    pub barrier: Duration,
+    /// Time issuing the two `cuMemcpy2DAsync` calls (asynchronous, so this is the
+    /// enqueue cost rather than the transfer).
+    pub issue: Duration,
+    /// Time in the post-copy `cuStreamSynchronize`, i.e. waiting for the transfer
+    /// itself to land before the render graph may sample the textures.
+    pub sync: Duration,
+}
+
+impl CopyTiming {
+    fn record(&self, barrier: Duration, issue: Duration, sync: Duration) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.barrier_ns.fetch_add(barrier.as_nanos() as u64, Ordering::Relaxed);
+        self.issue_ns.fetch_add(issue.as_nanos() as u64, Ordering::Relaxed);
+        self.sync_ns.fetch_add(sync.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> CopyTimingSnapshot {
+        CopyTimingSnapshot {
+            calls:   self.calls.load(Ordering::Relaxed),
+            barrier: Duration::from_nanos(self.barrier_ns.load(Ordering::Relaxed)),
+            issue:   Duration::from_nanos(self.issue_ns.load(Ordering::Relaxed)),
+            sync:    Duration::from_nanos(self.sync_ns.load(Ordering::Relaxed)),
+        }
+    }
+}
 
 /// A wgpu texture pair (Y plane, UV plane) whose memory is also CUDA-accessible,
 /// ready to receive an NVDEC frame directly without any CPU involvement.
@@ -40,6 +96,8 @@ pub struct DecodeInteropTarget {
     /// rather than letting `cuMemcpy2DAsync` write past the array.
     width:  u32,
     height: u32,
+    /// Where each copy's time went — see [`CopyTiming`].
+    timing: CopyTiming,
 }
 
 impl DecodeInteropTarget {
@@ -76,8 +134,8 @@ impl DecodeInteropTarget {
         // the committed resource and cannot change what CUDA imports. What it buys
         // is the ability to read a plane back and prove the device→array copy
         // actually landed — `cuMemcpy2DAsync` reports success having copied NOTHING
-        // when `cuCtxPushCurrent` was refused (gotcha 4), and an all-zero Y plane is
-        // indistinguishable from a colour bug without a readback.
+        // whenever the calls run against the wrong context (gotcha 4), and an
+        // all-zero Y plane is indistinguishable from a colour bug without a readback.
         // `src/tests/interop_correctness.rs` already does exactly this copy and
         // would have failed wgpu validation the moment `VE_TEST_FILE` was set.
         const PLANE_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::TEXTURE_BINDING
@@ -108,7 +166,15 @@ impl DecodeInteropTarget {
         let y_import  = ImportedTexture::new(std::sync::Arc::clone(&y_slot.texture));
         let uv_import = ImportedTexture::new(std::sync::Arc::clone(&uv_slot.texture));
 
-        Ok(Self { y_slot, uv_slot, y_import, uv_import, width, height })
+        Ok(Self {
+            y_slot,
+            uv_slot,
+            y_import,
+            uv_import,
+            width,
+            height,
+            timing: CopyTiming::default(),
+        })
     }
 
     /// The wgpu view of the luma plane, for binding in the render graph.
@@ -183,8 +249,48 @@ impl DecodeInteropTarget {
         let y_array  = self.y_slot.external.cuda_array();
         let uv_array = self.uv_slot.external.cuda_array();
 
+        // Step 1.5 — WAIT FOR THE DECODER, and this is not the same wait as step 3.
+        //
+        // NVDEC writes its output surface on **FFmpeg's** CUDA stream
+        // (`AVCUDADeviceContext::stream`); the copies below run on the stream
+        // `CudaContext` created. Two streams in one context are unordered, so the
+        // copy can read the surface while the decode is still writing it. There is
+        // no error and no counter for that: the copy succeeds and returns a frame
+        // that is part this picture and part the last one.
+        //
+        // MEASURED, on `bench --interop` before this barrier existed: 15-22% of the
+        // pixels that move between consecutive frames came back holding the PREVIOUS
+        // frame's content, concentrated on moving edges, and the interop arm's output
+        // varied run to run while the CPU arm was bit-identical across runs. That
+        // run-to-run variation is the signature — a colour or layout bug is
+        // deterministic; a race is not.
+        //
+        // **This barrier is only correct because both sides share one `CUcontext`.**
+        // `cuCtxSynchronize` waits for the *current* context, so with FFmpeg in a
+        // context of its own (which is what `av_hwdevice_ctx_create(flags = 0)` gives)
+        // it waits for our own idle stream and orders nothing — the pixel error only
+        // halved, 162 → 91, when this was added without
+        // `AV_CUDA_USE_PRIMARY_CONTEXT`. See `HwDeviceType::create_flags`.
+        //
+        // `cuCtxSynchronize` rather than `cuStreamSynchronize(ffmpeg_stream)` because
+        // reading FFmpeg's stream handle means a hard-coded offset into
+        // `AVCUDADeviceContext`, which AGENTS.md requires a `nvchk/` probe to
+        // justify and which changes between FFmpeg versions. Its cost is COUNTED
+        // rather than assumed — `Self::timing()` reports it per copy, which is how
+        // the "it usually finds nothing to wait for" claim stays falsifiable.
+        let t_barrier = Instant::now();
+        let ret = cuda_ctx.with_context(|_| unsafe { cuCtxSynchronize() });
+        let barrier = t_barrier.elapsed();
+        if ret != CUDA_SUCCESS {
+            return Err(CudaError::Import(format!(
+                "cuCtxSynchronize before the NVDEC copy failed: {}",
+                crate::interop::ffi::cuda_driver::cu_err_to_string(ret)
+            )));
+        }
+
         // Step 2 — Issue device-to-array copies for each plane via cuMemcpy2DAsync.
         // This is a GPU-side copy (device memory → CUDA array), with zero CPU/PCIe involvement.
+        let t_issue = Instant::now();
         let ret = cuda_ctx.with_context(|stream| unsafe {
             // Y plane — full resolution
             let y_copy = CudaMemcpy2D {
@@ -229,6 +335,7 @@ impl DecodeInteropTarget {
             };
             cuMemcpy2DAsync_v2(&uv_copy, stream)
         });
+        let issue = t_issue.elapsed();
 
         if ret != CUDA_SUCCESS {
             return Err(CudaError::Import(
@@ -239,10 +346,21 @@ impl DecodeInteropTarget {
         // Step 3 — Synchronize before the texture is used by the render graph.
         // wgpu has no visibility into CUDA stream completion, so we must sync explicitly.
         // A future optimization would use exported CUDA semaphores for timeline sync.
+        //
+        // Timed separately from the barrier above: this one waits for OUR transfer,
+        // the other for the DECODER, and a class where the interop path loses is a
+        // class where one of the two is expensive — a single figure cannot say which.
+        let t_sync = Instant::now();
         cuda_ctx.with_context(|stream| unsafe {
             cuStreamSynchronize(stream);
         });
+        self.timing.record(barrier, issue, t_sync.elapsed());
 
         Ok(())
+    }
+
+    /// Where this target's copies spent their time — see [`CopyTiming`].
+    pub fn timing(&self) -> CopyTimingSnapshot {
+        self.timing.snapshot()
     }
 }

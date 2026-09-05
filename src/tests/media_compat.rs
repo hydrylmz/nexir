@@ -37,8 +37,12 @@
 // as not-exercised rather than quietly dropped, because a matrix that silently
 // shrinks to H.264 is worse than no matrix.
 //
-// Requires the FFmpeg shared libraries like the rest of src/tests/, but NO GPU
-// and NO CUDA: everything here is demux/decode on the CPU.
+// The matrix itself requires the FFmpeg shared libraries like the rest of
+// src/tests/, but NO GPU and NO CUDA: it is all demux/decode on the CPU.
+// **`the_last_frame_of_a_clip_is_reachable_through_the_io_layer` is the exception**
+// — it drives `IoLayer`, which owns a `FrameSlotPool` and (on the interop half) a
+// `CudaContext`, so it needs a headless wgpu device and skips its interop half with
+// a printed reason on a host without CUDA/NVDEC.
 
 #[cfg(test)]
 mod media_compat {
@@ -613,5 +617,690 @@ mod media_compat {
             "not one row of the compatibility matrix ran, though ffmpeg was found \
              — the fixture generation is broken rather than a codec being missing"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TASK G3 — THE LAST FRAMES OF A CLIP MUST BE REACHABLE
+    //
+    // `IoLayer::decode_blocking` used never to drain the decoder, so FFmpeg's
+    // frame-level threading (and NVDEC's own delay) held back roughly one frame
+    // per core and the last frames of every file were unreachable through the
+    // engine — measured: frame 57 of a 60-frame `cam_4k30`.
+    //
+    // **The symptom is a plausible-looking frame, which is why this needs a test
+    // rather than a run.** `decode_blocking`'s `!decoded_anything` arm falls back
+    // to whatever `FrameCache` holds for the previous position, so the playhead
+    // moves over the last second while the picture freezes: no error, no warning,
+    // and a `Some(frame)` return either way. `bench --interop` found it only
+    // because a one-frame interop target has no cache to fall back on.
+    //
+    // Both tests below therefore assert on WHERE THE FRAME CAME FROM, not merely
+    // that one came back: a fresh decode inserts the frame under the pts that was
+    // asked for, and the stale fallback returns an entry keyed at the PREVIOUS
+    // pts. `cache.get(source, wanted_pts)` is the only observable that separates
+    // them — `decode_blocking` hands back a slot id and metadata, not a pts.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Write one H.264/MP4 fixture at an arbitrary frame rate and length.
+    ///
+    /// Separate from [`write_fixture`] because the two G3 tests need geometries the
+    /// matrix does not: a short clip whose tail is inside the decoder's delay, and
+    /// a HIGH-frame-rate clip where 600 video packets fit inside the five seconds
+    /// `decode_blocking` will read forward over without seeking.
+    fn write_timed_fixture(
+        ffmpeg: &Path,
+        dir: &Path,
+        label: &str,
+        fps: u32,
+        seconds: u32,
+    ) -> Result<PathBuf, String> {
+        let out = dir.join(format!("{label}.mp4"));
+        let _ = std::fs::remove_file(&out);
+        let source = format!("testsrc2=size={W}x{H}:rate={fps}");
+        let status = Command::new(ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-t"])
+            .arg(seconds.to_string())
+            .arg("-i")
+            .arg(&source)
+            .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p"])
+            .arg(&out)
+            .output()
+            .map_err(|e| format!("could not run ffmpeg: {e}"))?;
+        if !status.status.success() {
+            return Err(format!(
+                "ffmpeg could not encode the {label} fixture: {}",
+                String::from_utf8_lossy(&status.stderr).trim()
+            ));
+        }
+        Ok(out)
+    }
+
+    /// An `IoLayer` over one file, with the interop registry the caller chooses.
+    ///
+    /// `interop` is a parameter for the same reason `build_multi_clip_harness`'s is:
+    /// the CPU-path test must be on `disabled` so it cannot accidentally measure
+    /// NVDEC's delay instead of the software decoder's, and the interop test must
+    /// be on a live registry because the fallback it is checking only exists there.
+    fn io_layer_over(
+        device: &std::sync::Arc<crate::render::device::GpuDevice>,
+        path: &Path,
+        fps: Rational,
+        duration_pts: i64,
+        interop: std::sync::Arc<crate::io::interop_decode::InteropDecodeTargets>,
+    ) -> (
+        std::sync::Arc<crate::io::io_layer::IoLayer>,
+        crate::timeline::ids::SourceId,
+        std::sync::mpsc::Receiver<crate::io::prefetch::PrefetchRequest>,
+    ) {
+        use crate::io::frame_cache::FrameCache;
+        use crate::io::io_layer::IoLayer;
+        use crate::io::slot_pool::FrameSlotPool;
+        use crate::timeline::source::{
+            ColorInfo, PixelFormat, SourceRegistry, VideoRotation, VideoStreamInfo,
+        };
+
+        let sources = std::sync::Arc::new(std::sync::RwLock::new(SourceRegistry::new()));
+        let source_id = sources.write().unwrap().register(
+            path.to_path_buf(),
+            Some(VideoStreamInfo {
+                width: W,
+                height: H,
+                frame_rate: fps,
+                pixel_fmt: PixelFormat::Yuv420p,
+                color_info: ColorInfo::bt709(),
+                duration_pts,
+                is_vfr: false,
+                time_base: TB,
+                rotation: VideoRotation::None,
+            }),
+            None,
+        );
+
+        let pool = std::sync::Arc::new(FrameSlotPool::new(device));
+        let cache = std::sync::Arc::new(FrameCache::new(std::sync::Arc::clone(&pool), 32));
+        // The receiver is returned rather than dropped: `get_or_decode` sends
+        // prefetch requests, and a disconnected channel would make those fail
+        // silently. No worker is spawned — these tests call `decode_blocking`
+        // directly, and a background thread decoding the same source would race the
+        // decoder position the tests are asserting about.
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let io = std::sync::Arc::new(IoLayer::new(
+            std::sync::Arc::clone(&device.device),
+            pool,
+            cache,
+            sources,
+            tx,
+            TB,
+            interop,
+        ));
+        (io, source_id, rx)
+    }
+
+    /// G3 — the last frames of a clip must come back FRESH, on the CPU path.
+    ///
+    /// Walks the whole clip in order, the way playback does, because approaching the
+    /// tail is the only way to reach it: a cold request for the last frame seeks
+    /// first, and `Decoder::seek_to`'s own discard loop hits EOF before the target
+    /// and returns `NoFrame` — a different failure, in a different function, that
+    /// the drain does not address.
+    ///
+    /// The assertion is on the LAST EIGHT frames rather than only the final one:
+    /// the decoder holds back roughly one frame per core (12 here), so a one-frame
+    /// assertion could pass on a machine whose delay happens to be zero.
+    #[test]
+    fn the_last_frames_of_a_clip_are_reachable_through_the_io_layer() {
+        use crate::timeline::rational::frame_to_pts;
+
+        let Some(ffmpeg) = ffmpeg_binary() else {
+            assert!(!require(), "NEXIR_REQUIRE_COMPAT is set but there is no ffmpeg");
+            eprintln!("[media_compat] SKIP the G3 drain test: no `ffmpeg` binary.");
+            return;
+        };
+        let dir = scratch_dir();
+        let fps = Rational { num: FPS as i64, den: 1 };
+        let frames = (FPS * SECONDS) as usize;
+        let path = match write_timed_fixture(&ffmpeg, &dir, "g3_tail", FPS, SECONDS) {
+            Ok(p) => p,
+            Err(why) => {
+                assert!(!require(), "NEXIR_REQUIRE_COMPAT is set but {why}");
+                eprintln!("[media_compat] SKIP the G3 drain test: {why}");
+                return;
+            }
+        };
+
+        let device = std::sync::Arc::new(
+            pollster::block_on(crate::render::device::GpuDevice::new_headless())
+                .expect("headless GpuDevice"),
+        );
+        let (io, sid, _rx) = io_layer_over(
+            &device,
+            &path,
+            fps,
+            frames as i64 * (TB.den / FPS as i64),
+            // `disabled`, deliberately: this test is about the CPU path's drain, and
+            // a live registry would put NVDEC's delay in front of it instead.
+            std::sync::Arc::new(crate::io::interop_decode::InteropDecodeTargets::disabled(
+                std::sync::Arc::clone(&device),
+            )),
+        );
+
+        let mut served = 0usize;
+        let mut fresh = 0usize;
+        let mut first_stale: Option<usize> = None;
+        for i in 0..frames {
+            let pts = frame_to_pts(i as i64, fps, TB);
+            if io.decode_blocking(sid, pts).is_some() {
+                served += 1;
+            }
+            // FRESH means the frame was decoded for THIS pts and inserted under it.
+            // The stale fallback returns an entry keyed at the previous position, so
+            // this key is absent — which is the whole difference the drain makes.
+            if io.cache.get(sid, pts).is_some() {
+                fresh += 1;
+            } else if first_stale.is_none() {
+                first_stale = Some(i);
+            }
+        }
+
+        eprintln!(
+            "[media_compat] G3: {served}/{frames} frame(s) served, {fresh} of them freshly \
+             decoded{}",
+            first_stale
+                .map(|i| format!(", first stale at frame {i}"))
+                .unwrap_or_default()
+        );
+
+        assert_eq!(
+            served, frames,
+            "the engine returned nothing at all for {} of {frames} frame(s)",
+            frames - served
+        );
+        // The tail is what the drain exists for. Eight frames is comfortably inside
+        // `FrameCache`'s 32 slots, so a fresh entry cannot have been evicted, and
+        // comfortably below the decoder's own delay on any multi-core host.
+        let tail_start = frames - 8;
+        for i in tail_start..frames {
+            let pts = frame_to_pts(i as i64, fps, TB);
+            assert!(
+                io.cache.get(sid, pts).is_some(),
+                "frame {i} of {frames} was served from the previous position rather than \
+                 decoded: the decoder is holding it back and nothing drained it. The \
+                 playhead moves while the picture freezes, and `decode_blocking` returns \
+                 Some(_) either way — first stale frame this run was {first_stale:?}"
+            );
+        }
+        // And the whole run, not just the tail: every frame of a sequential walk is
+        // either read forward to or drained, so a stale one ANYWHERE is a defect.
+        // Freshness is sampled immediately after each decode, so `FrameCache`'s
+        // 32-slot capacity cannot make this flaky on a longer fixture.
+        assert_eq!(
+            fresh, frames,
+            "{} frame(s) of a sequential walk were served from the previous position \
+             (first at {first_stale:?}) — every frame here is reachable by reading \
+             forward or by draining",
+            frames - fresh
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// G3 — a COLD request must serve the frame it asked for, not the next one.
+    ///
+    /// **This is the assertion the rest of the file could not make**, and the reason
+    /// the seek defect survived every other test: `decode_blocking` caches whatever
+    /// it decoded under the pts that was REQUESTED, so `cache.get(source, pts)`
+    /// answers `Some` for the wrong picture just as readily as for the right one.
+    /// Freshness proves a decode happened, never which frame it produced.
+    ///
+    /// What it catches: `Decoder::seek_to` decodes until it reaches the target,
+    /// **discards that frame** and returns its pts — so a cold request for frame N
+    /// was answered with frame N+1, and every sequential request after it inherited
+    /// the shift. The tail was the only visible symptom (there is no N+1 for the
+    /// last frame), which is why this read as one stale frame rather than as sixty
+    /// wrong ones.
+    ///
+    /// Method: decode the whole fixture once through a plain `Demuxer` + `Decoder`
+    /// to get each frame's luma plane in presentation order, then ask a FRESH
+    /// `IoLayer` (fresh decoder ⇒ `prev_pts == i64::MIN` ⇒ the seek branch) for one
+    /// frame at a time and compare what lands in the slot against that reference.
+    ///
+    /// **The reference must come from outside `IoLayer`.** Comparing a cold request
+    /// against a sequential walk of the same `IoLayer` would have passed while the
+    /// bug was live: the walk's first request seeks too, so both arms were shifted
+    /// by one and agreed with each other. Same trap as gotcha 11's mis-tagged
+    /// control and as `bench --interop`'s `Δpx`, which compares two arms that shared
+    /// this defect.
+    ///
+    /// The reference decoder is opened with hardware enabled, exactly as `IoLayer`
+    /// opens its own, so the two produce the same layout (NV12 under NVDEC, YUV420P
+    /// in software) and the luma plane is the leading `W*H` bytes either way.
+    #[test]
+    fn a_cold_seek_serves_the_frame_that_was_asked_for() {
+        use crate::timeline::rational::frame_to_pts;
+
+        let Some(ffmpeg) = ffmpeg_binary() else {
+            assert!(!require(), "NEXIR_REQUIRE_COMPAT is set but there is no ffmpeg");
+            eprintln!("[media_compat] SKIP the G3 cold-seek test: no `ffmpeg` binary.");
+            return;
+        };
+        let dir = scratch_dir();
+        let fps = Rational { num: FPS as i64, den: 1 };
+        let frames = (FPS * SECONDS) as usize;
+        let path = match write_timed_fixture(&ffmpeg, &dir, "g3_cold_seek", FPS, SECONDS) {
+            Ok(p) => p,
+            Err(why) => {
+                assert!(!require(), "NEXIR_REQUIRE_COMPAT is set but {why}");
+                eprintln!("[media_compat] SKIP the G3 cold-seek test: {why}");
+                return;
+            }
+        };
+
+        const LUMA: usize = (W * H) as usize;
+
+        // ── The reference: every frame's luma, in the order the decoder emits it ──
+        let reference: Vec<Vec<u8>> = {
+            let mut demuxer = Demuxer::open(&path).expect("Demuxer::open");
+            let stream = demuxer.video_stream.clone().expect("no video stream");
+            let mut decoder = Decoder::open(&stream, stream.codecpar, true)
+                .expect("Decoder::open");
+            let mut buf = vec![0u8; LUMA * 6 + 256];
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            while let Ok(Some(pkt)) = demuxer.next_video_packet() {
+                if let Ok(Some(_)) = decoder.decode_into(&pkt, &mut buf, None) {
+                    out.push(buf[..LUMA].to_vec());
+                }
+            }
+            // The tail lives behind the decoder's own delay, so the reference needs
+            // the same drain the engine does — otherwise the last frames have no
+            // reference to be compared against and the test would silently skip
+            // exactly the region G3 is about.
+            while let Ok(Some(_)) = decoder.drain_into(&mut buf) {
+                out.push(buf[..LUMA].to_vec());
+            }
+            out
+        };
+        assert_eq!(
+            reference.len(), frames,
+            "the reference decode produced {} frame(s) of a {frames}-frame fixture, so \
+             it cannot be a reference for the frames it is missing",
+            reference.len()
+        );
+
+        /// Mean absolute difference between two luma planes, in code values.
+        fn mad(a: &[u8], b: &[u8]) -> f64 {
+            let total: u64 = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| x.abs_diff(*y) as u64)
+                .sum();
+            total as f64 / a.len() as f64
+        }
+
+        let device = std::sync::Arc::new(
+            pollster::block_on(crate::render::device::GpuDevice::new_headless())
+                .expect("headless GpuDevice"),
+        );
+        let (io, sid, _rx) = io_layer_over(
+            &device,
+            &path,
+            fps,
+            frames as i64 * (TB.den / FPS as i64),
+            std::sync::Arc::new(
+                crate::io::interop_decode::InteropDecodeTargets::disabled(
+                    std::sync::Arc::clone(&device),
+                ),
+            ),
+        );
+
+        // Frame 0 (the seek lands exactly on it), two interior frames the seek has to
+        // scan forward to, and the last frame, which only the drain can reach. The
+        // off-by-one is identical at each, but a single probe could be explained away
+        // as a keyframe quirk.
+        //
+        // **DESCENDING, through ONE `IoLayer`.** Every request must take the seek
+        // branch, and there are two ways to get there: a cold decoder
+        // (`prev_pts == i64::MIN`) or a request BEFORE the decoder's position
+        // (`pts < prev_pts`) — the same branch, and the second is what scrubbing
+        // backwards does. Descending uses the second, so one layer suffices; a fresh
+        // layer per probe would allocate a fresh `FrameSlotPool` per probe, which is
+        // ~386 MB of staging buffers each (tier 3 alone is 2 × 49.8 MB) and OOMs the
+        // test binary when the suite runs it alongside the rest.
+        //
+        // Requesting the last frame first also covers the seek-after-drain case for
+        // free: `flush()` clears the draining flag, so the next read-forward works.
+        for i in [frames - 1, 41, 17, 0] {
+            let pts = frame_to_pts(i as i64, fps, TB);
+            let (slot, _meta) = io
+                .decode_blocking(sid, pts)
+                .unwrap_or_else(|| panic!("a cold request for frame {i} returned nothing"));
+            assert!(
+                io.cache.get(sid, pts).is_some(),
+                "a cold request for frame {i} was served from the cache rather than \
+                 decoded, so this comparison would be about a stale frame"
+            );
+            let (got_self, got_next) = io.pool.with_buffer_read(slot, |bytes| {
+                (
+                    mad(&bytes[..LUMA], &reference[i]),
+                    reference.get(i + 1).map(|next| mad(&bytes[..LUMA], next)),
+                )
+            });
+
+            eprintln!(
+                "[media_compat] G3 cold seek: frame {i:>3} — MAD vs itself {got_self:.3}, \
+                 vs the next frame {}",
+                got_next
+                    .map(|d| format!("{d:.3}"))
+                    .unwrap_or_else(|| "n/a (last frame)".into())
+            );
+
+            // Tolerant of nothing but codec noise: the reference and the engine run
+            // the same decoder over the same bitstream, so the right frame is bit
+            // identical in practice. A whole frame of drift is ~10 code values on
+            // this fixture, well clear of 1.0.
+            assert!(
+                got_self < 1.0,
+                "a cold request for frame {i} came back with a DIFFERENT PICTURE: \
+                 mean absolute luma difference {got_self:.3} against frame {i}, \
+                 {} against frame {}. `Decoder::seek_to` discards the frame it lands \
+                 on, so the read-forward loop starts one frame late and the result is \
+                 cached under the pts that was asked for — no error, and every \
+                 freshness assertion still passes.",
+                got_next
+                    .map(|d| format!("{d:.3}"))
+                    .unwrap_or_else(|| "n/a".into()),
+                i + 1
+            );
+            if let Some(next) = got_next {
+                assert!(
+                    next > got_self,
+                    "frame {i} matches frame {} at least as well as itself \
+                     ({next:.3} vs {got_self:.3}) — the fixture's consecutive frames \
+                     are too similar for this test to detect a one-frame shift, so it \
+                     is not testing anything",
+                    i + 1
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// G3 — the 600-packet bound must NOT drain, and that is a separate rule.
+    ///
+    /// `hit_eof` is what distinguishes "the demuxer ran dry" from "the corrupt-file
+    /// guard tripped". Draining on the latter puts the decoder in draining mode,
+    /// where `avcodec_send_packet` refuses all further input — so **every later
+    /// frame on that source disappears until a seek flushes it**, which is a worse
+    /// bug than the one the drain fixes and has the same disguise (the stale
+    /// fallback keeps returning `Some`).
+    ///
+    /// Reaching the bound needs a request more than 600 packets ahead of the
+    /// decoder that is NOT far enough ahead to seek: `decode_blocking` seeks when
+    /// the gap exceeds five seconds, so the fixture is 240 fps, where five seconds
+    /// is 1200 frames. At 30 fps this case is unreachable and the rule would be
+    /// untestable.
+    #[test]
+    fn the_600_packet_bound_does_not_leave_the_decoder_draining() {
+        use crate::timeline::rational::frame_to_pts;
+
+        let Some(ffmpeg) = ffmpeg_binary() else {
+            assert!(!require(), "NEXIR_REQUIRE_COMPAT is set but there is no ffmpeg");
+            eprintln!("[media_compat] SKIP the G3 bound test: no `ffmpeg` binary.");
+            return;
+        };
+        let dir = scratch_dir();
+        // 240 fps × 4 s = 960 frames, so a request 900 frames ahead is 3.75 s ahead
+        // — inside the five-second no-seek window and past the 600-packet bound.
+        const HZ: u32 = 240;
+        const SECS: u32 = 4;
+        let fps = Rational { num: HZ as i64, den: 1 };
+        let path = match write_timed_fixture(&ffmpeg, &dir, "g3_bound", HZ, SECS) {
+            Ok(p) => p,
+            Err(why) => {
+                assert!(!require(), "NEXIR_REQUIRE_COMPAT is set but {why}");
+                eprintln!("[media_compat] SKIP the G3 bound test: {why}");
+                return;
+            }
+        };
+
+        let device = std::sync::Arc::new(
+            pollster::block_on(crate::render::device::GpuDevice::new_headless())
+                .expect("headless GpuDevice"),
+        );
+        let total = (HZ * SECS) as usize;
+        let (io, sid, _rx) = io_layer_over(
+            &device,
+            &path,
+            fps,
+            total as i64 * (TB.den / HZ as i64),
+            std::sync::Arc::new(crate::io::interop_decode::InteropDecodeTargets::disabled(
+                std::sync::Arc::clone(&device),
+            )),
+        );
+
+        // 1. Frame 0, so the decoder has a position and the cache has an entry for
+        //    the stale fallback to hand back later.
+        let first = frame_to_pts(0, fps, TB);
+        assert!(
+            io.decode_blocking(sid, first).is_some(),
+            "the fixture's first frame did not decode at all"
+        );
+        assert!(io.cache.get(sid, first).is_some(), "frame 0 was not cached");
+
+        // 2. Frame 900: sequential (3.75 s ahead, under the five-second seek
+        //    threshold) but more than 600 packets away, so the read-forward hits the
+        //    corrupt-file bound and gives up. Expected to be served stale — the
+        //    bound doing its job — and asserted so the case cannot silently stop
+        //    being the case this test is about.
+        let far = frame_to_pts(900, fps, TB);
+        io.decode_blocking(sid, far);
+        assert!(
+            io.cache.get(sid, far).is_none(),
+            "frame 900 decoded within 600 packets, so this test is no longer \
+             exercising the corrupt-file bound at all"
+        );
+
+        // 3. A frame the decoder has ALREADY passed. With the bound left alone this
+        //    is an ordinary read-forward that returns the next available frame. If
+        //    the bound had drained the decoder, every send is refused, nothing
+        //    decodes, and the stale fallback answers with frame 0 — `Some(_)`, and
+        //    keyed at the wrong pts.
+        let after = frame_to_pts(400, fps, TB);
+        let got = io.decode_blocking(sid, after);
+        assert!(
+            got.is_some(),
+            "nothing came back after the 600-packet bound tripped: the decoder was \
+             left in draining mode and is refusing input"
+        );
+        assert!(
+            io.cache.get(sid, after).is_some(),
+            "the frame after the 600-packet bound was served from the previous \
+             position rather than decoded — the bound put the decoder into draining \
+             mode, so it refuses all further input until a seek flushes it. `hit_eof` \
+             is what keeps the bound from draining."
+        );
+
+        eprintln!(
+            "[media_compat] G3: the 600-packet bound left the decoder usable — a \
+             later frame still decoded."
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// G3 step 2 — at EOF the interop path declines and the CPU path serves the
+    /// tail, and that is the design rather than a gap.
+    ///
+    /// `decode_interop` returns `None` when the demuxer runs dry: it does not drain,
+    /// because a drained frame arrives in host memory (`drain_into` passes
+    /// `interop = None` to `emit_frame`) and would have to be uploaded — on the arm
+    /// whose whole purpose is that nothing is uploaded. So the last frames of a clip
+    /// are served by the CPU fallback, exactly as a source that fell back for any
+    /// other reason is.
+    ///
+    /// Holds [`crate::tests::cuda_lock`] for its whole body and takes the ONE shared
+    /// context (gotcha 4), and skips with a printed reason when the host has no CUDA
+    /// or the decoder is not NVDEC — never a silent pass.
+    #[test]
+    fn at_eof_the_interop_path_declines_and_the_cpu_path_serves_the_tail() {
+        use crate::timeline::rational::frame_to_pts;
+
+        let _guard = crate::tests::cuda_lock();
+
+        let Some(ffmpeg) = ffmpeg_binary() else {
+            assert!(!require(), "NEXIR_REQUIRE_COMPAT is set but there is no ffmpeg");
+            eprintln!("[media_compat] SKIP the G3 interop-tail test: no `ffmpeg` binary.");
+            return;
+        };
+        let dir = scratch_dir();
+        let fps = Rational { num: FPS as i64, den: 1 };
+        let frames = (FPS * SECONDS) as usize;
+        let path = match write_timed_fixture(&ffmpeg, &dir, "g3_interop_tail", FPS, SECONDS) {
+            Ok(p) => p,
+            Err(why) => {
+                assert!(!require(), "NEXIR_REQUIRE_COMPAT is set but {why}");
+                eprintln!("[media_compat] SKIP the G3 interop-tail test: {why}");
+                return;
+            }
+        };
+
+        let device = std::sync::Arc::new(
+            pollster::block_on(crate::render::device::GpuDevice::new_headless())
+                .expect("headless GpuDevice"),
+        );
+        let capability = crate::interop::capability::InteropCapability::probe(&device);
+        let cuda = crate::tests::shared_cuda_ctx(&capability);
+        if cuda.is_none() {
+            eprintln!(
+                "[media_compat] SKIP the G3 interop-tail test: CUDA interop is \
+                 unavailable on this host (transport={:?}), so there is no interop \
+                 path to decline.",
+                capability.transport
+            );
+            return;
+        }
+        let registry = std::sync::Arc::new(
+            crate::io::interop_decode::InteropDecodeTargets::with_context(
+                std::sync::Arc::clone(&device),
+                capability,
+                cuda,
+            ),
+        );
+        let (io, sid, _rx) = io_layer_over(
+            &device,
+            &path,
+            fps,
+            frames as i64 * (TB.den / FPS as i64),
+            std::sync::Arc::clone(&registry),
+        );
+
+        // Walk in order exactly as `FrameScheduler::process_island` does: interop
+        // first, CPU fallback when it declines.
+        let mut by_interop = 0usize;
+        let mut by_cpu = 0usize;
+        let mut tail_by_cpu = 0usize;
+        let mut tail_cpu_fresh = 0usize;
+        let mut last_frame_by_cpu = false;
+        let mut last_frame_fresh = false;
+        let tail_start = frames - 8;
+        for i in 0..frames {
+            let pts = frame_to_pts(i as i64, fps, TB);
+            if io.decode_interop(sid, pts).is_some() {
+                by_interop += 1;
+            } else if io.decode_blocking(sid, pts).is_some() {
+                by_cpu += 1;
+                let fresh = io.cache.get(sid, pts).is_some();
+                if i >= tail_start {
+                    tail_by_cpu += 1;
+                    if fresh {
+                        tail_cpu_fresh += 1;
+                    }
+                }
+                if i + 1 == frames {
+                    last_frame_by_cpu = true;
+                    last_frame_fresh = fresh;
+                }
+            }
+        }
+
+        eprintln!(
+            "[media_compat] G3: {by_interop} frame(s) on the interop path, {by_cpu} on the \
+             CPU fallback ({tail_cpu_fresh}/{tail_by_cpu} of the last 8 fresh), {} live \
+             target(s){}",
+            registry.live_targets(),
+            registry
+                .rejections()
+                .first()
+                .map(|(id, why)| format!(" — source {} fell back: {why}", id.index()))
+                .unwrap_or_default(),
+        );
+
+        if registry.live_targets() == 0 {
+            // Not a failure: no NVDEC on this host, or a source geometry the interop
+            // path refuses. Reported rather than asserted, because the thing under
+            // test does not exist here.
+            eprintln!(
+                "[media_compat] SKIP the interop half: no target was allocated, so \
+                 every frame took the CPU path and there was nothing to decline."
+            );
+            return;
+        }
+
+        assert!(
+            by_interop > 0,
+            "a target was allocated but not one frame came back through it, so this \
+             test says nothing about the interop path's behaviour at EOF"
+        );
+        // THE DESIGN: the tail is served, and it is served by the CPU path. Both
+        // halves matter — `by_cpu == 0` would mean the interop path is somehow
+        // draining (which would upload the frame it drained), and a tail that is not
+        // fresh is the G3 bug with a different decoder in front of it.
+        assert!(
+            by_cpu > 0,
+            "every frame came back through the interop path, including the tail. \
+             `decode_interop` must return None at EOF (G3 step 2) — a drained frame \
+             arrives in host memory and would be uploaded on the arm whose whole \
+             point is that nothing is"
+        );
+        // **HOW MANY frames the fallback serves is a property of the host, so it is
+        // not asserted; that EVERY one of them is fresh is a property of this crate,
+        // so it is.**
+        //
+        // This assertion used to be `tail_fresh == 8`, and the 8 was never a
+        // measurement of anything — it was the count that happened to hold while
+        // `decode_blocking` and `decode_interop` both called `Decoder::seek_to`,
+        // which discards the frame it lands on. Every request was answered one frame
+        // late, so the interop arm ran out of reachable frames eight short of the end
+        // and the CPU path picked up the whole tail. With that fixed (both arms now
+        // flush and read forward, keeping the frame `seek_to` threw away) the interop
+        // arm reaches to within the decoder's own hold-back: measured 58 of 60 here,
+        // leaving 2 for the fallback. The number moves with core count and codec
+        // delay, so pinning it would be pinning this machine.
+        //
+        // What is invariant, and what G3 is actually about: the frames the interop
+        // path cannot reach must come back FRESHLY DECODED from the CPU path, never
+        // out of `FrameCache` at the previous position.
+        assert_eq!(
+            tail_cpu_fresh, tail_by_cpu,
+            "{} of the {tail_by_cpu} tail frame(s) the CPU path served came from the \
+             previous position rather than being decoded — the interop arm's tail is \
+             served by that fallback, so the drain has to work there too",
+            tail_by_cpu - tail_cpu_fresh
+        );
+        // The LAST frame is the one only the drain can reach, on either arm, so it is
+        // named rather than left to the count above: a tail of zero CPU frames would
+        // satisfy the equality vacuously.
+        assert!(
+            last_frame_by_cpu,
+            "the final frame came back through the interop path — `decode_interop` \
+             does not drain, so it cannot have; something is serving a stale target as \
+             a `Cached` hit"
+        );
+        assert!(
+            last_frame_fresh,
+            "the final frame was served from the previous position: the CPU fallback's \
+             drain is what makes it reachable, and it did not run"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

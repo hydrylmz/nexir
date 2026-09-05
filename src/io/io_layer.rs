@@ -173,7 +173,14 @@ impl IoLayer {
             // request for this pts could be served as a `Cached` hit showing the
             // wrong picture.
             self.interop.invalidate(source_id);
-            decoder.seek_to(&mut demuxer, stream_pts).ok()?
+            // FLUSH, NOT `seek_to` — see `decode_blocking`'s copy of this branch
+            // for what `seek_to` costs. Same bug on this arm, and it was invisible
+            // to `bench --interop`'s pixel check for a second reason: `Δpx 0/255`
+            // compares the two arms against each other and BOTH were shifted by
+            // one frame, so a cross-arm comparison cannot see a defect the arms
+            // share.
+            decoder.flush();
+            stream_pts
         } else {
             let demux = demuxer_arc.lock().unwrap();
             let stream_tb = demux.video_stream.as_ref()?.time_base;
@@ -259,21 +266,60 @@ impl IoLayer {
 
         let target_stream_pts = {
             if need_seek {
-                if is_still_image {
-                    let stream_pts = {
-                        let demuxer = demuxer_arc.lock().unwrap();
-                        let stream_tb = demuxer.video_stream.as_ref()?.time_base;
-                        self.project_tb.rescale_pts(0, stream_tb)
-                    };
-                    let mut decoder = decoder_arc.lock().unwrap();
-                    decoder.flush();
-                    stream_pts
+                // FLUSH AND LET THE READ-FORWARD LOOP FIND IT — never `seek_to`.
+                //
+                // **`Decoder::seek_to` DISCARDS the frame it lands on**, and that is
+                // the whole remaining G3 failure. Its discard loop decodes until
+                // `frame_pts >= target`, unrefs that frame and returns its pts; the
+                // loop below then searches for `eff_pts >= target_stream_pts`
+                // starting from the NEXT frame. So a cold request for frame N is
+                // answered with frame N+1, **cached under N's key**, and every
+                // sequential request after it is shifted by one — until the tail,
+                // where there is no N+1 left and the `!decoded_anything` arm serves
+                // the previous frame out of `FrameCache`.
+                //
+                // Measured with `examples/g3_drain_probe.rs` (phases 4 and 5 exist
+                // to separate this from the drain): replicating this function
+                // WITHOUT the cold seek serves 60/60 frames of a 60-frame file, all
+                // fresh, the last two out of the drain. Replicating it WITH the seek
+                // serves 59 and prints `got=Some(512)` for a request whose target is
+                // 0, `Some(29184)` for a target of 28672, and `None` for the last —
+                // i.e. the wrong picture on all 59 and nothing at all on the 60th.
+                //
+                // **The shift was the more serious half and it was invisible.** A
+                // one-frame offset in the picture is not something any assertion in
+                // the tree looked at: the frame is cached under the pts that was
+                // asked for, so `cache.get(source, pts)` succeeds and the G3 test's
+                // own `fresh` count was 59/60 rather than 0/60. Only the single
+                // missing frame at the end showed up, which is why this read as "one
+                // last stale frame" rather than as "every frame after a seek is the
+                // wrong one".
+                //
+                // The read-forward loop below already does exactly what `seek_to`'s
+                // discard loop does — decode from the keyframe until a frame at or
+                // past the target — except that it KEEPS that frame, in the slot
+                // acquired for it. So the seek branch only has to put the decoder in
+                // a state where the loop can run: `flush()` (which also clears the
+                // draining flag and any EAGAIN backlog from before the seek) plus the
+                // rescaled target. That is what the still-image branch has always
+                // done; the two are now the same shape for the same reason.
+                //
+                // What changes with it: the post-seek scan is now bounded by the same
+                // 600 packets as any other read-forward, where `seek_to`'s loop ran
+                // to EOF. A file whose GOP exceeds 600 packets therefore reports a
+                // stale frame instead of grinding through it — the corrupt-file guard
+                // doing its job, and `hit_eof` keeps it from draining (see the drain
+                // block below and `the_600_packet_bound_does_not_leave_the_decoder_draining`).
+                let mut demuxer = demuxer_arc.lock().unwrap();
+                let stream_pts = if is_still_image {
+                    let stream_tb = demuxer.video_stream.as_ref()?.time_base;
+                    self.project_tb.rescale_pts(0, stream_tb)
                 } else {
-                    let mut demuxer = demuxer_arc.lock().unwrap();
-                    let stream_pts = demuxer.seek(pts, self.project_tb).ok()?;
-                    let mut decoder = decoder_arc.lock().unwrap();
-                    decoder.seek_to(&mut demuxer, stream_pts).ok()?
-                }
+                    demuxer.seek(pts, self.project_tb).ok()?
+                };
+                let mut decoder = decoder_arc.lock().unwrap();
+                decoder.flush();
+                stream_pts
             } else {
                 // Sequential path: translate project PTS to stream PTS without seeking
                 let demux = demuxer_arc.lock().unwrap();
@@ -306,10 +352,11 @@ impl IoLayer {
 
             self.pool.with_buffer_mut(slot, |mapped| {
                 // Read forward up to 600 packets to find the target frame
+                let mut hit_eof = false;
                 for _ in 0..600 {
                     let pkt = match dem.next_video_packet().ok().flatten() {
                         Some(p) => p,
-                        None    => break,
+                        None    => { hit_eof = true; break }
                     };
                     let pkt_pts = pkt.pts;
                     if let Some(frame) = dec.decode_into(&pkt, mapped, None).ok().flatten() {
@@ -318,6 +365,53 @@ impl IoLayer {
                             found_pts = eff_pts;
                             final_meta = frame.meta;
                             decoded_anything = true;
+                            break;
+                        }
+                    }
+                }
+
+                // ── G3: DRAIN AT EOF ─────────────────────────────────────────
+                //
+                // **Without this the last frames of every clip are unreachable**,
+                // and the symptom is not an error. `avcodec_set_thread_count(ctx, 0)`
+                // gives FFmpeg one thread per core and each holds a frame back, so
+                // the send/receive loop above simply stops producing before the
+                // file ends — measured: frame 57 of a 60-frame `cam_4k30`. What the
+                // user sees is the playhead moving over the last second while the
+                // picture freezes, because the `!decoded_anything` arm below hands
+                // back the previous frame out of `FrameCache`. That disguise is why
+                // this went unnoticed; `bench --interop` found it only because a
+                // one-frame interop target has no cache to fall back on.
+                //
+                // Draining at end of stream is what every media pipeline does. It
+                // writes into the SAME slot already acquired above, so nothing about
+                // the cache or the slot pool changes.
+                //
+                // Only when the demuxer actually ran dry: `hit_eof` distinguishes
+                // that from the 600-packet bound, which is the corrupt-file guard
+                // and must not put the decoder into draining mode (it refuses input
+                // afterwards, so every later frame on this source would disappear
+                // until a seek flushed it).
+                if decoded_anything || !hit_eof {
+                    return;
+                }
+                loop {
+                    match dec.drain_into(mapped) {
+                        Ok(Some(frame)) => {
+                            // No packet to fall back on here, so the frame's own pts
+                            // is all there is — a drained frame always carries one.
+                            if frame.pts >= target_stream_pts {
+                                found_pts = frame.pts;
+                                final_meta = frame.meta;
+                                decoded_anything = true;
+                                break;
+                            }
+                        }
+                        // Fully drained: the decoder holds nothing more, so the
+                        // request is genuinely past the end of the stream.
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::debug!("[io] drain_into at EOF failed: {e:?}");
                             break;
                         }
                     }

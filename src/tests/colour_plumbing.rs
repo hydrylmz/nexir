@@ -689,12 +689,14 @@ mod colour_plumbing {
     /// Read the luma plane back and report the largest code in it.
     ///
     /// **Not a convenience — a guard against a false PASS and a false FAIL.** The
-    /// interop copy can silently write nothing: `CudaContext::with_context` is
-    /// `cuCtxPushCurrent`, the driver requires the primary context to be floating,
-    /// and a push that fails is *ignored* — so every CUDA call in the closure runs
-    /// against the wrong context and `cuMemcpy2DAsync` reports success having copied
-    /// nothing (gotcha 4, and it is silent in release). The result is an all-zero Y
-    /// plane, which the shader then converts to black.
+    /// interop copy can silently write nothing whenever the CUDA calls in
+    /// `CudaContext::with_context` run against the wrong context: the bind is
+    /// checked and logged now (`cuCtxSetCurrent`), but a failed bind still falls
+    /// through and runs the closure, and `cuMemcpy2DAsync` then reports success
+    /// having copied nothing. This is what the old `cuCtxPushCurrent` did on every
+    /// call after the first `Decoder::open` — push needs a floating context, and
+    /// `AV_CUDA_USE_PRIMARY_CONTEXT` means FFmpeg holds this one (gotcha 4). The
+    /// result is an all-zero Y plane, which the shader then converts to black.
     ///
     /// Distinguishing that from "the shader got the matrix wrong" is the whole
     /// point: the first is a host/serialisation condition this test cannot control
@@ -765,7 +767,9 @@ mod colour_plumbing {
     ///
     /// Holds `tests::cuda_lock()` for its whole body (gotcha 4): `CudaContext`
     /// wraps the device's primary context, so every instance in the process is one
-    /// `CUcontext` and `cuCtxPushCurrent` needs it floating.
+    /// `CUcontext` on one stream, and the CUDA work inside two tests' closures must
+    /// not interleave. (Binding it is safe concurrently — `with_context` is
+    /// `cuCtxSetCurrent`, not `cuCtxPushCurrent`.)
     #[test]
     fn interop_decoded_frames_carry_their_matrix_to_the_shader() {
         let _cuda = crate::tests::cuda_lock();
@@ -819,19 +823,19 @@ mod colour_plumbing {
             frame.meta.color.effective_range()
         );
 
-        // Did the copy actually land? An all-zero luma plane means
-        // `cuCtxPushCurrent` was refused and every CUDA call in the closure ran
-        // against the wrong context — reported as success, having copied nothing
-        // (gotcha 4). That is a host condition, not a colour bug, and the pixel
-        // assertions below cannot tell the two apart, so skip on it rather than
-        // failing for the wrong reason. `write_source_video`'s pattern includes a
+        // Did the copy actually land? An all-zero luma plane means the CUDA calls in
+        // the closure ran against the wrong context — reported as success, having
+        // copied nothing (gotcha 4). That is a host condition, not a colour bug, and
+        // the pixel assertions below cannot tell the two apart, so skip on it rather
+        // than failing for the wrong reason. `write_source_video`'s pattern includes a
         // white band, so a landed copy has luma near 235 (limited range).
         let peak = peak_luma(&device, &frame);
         if peak < 200 {
             eprintln!(
                 "[colour_plumbing] SKIP: the interop luma plane peaks at {peak}, so the \
-                 device→array copy wrote nothing (the CUDA context was not floating — \
-                 gotcha 4). Nothing about the colour path can be concluded from this run."
+                 device→array copy wrote nothing (the CUDA context could not be made \
+                 current — gotcha 4). Nothing about the colour path can be concluded \
+                 from this run."
             );
             let _ = std::fs::remove_file(&path);
             return;

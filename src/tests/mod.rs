@@ -28,24 +28,31 @@ pub mod export_validation;
 
 /// Serialises every test that puts the CUDA primary context current.
 ///
-/// `CudaContext::with_context` is `cuCtxPushCurrent` / pop, and the driver
-/// requires the context to be FLOATING to be pushed — a context already current
-/// on another thread cannot be pushed on a second one.  Every `CudaContext` in
-/// this process wraps the same allocation: `CudaContext::new` calls
-/// `cuDevicePrimaryCtxRetain` for the device, so two test modules each holding
-/// their "own" `Arc<CudaContext>` are holding one `CUcontext`.
+/// **Not because a second bind fails — that part is fixed.**
+/// `CudaContext::with_context` is `cuCtxSetCurrent`, which has no floating
+/// requirement and lets one context be current to many threads at once (see that
+/// function's doc comment and `examples/g2e_interop_target_probe.rs`). The old
+/// `cuCtxPushCurrent` implementation *did* fail that way: push needs the context
+/// FLOATING, `AV_CUDA_USE_PRIMARY_CONTEXT` puts FFmpeg's decoder in it, and every
+/// push after the first `Decoder::open` returned `CUDA_ERROR_INVALID_CONTEXT`
+/// while the unconditional pop stripped a context it had never placed.
 ///
-/// So the lock has to live HERE rather than per-module: `export_validation` had
-/// its own `export_lock` and `shared_buffer` would have had another, and two
-/// locks guarding one resource is not guarding it.  Symptom when this is missing:
-/// `cuCtxPushCurrent` returns `CUDA_ERROR_INVALID_CONTEXT`, the pop takes the
-/// wrong context off the stack, and the debug assertion in `with_context` fires
-/// with `left: 0x0` — from a test whose own code is correct and which passes when
-/// run alone.
+/// What the lock still guards is the CUDA WORK inside the closures. Every
+/// `CudaContext` in this process wraps one `CUcontext` —
+/// `CudaContext::new` calls `cuDevicePrimaryCtxRetain` for the device, so two test
+/// modules each holding their "own" `Arc<CudaContext>` hold the same one — and one
+/// stream, so two tests issuing copies or opening NVENC sessions concurrently
+/// interleave on shared state. `cuCtxSynchronize` is context-wide: a test that
+/// calls it waits for the other test's work too, and one that destroys a resource
+/// does so while another is reading it.
+///
+/// So the lock lives HERE rather than per-module: `export_validation` had its own
+/// `export_lock` and `shared_buffer` would have had another, and two locks guarding
+/// one resource is not guarding it.
 ///
 /// Held across the whole body of any test that touches CUDA, not just the CUDA
 /// call: a test that maps a buffer, runs a wgpu dispatch and then reads back must
-/// not have another test's push land between its own.
+/// not have another test's session open and close in between.
 pub fn cuda_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // A panicking test poisons the mutex; ignore that rather than cascading one
