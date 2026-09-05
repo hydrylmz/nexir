@@ -375,6 +375,53 @@ impl Decoder {
         self.receive_one(dst, interop)
     }
 
+    /// Take at most one frame out of the decoder and DISCARD it, reporting only its
+    /// presentation timestamp.
+    ///
+    /// **The only receive in this type that costs nothing but NVDEC, which is the
+    /// whole reason it exists.** [`Self::receive_into`] on a hardware decoder either
+    /// runs `av_hwframe_transfer_data` (a full device→host frame copy) or
+    /// `DecodeInteropTarget::copy_from_nvdec_frame` (a `cuCtxSynchronize` plus two
+    /// `cuMemcpy2DAsync`s and a stream sync), so neither can answer *"what does the
+    /// decode ALONE cost"*. Task I of the 4K60 audit asks exactly that — the minimum
+    /// wall time in which this host's NVDEC engine can deliver N decoded frames with
+    /// nothing downstream — and a figure carrying either copy would be a floor for
+    /// the pipeline rather than for the engine.
+    ///
+    /// It is also what makes an unlocked concurrent arm honest. Every other decode
+    /// path here ends in a context-wide `cuCtxSynchronize` (AGENTS.md gotcha 19), so
+    /// running several sources without a mutex makes each one wait for the others'
+    /// copies and inflates every per-source figure. With no copy there is no barrier,
+    /// so sources may genuinely overlap and whatever serialisation remains is the
+    /// driver's own — which is what a floor is supposed to include.
+    ///
+    /// `Ok(Some(pts))` when a picture came out, `Ok(None)` when the decoder wants
+    /// more input (not end-of-stream — that is [`Self::drain_into`]). The frame is
+    /// unref'd before returning either way, so the decoder's output slot is free for
+    /// the next receive; that is the same housekeeping `emit_frame` performs at the
+    /// end of every successful decode, and skipping it would have the next
+    /// `avcodec_receive_frame` unref a frame this one still claimed.
+    ///
+    /// The pts is read from `self.frame`, the only place it exists on the hardware
+    /// path (gotcha 22) — there is no transfer destination here to read it from
+    /// wrongly, which is the one hazard this method does not have.
+    ///
+    /// **A measurement primitive, not a decode path.** A caller that wants the
+    /// pixels must use [`Self::receive_into`].
+    pub fn receive_and_discard(&mut self) -> Result<Option<i64>, DecodeError> {
+        let recv_ret = unsafe { avcodec_receive_frame(self.ctx, self.frame) };
+        if recv_ret == 0 {
+            let pts_raw = unsafe { av_frame_get_pts(self.frame) };
+            let pts = if pts_raw == AV_NOPTS_VALUE { 0i64 } else { pts_raw };
+            unsafe { av_frame_unref(self.frame) };
+            return Ok(Some(pts));
+        }
+        if recv_ret == AVERROR_EAGAIN || recv_ret == AVERROR_EOF {
+            return Ok(None);
+        }
+        Err(DecodeError::Receive(av_err_to_string(recv_ret)))
+    }
+
     /// Take at most one frame out of the decoder and emit it.
     ///
     /// Split out of [`Self::decode_into`] so the receive happens exactly once per

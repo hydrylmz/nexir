@@ -35,6 +35,7 @@ NEXIR_FRAME_CSV=target/run_%d.csv ./target/release/bench.exe 5   # per-frame ser
 NEXIR_GPU_LOOKAHEAD=1 ./target/release/bench.exe 5   # collapse the pipeline (lowers only)
 NEXIR_NODE_TIMINGS=1 ./target/release/bench.exe 5    # per-node GPU timings, in an EXTRA pass
 NEXIR_NODE_TIMINGS=1 ./target/release/bench.exe 7    # same, on the real-media graph (one frame, re-recorded)
+NEXIR_FUSE_GRADE=0 ./target/release/bench.exe 5 7 8  # the UNFUSED grade chain (gotcha 29; fused is the default)
 ./target/release/bench.exe --media    # real coded frames: decode/render/encode/E2E per class
 ./target/release/bench.exe --export   # end-to-end ExportEngine per class, every output verified
 ./target/release/bench.exe --interop  # the interop decode path vs the CPU one, both arms, per class
@@ -42,11 +43,30 @@ NEXIR_INTEROP_FRAMES=12 ./target/release/bench.exe --interop   # short pass whil
 NEXIR_INTEROP_DUMP=target/interop ./target/release/bench.exe --interop  # sampled frames as PNGs
 ```
 
+**The NVDEC engine's own ceiling** (gotcha 28) is a separate binary, because it must have
+no graph, no encoder and no copy in front of it:
+
+```bash
+cargo build -p nexir --example b_decode_split_probe --release
+cp target/debug/*.dll target/release/examples/       # cuda.dll beside the binary
+./target/release/examples/b_decode_split_probe.exe --floor   # 1->4 sources, median of 3
+NEXIR_FLOOR_REPEATS=1 ./target/release/examples/b_decode_split_probe.exe --floor  # smoke
+./target/release/examples/b_decode_split_probe.exe --floor C:/path/a.mp4 C:/path/b.mp4
+./target/release/examples/b_decode_split_probe.exe          # Task B/G's seven arms instead
+```
+
+**A fixture path passed to a native binary must be `C:/...` on this shell** — an MSYS
+`/c/...` argument arrives as a file that does not exist, and the run then skips several
+lines later naming the path but not the cause. The probe prints `n/a — cannot stat this
+path` rather than `0.0 MB` for exactly this.
+
 A single run of the 4K row spans ~40% between repeats, so **quote the median with its spread, never one run.**
 
 **The 4K60 preview target is a frame-time budget with a percentile, and its gate is benchmark 7.**
 
 > 4K60 preview is met when the steady-state frame interval is **≤ 16.67 ms at P95 and ≤ 20 ms at P99 on benchmark 7**, median of ≥3 repeats. Average FPS is reported alongside as throughput and is NOT the gate.
+
+**As stated, that target is UNREACHABLE ON THIS HOST, and the decode is why — see gotcha 28.** The NVDEC engine needs **32.03 ms** to deliver four decoded 4K60 frames with the pictures *discarded*: no graph, no encoder, no pipeline, no copy. That is 1.92× the whole 16.67 ms frame before a shader runs, so no change inside this crate can close it. Measured the same way, the gate IS met at **two 4K60 sources** (9.78 ms), at **four sources for 30 Hz** (33.33 ms), and at **three 1080p60 sources** (7.53 ms). Everything below still stands as *how* to read the gate — and gotcha 28 is what any restatement of the workload must cite.
 
 Why stated this way: an average hides exactly the stutter a viewer notices — 60 avg with a 40 ms P99 judders, while 58 avg with a 17 ms P99 is smooth. P95 ≤ 16.67 ms *is* the 60 Hz budget; P99 ≤ 20 ms lets one frame in a hundred slip a single vsync interval without failing, while still failing anything that stalls. Both are read off the `↳ steady` row, never the whole-run row (gotcha 15). Three rules come with it:
 
@@ -54,7 +74,7 @@ Why stated this way: an average hides exactly the stutter a viewer notices — 6
 - **A serial `--interop` row is a frame COST and cannot be read against a percentile target.**
 - **`ALTERNATING` in `format_table` fails the target on its own**, whatever the percentiles say — a distribution cannot see a cycle, and benchmark 7's is a judder a viewer sees. That cycle is attributed: gotcha 24.
 
-Real-media gap, measured rather than estimated: of 7.18 ms per interop decode, **6.66 ms is inside `avcodec_send_packet`/`receive_frame`** and 0.52 ms is ours, four times per frame. The graph is ~7.4 ms of a ~36 ms frame (`NEXIR_NODE_TIMINGS=1 bench.exe 7`, `target/taskF_b7_nodes.txt`: Lut3D 1.550, ColorCorrection 1.492, ChromaKey 1.455, Composite 1.337, YuvToRgb 1.222, ToneMap 0.323), so **even a free graph leaves ~29 ms** and graph work is not the lever that closes this.
+Real-media gap, measured rather than estimated: of 7.18 ms per interop decode, **6.66 ms is inside `avcodec_send_packet`/`receive_frame`** and 0.52 ms is ours, four times per frame. **The graph is now ~4.7 ms of a ~34 ms frame** after P2.3 fused three of its passes (gotcha 29 — it was 7.4 ms; `NEXIR_NODE_TIMINGS=1 bench.exe 7`, `target/p23_fused_3x.txt`: FusedGrade 1.798, Composite 1.339, YuvToRgb 1.222, ToneMap 0.323), so **even a free graph leaves ~29 ms** and graph work is not the lever that closes this. Gotcha 28 says what is.
 
 ## Build Dependencies (Windows)
 
@@ -113,6 +133,8 @@ Every "measured"/"verified" claim in `src/interop/` cites a standalone C probe i
 Compiled at startup via `ShaderRegistry::compile_all()`. Shaders live in `src/render/shader/*.wgsl` and are included at compile time (`include_str!`). Hot-reload supported per-shader.
 
 Required wgpu features: `TEXTURE_BINDING_ARRAY`, `PUSH_CONSTANTS`, `SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING`.
+
+**`fused_grade.wgsl` duplicates three shaders' bodies on purpose** (gotcha 29), so a change to `color_correction.wgsl`, `lut.wgsl` or `chroma_key.wgsl` has to be made there too — `tests::fused_grade` is what catches the omission, by rendering both paths and comparing. The three are KEPT rather than replaced: `EffectChainBuilder` emits them individually for a clip whose effect list is not the fusable triple, and the equivalence test needs the chain compilable.
 
 ### Project File (.nexp)
 JSON with `format_version: 1`. Saved/loaded via `ProjectFile::save()` / `ProjectFile::load()`.
@@ -253,6 +275,51 @@ Hardcoded dark theme in `NexirApp::new()`. No theme switching. Window size: 1280
     - **With equivalent content the interop graph is exactly benchmark 5's graph minus the node it deletes.** 6.802 − 0.935 (`YuvUpload`, absent on an interop clip per gotcha 18) = 5.867 predicted against 5.881 measured, **+0.2%**. That is the cleanest confirmation available that G2d's import path adds no shader cost — and it is only visible once content is held equal.
     - **`cam_4k60_grain` is dear in the GRAPH as well as the decoder, and for a different reason.** Gotcha 25 says a four-source decode split reports who waited; this is the other half — the grain source's ~35× bitrate makes its *decoded picture* incompressible, so every shader pass over it costs ~2× and the four-source graph carries one dear layer among three cheap ones. Mixing one noisy source into three clean ones reproduces it exactly: implied 4th instance 0.578/0.533/0.543/0.387 ms against the all-noisy per-pass 0.591/0.562/0.569/0.393, i.e. within 1.5-5.2% (`target/taskH_mixed_3x.txt`).
     - **`NEXIR_MEDIA_DIR` does not isolate a fixture set unless the files are plausible.** `ensure_fixture` reuses any existing file over 64 KB, and a 4K60 clip of near-static content encodes *below* that floor — so a directory of 48 KB fixtures was silently re-encoded with the default recipes and the run measured the repo's own fixtures under a "flat content" heading, md5-identical to `nexir_media_fixtures/` (`target/taskH_flat.txt`, which is why its figures match the fixtures column to 0.1%). Any alternate fixture set has to clear the floor; `scroll=horizontal=0.004` over `smptehdbars` does (0.2 MB) and static `color=` does not.
+
+28. **There is NO 4K60 budget for four sources on this host, and it is the DECODE that says so — measured with the pictures thrown away.** Task I asked the last question about the gate: what is the minimum wall time in which this host's single NVDEC engine can deliver N decoded 4K60 frames with no graph, no encoder, no pipeline and no copy? `examples/b_decode_split_probe.rs --floor` answers it with an arm that decodes and *discards* (`Decoder::receive_and_discard`), so nothing downstream of NVDEC runs. Median of 3, `target/taskI_floor_4k_3x.txt`:
+
+    | sources | floor | vs 16.67 ms | obs/additive | verdict |
+    |---|---:|---:|---:|---|
+    | 1 | 5.11 ms | 0.31× | 0.99× | inside 60 Hz |
+    | 2 | **9.78 ms** | 0.59× | 0.97× | **inside 60 Hz** |
+    | 3 | 26.98 ms | 1.62× | 0.99× | 30 Hz only |
+    | **4** | **32.03 ms** | **1.92×** | **0.99×** | **30 Hz only** |
+
+    **Benchmark 7 therefore cannot reach 16.67 ms at P95 whatever this crate does**: the decode alone is 32 ms of a 16.67 ms frame before a shader runs. The gate IS met at **two 4K60 sources** (59% of budget), the full four fit **30 Hz** (33.33 ms, 4% spare), and three 1080p60 sources fit 60 Hz at 7.53 ms (`target/taskI_floor_1080p_3x.txt`). Confirmed on three separately-built binaries (`target/taskI_smoke.txt`, `target/taskI_floor_3x.txt`) agreeing to ~1%. Six rules the reading depends on:
+    - **`obs/additive`, never `n × floor(1 source)`.** `MULTI_4K60_SOURCES` is one very heavy source plus three ordinary ones (gotcha 25), so a ratio against the first fixture charges *adding a source* for grain's ~35× bitrate — the earlier version printed "1.58x of linear" directly above a 0.9 threshold it can exceed arbitrarily. Each source is therefore measured ALONE (5.16 / 4.90 / **17.08** / 5.13 ms) and the prediction is the sum of the subset's OWN solo floors. At 0.97-0.99× of that the engine served them in turn: **saturated, and no scheduling change in this crate can overlap them.**
+    - **The floor is the better of a CONCURRENT and a SERIAL arm, both printed.** One-thread-per-source is a scheduling choice; if its contention made it slower than decoding in turn, calling it the floor would attribute this probe's threading to the hardware. They agree to 0.1-0.8% (the 4-source floor came off the serial arm, 32.03 vs 32.07).
+    - **The discard arm is NOT a decode path and may never be quoted as one.** A pipeline cannot go this fast by construction; the figure bounds what any change could ever buy.
+    - **It is also the ONE place a concurrent arm may run without the engine mutex.** Every other arm holds one lock around `decode_into` because the copies share one `CUcontext` and one stream and the barrier is context-wide (gotchas 4, 19); with no copy there is no barrier to serialise, so what remains is the driver's own — which is what belongs in a floor.
+    - **Geometry, frame rate and decoder are read off the first fixture and printed in the heading, the verdict and the scope note.** The pre-fix version printed "These are 4K60 fixtures" over a 1080p sweep and a hardcoded "benchmark 7 misses by ~4.4x" on a row where benchmark 7 was not the workload. A host that attached software decode now skips with a reason rather than reporting libavcodec's CPU throughput as an NVDEC ceiling.
+    - **Repeats are the OUTER loop, source count the inner one.** Drift over a multi-minute sweep would otherwise land on whichever count ran last, and the conclusion is a comparison *between* counts.
+
+29. **Colour correction + LUT + chroma key now run as ONE pass, and the win is bandwidth — measured on both content sets, and it still does not close the gate.** P2.3. `FusedGradeNode` + `fused_grade.wgsl` replace the three-node chain wherever all three run back to back (the Heavy graph, benchmarks 5-8). The chain reads and writes a full canvas-sized `Rgba16Float` texture three times, so it crosses the canvas 6 times where the fused pass crosses it 2. `NEXIR_FUSE_GRADE=0` takes the unfused arm from the same binary — one argument different, the discipline `NEXIR_UPLOAD_PATH` follows — and **the default is ON**, so any comparison against a pre-P2.3 figure must set it to 0. The bench banner prints which path it took. Medians of 3:
+
+    | row | graph TOTAL | FPS | peak bucket |
+    |---|---:|---:|---:|
+    | 5 — synthetic 4K60 | 6.783 → **4.814 ms** (−29%) | 57.5 → **67.1** | 16/32 → **8/32** |
+    | 7 — real media, interop | 7.387 → **4.682 ms** (−37%) | 27.8 → **28.6** | 16/32 → **8/32** |
+    | 8 — real media, CPU upload | (same graph) | 18.9 → **21.9** | 16/32 → **8/32** |
+    | 7 — `nexir_media_bars` control | 5.881 → **3.867 ms** (−34%) | 45.0 → **47.6** | — |
+
+    `target/p23_unfused_3x.txt`, `target/p23_fused_3x.txt`, `target/p23_bars_unfused_3x.txt`, `target/p23_bars_fused_3x.txt`. Four things it comes with:
+    - **Both content sets, because a bandwidth win is exactly what low-entropy fixtures would flatter** (gotcha 27). 34% on the compressible bars and 37% on the repo fixtures — it survives real content, which was the test that mattered.
+    - **It does NOT close the 4K60 gate and must not be quoted as progress toward it.** Benchmark 7 still prints `ALTERNATING` (12.93 / 52.36 ms), which fails the target on its own (gotcha 15), and gotcha 28's floor is 32 ms. The graph was ~20% of the frame; it is now ~13%.
+    - **`peak bucket` re-read, as gotcha 14 requires of a graph change**: 16/32 → 8/32, 0 evicted. `POOL_BUCKET_CAPACITY` stays 32 — 16 is still a shape the tree builds (`NEXIR_FUSE_GRADE=0`, and `EffectChainBuilder` for a clip whose effect list is not the fusable triple) and an unreached bucket costs nothing (`1/32` at 1080p).
+    - **The fused output is not bit-identical to the chain's, and the difference favours the fused path.** The chain rounds to f16 at each intermediate; the fused pass keeps f32 in registers. `tests::fused_grade` therefore compares within f16 quantisation (8 × 2⁻¹⁰) and `a_dropped_stage_would_exceed_the_tolerance` removes each stage in turn to measure the margin — 6-50× the tolerance — so the equality check can actually fail. `both_sides_of_the_chroma_key_gate_agree` does NOT hardcode which band is keyed: the key sees the pixel after two per-channel stages, so predicting that means hand-computing five stages; it asserts that both branches ran and that the two paths keyed the same set.
+
+30. **P2.2's ceiling is computed off the compiled graph, not estimated — and on the Heavy graph it is 3 textures of 18, worth VRAM and no frame time.** `CompiledGraph::lifetime_bounds()` returns `(held, ideal)`: what the frame holds today (every declared resource, since `execute` acquires all of them before the first node records) against the maximum simultaneously LIVE, which is the floor a perfect aliasing scheme could reach. The bench prints both beside the pool stats. Measured on benchmark 5 after P2.3: **holds 18, ideal 15 — 3 fewer, ~190 MB of 4K residency.** Three constraints keep it small, each in the analysis rather than assumed:
+    - **A node binds its input and its output in one pass**, so a live range is `[first write … last read]` INCLUSIVE and consecutive stages can never share. A scheme treating a resource as dead at its last reader would build bind groups wgpu rejects outright. The floor for a chain of any length is 2, not 1.
+    - **The pool buckets by (format, USAGE, size)**, so resources whose usage flags differ cannot alias however their lifetimes fall — a write-only final output is its own bucket, which is why a 4-stage chain's ideal is 3 and not 2.
+    - **Imports are excluded** (gotcha 18): the decoder owns that texture beyond the frame, so counting it would inflate the prize with memory nothing can reclaim.
+
+    `render::graph::tests::lifetime_bounds_reports_what_aliasing_could_save` pins both shapes with their arithmetic and `lifetime_bounds_ignores_imports` pins the exclusion. **Verdict: not worth writing.** The pool already reuses textures across frames at a 0.5-0.8% miss rate with 0 evictions, so aliasing *within* a frame removes residency and shortens nothing in the recording — 3 of 18 against per-resource lifetime tracking through `resolve_resources` and all three `execute*` bodies is not a trade the audit's own constraint permits. **Read it as residency, never as speed.**
+
+## The 4K60 audit is CLOSED
+
+Every task in `.hermes/plans/2026-08-30_210807-nexir-4k60-upload-sync-audit.md` is done, and that file is now a RESULT rather than a work list. The audit's own conclusion, in one line: **the gate as stated is unreachable at four 4K60 sources because the NVDEC engine needs 1.92× the frame budget to decode them with the pictures discarded (gotcha 28)** — it is met at two 4K60 sources, at four for 30 Hz, or at three 1080p60. Phase H closed with P2.3 landed (gotcha 29) and P2.2 measured then declined (gotcha 30); P2.5 is under 1% of the frame and should stay untouched.
+
+**Before opening any new performance work, read gotchas 24, 26, 28 and the audit's "Settled — do not re-litigate" table.** Between them they refute the upload lead (twice), pipeline depth, double-buffered interop targets, per-source CUDA streams, `CompositeNode`'s bind-group caching, and the idea that the graph is the lever — each with a control rather than an argument.
 
 ## Style Notes
 

@@ -477,12 +477,129 @@ impl CompiledGraph {
     ///
     /// Exposed so a caller can report allocation behaviour it would otherwise have
     /// to guess at. The pool's cap has to cover a whole frame's simultaneous
-    /// resources — `execute` acquires them all before the first node and releases
-    /// them all after the last — so a non-zero `evicted` means every frame is
+    /// resources — `execute` acquires them all before the first node records and
+    /// releases them all after the last — so a non-zero `evicted` means every frame is
     /// dropping textures it will immediately re-allocate. At 4K that is 66 MB per
     /// texture per frame. See [`crate::render::resource::POOL_BUCKET_CAPACITY`].
     pub fn pool_stats(&self) -> crate::render::resource::PoolStats {
         self.texture_pool.lock().unwrap().stats()
+    }
+
+    /// **P2.2 — what per-resource lifetimes would buy, computed from this graph rather
+    /// than estimated.**
+    ///
+    /// `execute` acquires every declared resource before the first node records and
+    /// releases them all after the last, so a frame holds N same-key textures
+    /// simultaneously whether or not their live ranges overlap. The audit's P2.2 asks
+    /// whether tracking those ranges and letting non-overlapping resources SHARE a
+    /// texture is worth doing — and the honest way to answer that is to compute both
+    /// numbers off the compiled graph instead of writing the refactor and then
+    /// measuring.
+    ///
+    /// Returns `(held, ideal)` per bucket key, summed over keys:
+    /// * `held` — what the frame holds today: every created resource, at once. This is
+    ///   the number [`crate::render::resource::PoolStats::peak_bucket`] reports and
+    ///   [`crate::render::resource::POOL_BUCKET_CAPACITY`] has to cover.
+    /// * `ideal` — the maximum simultaneously LIVE at any point in the execution order,
+    ///   which is the floor a perfect aliasing scheme could reach. `held - ideal` is
+    ///   the whole prize, and if it is zero there is nothing for P2.2 to win.
+    ///
+    /// **A resource's live range is `[first write … last read]` inclusive, and the
+    /// inclusivity is the load-bearing part.** A node that reads A and writes B binds
+    /// both in one pass, so A and B cannot share a texture even though A is "dead
+    /// after" that node — wgpu would reject the bind group outright (one texture as
+    /// read-storage and write-storage at once), and a scheme that ignored this would
+    /// fail at the first frame rather than silently. Counting the live set as an
+    /// inclusive interval is therefore not conservatism; it is the constraint.
+    ///
+    /// **Imports are excluded**, because they are not the pool's to alias (gotcha 18):
+    /// the decoder owns that texture for longer than the frame.
+    ///
+    /// This is a static analysis of declared resources, not a measurement of GPU
+    /// behaviour — so it says what the SHAPE permits, and it is exact for that
+    /// question. Nothing here is an estimate of time.
+    pub fn lifetime_bounds(&self) -> (usize, usize) {
+        use std::collections::HashMap;
+
+        // Position of each node in the recorded order, keyed by its registered index.
+        let mut position = HashMap::with_capacity(self.order.len());
+        for (pos, &node_idx) in self.order.iter().enumerate() {
+            position.insert(node_idx, pos);
+        }
+
+        // Re-derive each resource's live range from the nodes' own declarations. Asking
+        // the nodes again rather than caching it at compile time keeps this analysis
+        // honest about the graph as it actually is: a node whose `declare_resources`
+        // changed would change this answer too.
+        let mut first_write: HashMap<ResourceId, usize> = HashMap::new();
+        let mut last_read: HashMap<ResourceId, usize> = HashMap::new();
+        let mut imported: std::collections::HashSet<ResourceId> =
+            self.imported_ids.iter().copied().collect();
+
+        for (&node_idx, &pos) in &position {
+            let mut builder = ResourceBuilder::new(0);
+            self.nodes[node_idx].declare_resources(&mut builder);
+            for (id, _) in &builder.creates {
+                let e = first_write.entry(*id).or_insert(pos);
+                *e = (*e).min(pos);
+            }
+            for (id, _) in &builder.writes {
+                let e = first_write.entry(*id).or_insert(pos);
+                *e = (*e).min(pos);
+            }
+            for (id, _) in &builder.reads {
+                let e = last_read.entry(*id).or_insert(pos);
+                *e = (*e).max(pos);
+            }
+            for (id, _) in &builder.imports {
+                imported.insert(*id);
+            }
+        }
+
+        // Group by the same key the pool buckets on: (format, usage, resolved size).
+        // Two resources of different keys never share a texture anyway, so a peak
+        // computed across keys would overstate what aliasing could save.
+        let mut by_key: HashMap<(wgpu::TextureFormat, wgpu::TextureUsages, u32, u32), Vec<(usize, usize)>> =
+            HashMap::new();
+        for (id_usize, desc_opt) in self.descriptors.iter().enumerate() {
+            let Some((desc, usage)) = desc_opt else { continue };
+            let id = ResourceId(id_usize as u32);
+            if imported.contains(&id) {
+                continue;
+            }
+            let (w, h) = match desc.size {
+                ResolutionSource::Canvas => (self.canvas_width, self.canvas_height),
+                ResolutionSource::Fixed(fw, fh) => (fw, fh),
+            };
+            let start = first_write.get(&id).copied().unwrap_or(0);
+            // A resource nobody reads is still written, so it is live for that one
+            // node — `FINAL_COLOR` on a graph with no readback is the ordinary case.
+            let end = last_read.get(&id).copied().unwrap_or(start).max(start);
+            by_key
+                .entry((desc.format, *usage, w, h))
+                .or_default()
+                .push((start, end));
+        }
+
+        let mut held = 0usize;
+        let mut ideal = 0usize;
+        for ranges in by_key.values() {
+            held += ranges.len();
+            // Sweep the positions and take the largest live set. A sweep rather than an
+            // interval-graph colouring because for one key the maximum clique of an
+            // interval graph IS its chromatic number — so this peak is exactly the
+            // number of textures a perfect scheme needs, not a bound on it.
+            let mut peak = 0usize;
+            for pos in 0..self.order.len() {
+                let live = ranges
+                    .iter()
+                    .filter(|(s, e)| *s <= pos && pos <= *e)
+                    .count();
+                peak = peak.max(live);
+            }
+            ideal += peak;
+        }
+        (held, ideal)
     }
 
     /// Resolve every declared resource for one frame: pooled textures acquired from
@@ -714,3 +831,206 @@ impl std::fmt::Display for GraphError {
 }
 
 impl std::error::Error for GraphError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::resource::{ResolutionSource, ResourceDescriptor, TextureAccess};
+
+    /// A node that creates one canvas-sized texture and optionally reads another.
+    ///
+    /// Deliberately minimal: [`CompiledGraph::lifetime_bounds`] is a question about
+    /// DECLARATIONS, so a test node that declares and records nothing exercises exactly
+    /// the code under test and needs no shaders, no pipelines and no GPU work.
+    struct Stage {
+        label: &'static str,
+        reads: Option<ResourceId>,
+        creates: ResourceId,
+    }
+
+    impl RenderNode for Stage {
+        fn name(&self) -> &str {
+            self.label
+        }
+
+        fn declare_resources(&self, builder: &mut ResourceBuilder) {
+            builder.creates.push((
+                self.creates,
+                ResourceDescriptor {
+                    label: Some(self.label.to_string()),
+                    size: ResolutionSource::Canvas,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                },
+            ));
+            builder.write(self.creates, TextureAccess::StorageWrite);
+            if let Some(id) = self.reads {
+                builder.read(id, TextureAccess::StorageRead);
+            }
+        }
+
+        fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
+    }
+
+    /// **P2.2's prize, on the two shapes that matter — and it is small.**
+    ///
+    /// Two constraints bound what aliasing can win, and both are measured here rather
+    /// than assumed:
+    ///
+    /// 1. **A node binds its input and its output in one pass**, so consecutive stages
+    ///    can never share a texture. On a chain of any length that puts the floor at
+    ///    two per bucket, not one — a reader expecting A→B→C→D to collapse to a single
+    ///    texture is expecting something wgpu would reject at the first bind group.
+    /// 2. **The pool buckets by (format, USAGE, size)**, so resources with different
+    ///    usage flags cannot alias each other however their lifetimes fall. The chain's
+    ///    last output is written and never read, so its usage is `STORAGE_BINDING`
+    ///    alone while every intermediate carries `TEXTURE_BINDING | STORAGE_BINDING` —
+    ///    a separate bucket, and a separate texture. That is why the chain's ideal is
+    ///    3 and not 2.
+    ///
+    /// The second shape is the Heavy graph's: four independent chains fanning into one
+    /// composite. There the composite reads all four ends in one pass, so those four
+    /// are simultaneous by construction and no scheme can reduce them.
+    ///
+    /// **This is why P2.2 is judged before it is written.** The prize is a VRAM figure
+    /// rather than a frame time — the pool already reuses textures across frames, so
+    /// aliasing within a frame buys residency, not allocations.
+    #[test]
+    fn lifetime_bounds_reports_what_aliasing_could_save() {
+        // ── A straight chain: A → B → C → D ────────────────────────────────────
+        let mut c = RenderGraphCompiler::new();
+        let a = ResourceId(2);
+        let b = ResourceId(3);
+        let d = ResourceId(4);
+        let e = ResourceId(5);
+        c.add_node(Box::new(Stage { label: "A", reads: None, creates: a }));
+        c.add_node(Box::new(Stage { label: "B", reads: Some(a), creates: b }));
+        c.add_node(Box::new(Stage { label: "C", reads: Some(b), creates: d }));
+        c.add_node(Box::new(Stage { label: "D", reads: Some(d), creates: e }));
+        let chain = c.compile(3840, 2160).expect("chain compiles");
+
+        let (held, ideal) = chain.lifetime_bounds();
+        assert_eq!(held, 4, "the graph holds every created texture for the frame");
+        assert_eq!(
+            ideal, 3,
+            "two for the read-and-written intermediates (a node binds its input and \
+             output together, so consecutive stages can never share) plus one for the \
+             write-only final output, which the pool buckets separately because its \
+             usage flags differ. An `ideal` of 1 or 2 would mean the analysis ignored \
+             one of those two constraints and the refactor it justified would fail wgpu \
+             validation on its first frame."
+        );
+
+        // ── The Heavy graph's shape: four chains into one composite ────────────
+        //
+        // The composite reads all four ends in one pass, so they ARE simultaneous and
+        // aliasing cannot touch them. What it can share is each chain's own
+        // intermediate.
+        let mut c = RenderGraphCompiler::new();
+        let mut ids = 2u32;
+        let mut ends = Vec::new();
+        for _ in 0..4 {
+            let src = ResourceId::next(&mut ids);
+            let mid = ResourceId::next(&mut ids);
+            let end = ResourceId::next(&mut ids);
+            c.add_node(Box::new(Stage { label: "Lsrc", reads: None, creates: src }));
+            c.add_node(Box::new(Stage { label: "Lmid", reads: Some(src), creates: mid }));
+            c.add_node(Box::new(Stage { label: "Lend", reads: Some(mid), creates: end }));
+            ends.push(end);
+        }
+        // The composite: reads all four ends, writes FINAL_COLOR.
+        struct Composite {
+            reads: Vec<ResourceId>,
+        }
+        impl RenderNode for Composite {
+            fn name(&self) -> &str {
+                "Composite"
+            }
+            fn declare_resources(&self, builder: &mut ResourceBuilder) {
+                builder.creates.push((
+                    ResourceId::FINAL_COLOR,
+                    ResourceDescriptor {
+                        label: Some("FinalColor".into()),
+                        size: ResolutionSource::Canvas,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                    },
+                ));
+                builder.write(ResourceId::FINAL_COLOR, TextureAccess::StorageWrite);
+                for id in &self.reads {
+                    builder.read(*id, TextureAccess::StorageRead);
+                }
+            }
+            fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
+        }
+        c.add_node(Box::new(Composite { reads: ends }));
+        let fan = c.compile(3840, 2160).expect("fan-in compiles");
+
+        let (held, ideal) = fan.lifetime_bounds();
+        assert_eq!(
+            held, 13,
+            "four layers x three textures, plus FINAL_COLOR, all held for the frame"
+        );
+        // 6 is arithmetic on the order Kahn's sort produces, not a fitted number: the
+        // four chains advance in lockstep (all four sources, then all four middles,
+        // then all four ends), so five of the twelve same-key textures are live at the
+        // busiest point — four at one stage plus the first of the next — and
+        // FINAL_COLOR's own bucket adds one.
+        assert_eq!(
+            ideal, 6,
+            "the composite reads four layer outputs in one pass, so those four are \
+             simultaneous by construction; with the four chains interleaved the live \
+             peak is five same-key textures plus FINAL_COLOR"
+        );
+        // The prize, stated as the thing P2.2 would be judged on. At 4K RGBA16Float
+        // that is 7 x 66.4 MB of residency, and no frame time.
+        assert_eq!(
+            held - ideal,
+            7,
+            "aliasing could remove {} of {held} textures on this shape",
+            held - ideal
+        );
+    }
+
+    /// An imported resource must not appear in either figure.
+    ///
+    /// Gotcha 18: the decoder owns that texture across frames, so it is not the pool's
+    /// to alias and counting it would inflate the prize P2.2 is judged on with memory
+    /// that cannot be reclaimed.
+    #[test]
+    fn lifetime_bounds_ignores_imports() {
+        struct Importer {
+            imports: ResourceId,
+            creates: ResourceId,
+        }
+        impl RenderNode for Importer {
+            fn name(&self) -> &str {
+                "Importer"
+            }
+            fn declare_resources(&self, builder: &mut ResourceBuilder) {
+                builder.creates.push((
+                    self.creates,
+                    ResourceDescriptor {
+                        label: Some("out".into()),
+                        size: ResolutionSource::Canvas,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                    },
+                ));
+                builder.write(self.creates, TextureAccess::StorageWrite);
+                builder.import(self.imports, TextureAccess::StorageRead);
+            }
+            fn record(&self, _e: &mut wgpu::CommandEncoder, _c: &RenderContext, _f: &FrameState) {}
+        }
+
+        let mut c = RenderGraphCompiler::new();
+        c.add_node(Box::new(Importer {
+            imports: ResourceId(2),
+            creates: ResourceId(3),
+        }));
+        let g = c.compile(1920, 1080).expect("import graph compiles");
+        let (held, ideal) = g.lifetime_bounds();
+        assert_eq!(
+            (held, ideal),
+            (1, 1),
+            "only the created texture counts; the import is the decoder's"
+        );
+    }
+}

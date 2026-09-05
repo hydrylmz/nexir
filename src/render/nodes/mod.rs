@@ -7,6 +7,9 @@ pub mod blit;
 pub mod color_correction;
 pub mod chroma_key;
 pub mod lut;
+/// Colour correction + LUT + chroma key in one pass — P2.3. See the module comment
+/// for what it saves and what it cannot.
+pub mod fused_grade;
 pub mod tonemap;
 pub mod gaussian_blur;
 pub mod sharpen;

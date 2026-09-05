@@ -462,6 +462,16 @@ impl Default for TransientTexturePool {
 /// [`PoolStats::peak_bucket`] is how the peak is re-read after a graph change — the
 /// bench prints it as `peak bucket N/CAP`, and `N == CAP` means the real peak is
 /// unknown and at least the cap.
+///
+/// **Re-read after P2.3, which is what gotcha 14 requires of a graph change.** Fusing
+/// colour correction + LUT + chroma key into one pass removes two canvas-sized
+/// intermediates per layer, so benchmarks 5/7/8 now report `peak bucket 8/32` with 0
+/// evicted (`target/p23_fused_3x.txt`) against `16/32` unfused
+/// (`target/p23_unfused_3x.txt`). The cap stays 32: **16 is still a shape the tree
+/// builds** — `NEXIR_FUSE_GRADE=0` is a supported arm and `EffectChainBuilder` emits
+/// the separate nodes for a clip whose effect list is not the fusable triple — and a
+/// cap is a ceiling, so lowering it to fit the cheaper shape would evict on the other
+/// one for no gain (an unreached bucket costs nothing, measured: `1/32` at 1080p).
 pub const POOL_BUCKET_CAPACITY: usize = 32;
 
 impl TransientTexturePool {

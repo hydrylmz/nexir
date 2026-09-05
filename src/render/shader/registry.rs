@@ -13,6 +13,13 @@ pub enum BuiltinShader {
     ColorCorrection,
     ChromaKey,
     Lut3D,
+    /// `ColorCorrection` + `Lut3D` + `ChromaKey` in one pass — P2.3.
+    ///
+    /// The three are KEPT alongside it rather than replaced: an effect chain that runs
+    /// only one or two of them (which `EffectChainBuilder` builds from a clip's own
+    /// effect list) has nothing to fuse, and `tests::fused_grade` compares the fused
+    /// output against the chain's, so the chain has to stay compilable.
+    FusedGrade,
     ToneMap,
     GaussianBlur,
     Sharpen,
@@ -35,6 +42,7 @@ impl ShaderRegistry {
             (BuiltinShader::ColorCorrection,  include_str!("color_correction.wgsl")),
             (BuiltinShader::ChromaKey,        include_str!("chroma_key.wgsl")),
             (BuiltinShader::Lut3D,            include_str!("lut.wgsl")),
+            (BuiltinShader::FusedGrade,       include_str!("fused_grade.wgsl")),
             (BuiltinShader::ToneMap,          include_str!("tonemap.wgsl")),
             (BuiltinShader::GaussianBlur,     include_str!("blur.wgsl")),
             (BuiltinShader::Sharpen,          include_str!("sharpen.wgsl")),
@@ -52,6 +60,7 @@ impl ShaderRegistry {
                 BuiltinShader::ColorCorrection => "color_correction_shader",
                 BuiltinShader::ChromaKey       => "chroma_key_shader",
                 BuiltinShader::Lut3D           => "lut_3d_shader",
+                BuiltinShader::FusedGrade      => "fused_grade_shader",
                 BuiltinShader::ToneMap         => "tonemap_shader",
                 BuiltinShader::GaussianBlur     => "gaussian_blur_shader",
                 BuiltinShader::Sharpen          => "sharpen_shader",

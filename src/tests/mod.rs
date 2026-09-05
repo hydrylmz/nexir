@@ -25,6 +25,9 @@ pub mod abgr10_repack;
 pub mod nv12_encode;
 pub mod shared_buffer;
 pub mod export_validation;
+/// P2.3 — the fused colour-correction/LUT/chroma-key pass against the three nodes it
+/// replaces. Needs a GPU and nothing else: no CUDA, no NVENC, no files.
+pub mod fused_grade;
 
 /// Serialises every test that puts the CUDA primary context current.
 ///

@@ -58,6 +58,7 @@ use nexir::render::nodes::chroma_key::ChromaKeyNode;
 use nexir::render::nodes::color_correction::{ColorCorrectionNode, ColorCorrectionParams};
 use nexir::render::nodes::composite::CompositeNode;
 use nexir::render::nodes::lut::LutNode;
+use nexir::render::nodes::fused_grade::{FusedGradeNode, FusedGradeParams};
 use nexir::render::nodes::tonemap::{
     GamutConversion, InputTransferFn, ToneMapMode, ToneMapNode, ToneMapPushConstants,
 };
@@ -266,6 +267,110 @@ fn identity_lut(n: u32) -> Lut3D {
         domain_min: [0.0, 0.0, 0.0],
         domain_max: [1.0, 1.0, 1.0],
     }
+}
+
+/// Whether the graph fuses colour correction + LUT + chroma key into one pass —
+/// **P2.3, and the switch is what makes it a measurement rather than a git checkout.**
+///
+/// One [`FusedGradeNode`] where the Heavy chain otherwise emits `ColorCorrection` →
+/// `Lut3D` → `ChromaKey`. `NEXIR_FUSE_GRADE=0` takes the unfused arm, from the same
+/// binary on the same fixtures — one argument different, the discipline
+/// `NEXIR_UPLOAD_PATH` and `--interop`'s two arms already follow.
+///
+/// **ON by default, because the win is measured on BOTH content sets and neither is
+/// the compressible one.** Gotcha 27's rule is that a bandwidth saving must be checked
+/// against real and low-entropy content, since the latter makes the graph ~20% cheaper
+/// with no code change and would flatter exactly this kind of optimisation. Medians of
+/// 3, `target/p23_unfused_3x.txt` vs `target/p23_fused_3x.txt` (repo fixtures) and
+/// `target/p23_bars_*_3x.txt` (the `nexir_media_bars` control):
+///
+/// | row | graph TOTAL unfused → fused | FPS |
+/// |---|---|---|
+/// | 5 — synthetic 4K60 | 6.783 → 4.814 ms (−29%) | 57.5 → 67.1 |
+/// | 7 — real media, interop | 7.387 → 4.682 ms (−37%) | 27.8 → 28.6 |
+/// | 8 — real media, CPU upload | same graph | 18.9 → 21.9 |
+/// | 7 — bars control | 5.881 → 3.867 ms (−34%) | 45.0 → 47.6 |
+///
+/// The three passes' 0.861 ms/pass become one at 0.367, and `peak bucket` falls 16/32
+/// → 8/32 with 0 evicted — the re-read gotcha 14 requires after a graph change, and a
+/// reduction rather than a risk. **It does NOT close the 4K60 gate and is not claimed
+/// to**: benchmark 7 still prints `ALTERNATING` (12.9 / 52.4 ms), which fails the target
+/// on its own, and Task I's floor puts the four-source decode at 32.0 ms against a
+/// 16.67 ms frame.
+fn fuse_grade() -> bool {
+    std::env::var("NEXIR_FUSE_GRADE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
+}
+
+/// The Heavy chain's per-layer grade, built either fused or as three nodes.
+///
+/// **One function so the two graph builders cannot drift.** Benchmark 5 (synthetic) and
+/// benchmark 7/8 (real media) exist to be compared with each other, and their whole
+/// claim is that the graph is identical and only the decode path differs — so a fusion
+/// applied to one and not the other would silently make every 5-vs-7 comparison a mix
+/// of two changes. Both call this.
+///
+/// Returns the `ResourceId` the composite should read. The unfused arm allocates the
+/// two intermediates it needs from `id_counter`; the fused arm allocates ONE, which is
+/// the saving (`tests::fused_grade::fusing_removes_two_intermediates_per_layer` pins
+/// that it is two canvas-sized textures per layer, i.e. what `peak bucket` reports).
+///
+/// **The id counter therefore advances by a different amount on the two arms**, which is
+/// fine for both callers — neither derives a later id arithmetically — but it is why
+/// `FrameScheduler::interop_id_counter_start`'s reservation must stay BELOW the
+/// counter's start rather than being computed as an offset into it.
+#[allow(clippy::too_many_arguments)]
+fn add_grade_chain(
+    device: &GpuDevice,
+    shaders: &ShaderRegistry,
+    compute: &ComputePipelineCache,
+    compiler: &mut RenderGraphCompiler,
+    id_counter: &mut u32,
+    lut: &Lut3D,
+    in_rgba: ResourceId,
+    width: u32,
+    height: u32,
+) -> ResourceId {
+    let cc = ColorCorrectionParams::identity(width, height);
+    let key = nexir::render::nodes::chroma_key::ChromaKeyParams::green_screen(width, height);
+
+    if fuse_grade() {
+        let out = ResourceId::next(id_counter);
+        compiler.add_node(Box::new(FusedGradeNode::new(
+            device,
+            shaders,
+            compute,
+            lut,
+            in_rgba,
+            out,
+            // The same three parameter structs the unfused arm passes, through the one
+            // constructor that translates them — so the two arms cannot differ in what
+            // grade they apply, only in how many passes apply it.
+            FusedGradeParams::from_parts(cc, 1.0, key),
+        )));
+        return out;
+    }
+
+    let cc_id = ResourceId::next(id_counter);
+    let lut_id = ResourceId::next(id_counter);
+    let key_id = ResourceId::next(id_counter);
+
+    compiler.add_node(Box::new(ColorCorrectionNode::new(
+        device, shaders, compute, in_rgba, cc_id, cc,
+    )));
+
+    // `LutNode::new` only sees the cube, so the frame size must be set explicitly —
+    // gotcha 10. Omitting it asks wgpu for a zero-sized texture and fails with
+    // `Dimension X is zero`, naming neither the node nor the missing call.
+    let mut lut_node = LutNode::new(device, shaders, compute, lut, cc_id, lut_id, 1.0);
+    lut_node.set_size(width, height);
+    compiler.add_node(Box::new(lut_node));
+
+    compiler.add_node(Box::new(ChromaKeyNode::new(
+        device, shaders, compute, lut_id, key_id, key,
+    )));
+    key_id
 }
 
 /// Why a benchmark could not run, for honest reporting instead of a zero row.
@@ -766,6 +871,41 @@ fn print_pool_stats(pool: nexir::render::resource::PoolStats) {
     }
 }
 
+/// **P2.2 — what per-resource texture lifetimes could save on THIS graph.**
+///
+/// Printed beside the pool stats because the two answer the same question from
+/// opposite ends: `peak bucket N/CAP` is what the frame holds, and this is what it
+/// would have to hold if non-overlapping resources shared textures.
+/// [`CompiledGraph::lifetime_bounds`] computes both off the compiled graph's own
+/// declarations, so the figure is exact for the shape rather than an estimate — and if
+/// `save` is 0 there is nothing for P2.2 to win on this row and the task can be closed
+/// on evidence instead of attempted.
+///
+/// **It is a VRAM figure, not a frame time, and the line says so.** The pool already
+/// reuses textures across frames (0.5-0.8% miss rate, 0 evicted), so aliasing within a
+/// frame removes residency rather than allocations: nothing in the frame's recording
+/// gets shorter. Quoting it as a speed-up would be the mistake gotcha 9 exists to
+/// prevent.
+fn print_lifetime_bounds(graph: &nexir::render::graph::CompiledGraph, canvas_w: u32, canvas_h: u32) {
+    let (held, ideal) = graph.lifetime_bounds();
+    let save = held.saturating_sub(ideal);
+    // One canvas-sized RGBA16Float texture, which is what the Heavy graph's buckets
+    // hold. Counted from the geometry rather than hardcoded, and labelled a lower bound
+    // for the same reason `allocated_gpu_bytes` is: it counts the resources the graph
+    // declares and knows nothing about driver-side padding.
+    let per_texture = canvas_w as u64 * canvas_h as u64 * 8;
+    println!(
+        "    Lifetimes: holds {held} texture(s) simultaneously; {ideal} would suffice if \
+         non-overlapping\n    resources shared one (P2.2's ceiling) — {save} fewer, \
+         {:.1} MB of 4K residency (lower bound).",
+        save as f64 * per_texture as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "    That is VRAM, NOT frame time: the pool already reuses across frames, so \
+         aliasing\n    inside a frame changes residency and not the recording."
+    );
+}
+
 /// Open the NVENC session a config asks for, BEFORE any timing starts.
 ///
 /// Shared by the synthetic sweep and the real-media rows, for the same reason
@@ -992,9 +1132,6 @@ fn run_synthetic_benchmark(
 
             for i in 0..layer_count {
                 let rgb_id = ResourceId::next(&mut id_counter);
-                let cc_id = ResourceId::next(&mut id_counter);
-                let lut_id = ResourceId::next(&mut id_counter);
-                let key_id = ResourceId::next(&mut id_counter);
 
                 let planes = planes_for_source(
                     device,
@@ -1020,43 +1157,23 @@ fn run_synthetic_benchmark(
                     true,
                 )));
 
-                compiler.add_node(Box::new(ColorCorrectionNode::new(
+                // Colour correction → LUT → chroma key, or one fused pass — see
+                // `add_grade_chain` and `NEXIR_FUSE_GRADE`. Shared with benchmark
+                // 7/8's builder so the two graphs cannot differ in anything but the
+                // decode path.
+                let graded = add_grade_chain(
                     device,
                     &shaders,
                     &compute,
-                    rgb_id,
-                    cc_id,
-                    ColorCorrectionParams::identity(config.canvas_w, config.canvas_h),
-                )));
-
-                // `LutNode::new` only sees the LUT cube, so the frame size must be
-                // set explicitly. Omitting it is why benchmark 5 used to abort with
-                // wgpu's `Dimension X is zero` before printing anything.
-                let mut lut_node = LutNode::new(
-                    device,
-                    &shaders,
-                    &compute,
+                    &mut compiler,
+                    &mut id_counter,
                     &identity_lut,
-                    cc_id,
-                    lut_id,
-                    1.0,
+                    rgb_id,
+                    config.canvas_w,
+                    config.canvas_h,
                 );
-                lut_node.set_size(config.canvas_w, config.canvas_h);
-                compiler.add_node(Box::new(lut_node));
 
-                compiler.add_node(Box::new(ChromaKeyNode::new(
-                    device,
-                    &shaders,
-                    &compute,
-                    lut_id,
-                    key_id,
-                    nexir::render::nodes::chroma_key::ChromaKeyParams::green_screen(
-                        config.canvas_w,
-                        config.canvas_h,
-                    ),
-                )));
-
-                final_composite_inputs.push(key_id);
+                final_composite_inputs.push(graded);
             }
 
             let pre_tonemap_id = ResourceId::next(&mut id_counter);
@@ -1638,6 +1755,9 @@ fn run_synthetic_benchmark(
     // ran: the pool is per-graph and its high-water mark is what gotcha 14's cap
     // is read off, so it must cover every frame this graph executed.
     print_pool_stats(graph.pool_stats());
+    // ...and what per-resource lifetimes could reduce it to — P2.2's ceiling, off this
+    // graph's own declarations rather than estimated. VRAM, not frame time.
+    print_lifetime_bounds(&graph, config.canvas_w, config.canvas_h);
 
     // NVML, read once here rather than per frame: the driver samples utilisation
     // over its own window (200 ms on this card, per nvchk/nvml_probe.c), so polling
@@ -2305,6 +2425,10 @@ fn run_real_media_benchmark(
         .as_ref()
         .map(|g| g.graph.pool_stats())
         .unwrap_or_default();
+    // P2.2's ceiling on the real-media graph shape, taken from the same cached graph
+    // and for the same reason: the sample pass below compiles a different one (with the
+    // readback node), whose lifetimes are not this row's.
+    let lifetimes = cached.as_ref().map(|g| g.graph.lifetime_bounds());
 
     // One sampled frame, decoded FORWARD from where the measured loop stopped and
     // outside the timed span. Forward rather than re-visiting, for
@@ -2338,6 +2462,23 @@ fn run_real_media_benchmark(
     }
 
     print_pool_stats(pool);
+    // Printed from the `(held, ideal)` pair taken above rather than by re-reading the
+    // graph, which by now is the sample pass's. `n/a` when no graph was ever cached,
+    // because a row that rendered nothing has no shape to analyse — never a zero.
+    match lifetimes {
+        Some((held, ideal)) => {
+            let save = held.saturating_sub(ideal);
+            let per_texture = config.canvas_w as u64 * config.canvas_h as u64 * 8;
+            println!(
+                "    Lifetimes: holds {held} texture(s) simultaneously; {ideal} would \
+                 suffice if non-overlapping\n    resources shared one (P2.2's ceiling) \
+                 — {save} fewer, {:.1} MB of residency (lower bound). VRAM, not frame \
+                 time.",
+                save as f64 * per_texture as f64 / (1024.0 * 1024.0)
+            );
+        }
+        None => println!("    Lifetimes: n/a (no graph was compiled for this row)"),
+    }
 
     let gpu = nexir::profiling::ffi::nvml::read_device_0().unwrap_or_default();
     session.update_system_metrics(SystemMetrics {
@@ -4697,44 +4838,21 @@ fn build_interop_graph(
 
         // The per-layer effect chain, at the CLIP's own dimensions because that is
         // what `rgba_id` was created at. Benchmark 5's order exactly: colour
-        // correction, then LUT, then chroma key.
+        // correction, then LUT, then chroma key — through the SAME `add_grade_chain`
+        // the synthetic builder calls, so `NEXIR_FUSE_GRADE` cannot apply to one row
+        // and not the other and make 5-vs-7 a mix of two changes.
         let composite_input = match (&lut, chain) {
-            (Some(cube), GraphChain::Heavy) => {
-                let cc_id = ResourceId::next(&mut id_counter);
-                let lut_id = ResourceId::next(&mut id_counter);
-                let key_id = ResourceId::next(&mut id_counter);
-
-                compiler.add_node(Box::new(ColorCorrectionNode::new(
-                    device,
-                    shaders,
-                    compute,
-                    rgba_id,
-                    cc_id,
-                    ColorCorrectionParams::identity(clip.clip_width, clip.clip_height),
-                )));
-
-                // `LutNode::new` only sees the cube, so the frame size must be set
-                // explicitly — gotcha 10. Omitting it asks wgpu for a zero-sized
-                // texture and fails with `Dimension X is zero`, naming neither the
-                // node nor the missing call.
-                let mut lut_node =
-                    LutNode::new(device, shaders, compute, cube, cc_id, lut_id, 1.0);
-                lut_node.set_size(clip.clip_width, clip.clip_height);
-                compiler.add_node(Box::new(lut_node));
-
-                compiler.add_node(Box::new(ChromaKeyNode::new(
-                    device,
-                    shaders,
-                    compute,
-                    lut_id,
-                    key_id,
-                    nexir::render::nodes::chroma_key::ChromaKeyParams::green_screen(
-                        clip.clip_width,
-                        clip.clip_height,
-                    ),
-                )));
-                key_id
-            }
+            (Some(cube), GraphChain::Heavy) => add_grade_chain(
+                device,
+                shaders,
+                compute,
+                &mut compiler,
+                &mut id_counter,
+                cube,
+                rgba_id,
+                clip.clip_width,
+                clip.clip_height,
+            ),
             _ => rgba_id,
         };
         composite.input_textures.push(composite_input);
@@ -6703,6 +6821,18 @@ fn main() {
         "\nEvery figure below is timed or counted. Anything this process does not \
          measure\nprints as n/a rather than as an estimate.\n"
     );
+    // The grade path, printed in the banner for the same reason the upload mechanism
+    // is: a figure whose graph shape is invisible cannot be compared with another
+    // run's. `NEXIR_FUSE_GRADE=0` is how every pre-P2.3 number is reproduced.
+    println!(
+        "Grade path   : {} (NEXIR_FUSE_GRADE=0 for the three separate passes)",
+        if fuse_grade() {
+            "FUSED — colour correction + LUT + chroma key in one compute pass"
+        } else {
+            "UNFUSED — ColorCorrection -> Lut3D -> ChromaKey, three passes"
+        }
+    );
+    println!();
     if node_timing_frames().is_some() {
         println!(
             "NEXIR_NODE_TIMINGS is set: each benchmark prints per-node GPU timings from \
