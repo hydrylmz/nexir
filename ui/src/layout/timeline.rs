@@ -269,6 +269,8 @@ pub fn draw(
     enum TrackMutation {
         ToggleMute(TrackId),
         ToggleSolo(TrackId),
+        SetGain(TrackId, f32),
+        RecordHistory,
         AddVideoTrack,
         AddAudioTrack,
     }
@@ -366,7 +368,7 @@ pub fn draw(
 
     ui.separator();
 
-    const GUTTER_W: f32 = 110.0;
+    const GUTTER_W: f32 = 145.0;
     const RULER_H: f32 = 20.0;
     const CLIP_H_PAD: f32 = 4.0;
 
@@ -550,6 +552,25 @@ pub fn draw(
                 let stripe = Rect::from_min_size(gutter.min, Vec2::new(3.0, track_h));
                 ui.painter().rect_filled(stripe, 0.0, stripe_color);
 
+                let has_audio = matches!(track.kind, TrackKind::Audio { .. } | TrackKind::Video);
+
+                // Track name and controls position based on whether fader is present
+                let (name_pos, m_rect, s_rect) = if has_audio {
+                    let top_y = if track_h >= 70.0 { 18.0 } else { 14.0 };
+                    let btn_y = if track_h >= 70.0 { 10.0 } else { 6.0 };
+                    (
+                        gutter.min + egui::vec2(10.0, top_y),
+                        Rect::from_min_size(gutter.min + egui::vec2(GUTTER_W - 44.0, btn_y), Vec2::splat(16.0)),
+                        Rect::from_min_size(gutter.min + egui::vec2(GUTTER_W - 24.0, btn_y), Vec2::splat(16.0)),
+                    )
+                } else {
+                    (
+                        gutter.min + egui::vec2(10.0, track_h * 0.5),
+                        Rect::from_min_size(gutter.min + egui::vec2(GUTTER_W - 44.0, (track_h - 16.0) * 0.5), Vec2::splat(16.0)),
+                        Rect::from_min_size(gutter.min + egui::vec2(GUTTER_W - 24.0, (track_h - 16.0) * 0.5), Vec2::splat(16.0)),
+                    )
+                };
+
                 // Track name
                 let label_color = if is_active {
                     Color32::WHITE
@@ -557,18 +578,14 @@ pub fn draw(
                     Color32::DARK_GRAY
                 };
                 ui.painter().text(
-                    gutter.min + egui::vec2(10.0, track_h * 0.5),
+                    name_pos,
                     Align2::LEFT_CENTER,
                     &track.name,
-                    egui::FontId::proportional(12.0),
+                    egui::FontId::proportional(11.5),
                     label_color,
                 );
 
                 // Mute / Solo buttons — interactive
-                let m_rect = Rect::from_min_size(
-                    gutter.min + egui::vec2(GUTTER_W - 46.0, (track_h - 16.0) * 0.5),
-                    Vec2::splat(16.0),
-                );
                 let m_resp = ui.interact(m_rect, egui::Id::new(("mute", track.id)), Sense::click());
                 let m_color = if track.mute {
                     Color32::YELLOW
@@ -594,10 +611,6 @@ pub fn draw(
                     "Mute track"
                 });
 
-                let s_rect = Rect::from_min_size(
-                    gutter.min + egui::vec2(GUTTER_W - 26.0, (track_h - 16.0) * 0.5),
-                    Vec2::splat(16.0),
-                );
                 let s_resp = ui.interact(s_rect, egui::Id::new(("solo", track.id)), Sense::click());
                 let s_color = if track.solo {
                     Color32::from_rgb(255, 160, 0)
@@ -622,6 +635,137 @@ pub fn draw(
                 } else {
                     "Solo track"
                 });
+
+                // Fader Slider for audio tracks
+                if has_audio {
+                    let fader_y = if track_h >= 70.0 { 50.0 } else { 38.0 };
+                    let vol_icon = if track.mute || track.gain <= 0.001 {
+                        "🔇"
+                    } else if track.gain > 1.0 {
+                        "🔊"
+                    } else {
+                        "🔈"
+                    };
+                    ui.painter().text(
+                        gutter.min + egui::vec2(10.0, fader_y),
+                        Align2::LEFT_CENTER,
+                        vol_icon,
+                        egui::FontId::proportional(10.0),
+                        Color32::LIGHT_GRAY,
+                    );
+
+                    let pct_text = format!("{:.0}%", track.gain * 100.0);
+                    let pct_color = if (track.gain - 1.0).abs() < 0.01 {
+                        Color32::from_rgb(150, 150, 150)
+                    } else if track.gain > 1.0 {
+                        Color32::from_rgb(255, 180, 50)
+                    } else {
+                        Color32::from_rgb(0, 200, 255)
+                    };
+                    ui.painter().text(
+                        gutter.min + egui::vec2(GUTTER_W - 6.0, fader_y),
+                        Align2::RIGHT_CENTER,
+                        pct_text,
+                        egui::FontId::proportional(9.0),
+                        pct_color,
+                    );
+
+                    let bar_min_x = gutter.min.x + 24.0;
+                    let bar_max_x = gutter.min.x + GUTTER_W - 38.0;
+                    let bar_w = (bar_max_x - bar_min_x).max(10.0);
+                    let fader_bar_rect = Rect::from_min_size(
+                        egui::pos2(bar_min_x, gutter.min.y + fader_y - 2.5),
+                        Vec2::new(bar_w, 5.0),
+                    );
+                    let fader_hit_rect = Rect::from_min_size(
+                        egui::pos2(bar_min_x - 4.0, gutter.min.y + fader_y - 10.0),
+                        Vec2::new(bar_w + 8.0, 20.0),
+                    );
+
+                    let fader_id = egui::Id::new(("track_fader", track.id));
+                    let fader_resp = ui.interact(fader_hit_rect, fader_id, Sense::click_and_drag());
+
+                    if fader_resp.hovered() || fader_resp.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+
+                    if fader_resp.drag_started() {
+                        pending_track_mutations.push(TrackMutation::RecordHistory);
+                    }
+
+                    if fader_resp.dragged() || fader_resp.clicked() {
+                        if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                            let norm = ((pos.x - bar_min_x) / bar_w).clamp(0.0, 1.0);
+                            let new_gain = (norm * 2.0 * 100.0).round() / 100.0;
+                            pending_track_mutations.push(TrackMutation::SetGain(track.id, new_gain));
+                        }
+                    }
+
+                    if fader_resp.double_clicked() {
+                        pending_track_mutations.push(TrackMutation::RecordHistory);
+                        pending_track_mutations.push(TrackMutation::SetGain(track.id, 1.0));
+                    }
+
+                    let db_str = if track.gain <= 0.0001 {
+                        "-∞ dB".to_string()
+                    } else {
+                        format!("{:+.1} dB", 20.0 * track.gain.log10())
+                    };
+                    let fader_resp = fader_resp.on_hover_text(format!(
+                        "Track Volume: {:.0}% ({})\nDrag to adjust, double-click to reset (100% / 0 dB)",
+                        track.gain * 100.0,
+                        db_str
+                    ));
+
+                    // Paint fader track groove
+                    ui.painter().rect_filled(fader_bar_rect, 2.5, Color32::from_rgb(18, 18, 18));
+                    ui.painter().rect_stroke(
+                        fader_bar_rect,
+                        2.5,
+                        egui::Stroke::new(1.0, Color32::from_rgb(45, 45, 45)),
+                    );
+
+                    // Center unity tick (100% / 0 dB at norm = 0.5)
+                    let center_x = bar_min_x + bar_w * 0.5;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(center_x, fader_bar_rect.min.y - 1.5),
+                            egui::pos2(center_x, fader_bar_rect.max.y + 1.5),
+                        ],
+                        egui::Stroke::new(1.0, Color32::from_rgb(85, 85, 85)),
+                    );
+
+                    // Active fill
+                    let current_norm = (track.gain / 2.0).clamp(0.0, 1.0);
+                    let fill_w = bar_w * current_norm;
+                    let fill_rect = Rect::from_min_size(fader_bar_rect.min, Vec2::new(fill_w, fader_bar_rect.height()));
+                    let fill_color = if track.mute {
+                        Color32::from_rgb(70, 70, 70)
+                    } else if current_norm > 0.5 {
+                        Color32::from_rgb(0, 180, 220)
+                    } else {
+                        Color32::from_rgb(40, 160, 90)
+                    };
+                    ui.painter().rect_filled(fill_rect, 2.5, fill_color);
+
+                    // Thumb / Knob
+                    let thumb_x = bar_min_x + fill_w;
+                    let thumb_rect = Rect::from_center_size(
+                        egui::pos2(thumb_x, fader_bar_rect.center().y),
+                        Vec2::new(6.0, 12.0),
+                    );
+                    let thumb_color = if fader_resp.dragged() || fader_resp.hovered() {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_rgb(200, 200, 200)
+                    };
+                    ui.painter().rect_filled(thumb_rect, 1.5, thumb_color);
+                    ui.painter().rect_stroke(
+                        thumb_rect,
+                        1.5,
+                        egui::Stroke::new(1.0, Color32::from_rgb(20, 20, 20)),
+                    );
+                }
 
                 // Lane background
                 let lane = Rect::from_min_size(
@@ -1024,6 +1168,31 @@ pub fn draw(
                             clip_text_color,
                         );
                     }
+
+                    // ── Keyframe Diamonds on Clip ─────────────────────────
+                    if !is_being_dragged && !is_being_resized {
+                        for track in project.clips.keyframes().tracks_for_clip(clip_id) {
+                            for key in &track.keys {
+                                let key_frame = project.pts_to_frame(key.pts);
+                                if key_frame >= frame_in && key_frame <= frame_out {
+                                    let kf_x = clip_rect.min.x + (key_frame - frame_in) as f32 * state.zoom;
+                                    let kf_center = egui::pos2(kf_x, clip_rect.bottom() - 6.0);
+                                    let diamond_size = 4.0;
+                                    let points = [
+                                        egui::pos2(kf_center.x, kf_center.y - diamond_size),
+                                        egui::pos2(kf_center.x + diamond_size, kf_center.y),
+                                        egui::pos2(kf_center.x, kf_center.y + diamond_size),
+                                        egui::pos2(kf_center.x - diamond_size, kf_center.y),
+                                    ];
+                                    ui.painter().add(egui::Shape::convex_polygon(
+                                        points.to_vec(),
+                                        Color32::from_rgb(0, 220, 255),
+                                        egui::Stroke::new(1.0, Color32::from_rgb(20, 20, 20)),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 } // end clips loop
 
                 // Deselect on empty lane click
@@ -1086,6 +1255,14 @@ pub fn draw(
                         if let Some(track) = project.tracks.get_mut(id) {
                             track.solo = !track.solo;
                         }
+                    }
+                    TrackMutation::SetGain(id, gain) => {
+                        if let Some(track) = project.tracks.get_mut(id) {
+                            track.gain = gain;
+                        }
+                    }
+                    TrackMutation::RecordHistory => {
+                        history.record(project);
                     }
                     TrackMutation::AddVideoTrack => {
                         history.record(project);

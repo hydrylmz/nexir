@@ -1,7 +1,10 @@
 use crate::history::HistoryState;
 use egui::{Color32, RichText, Ui};
 use nexir::project::Project;
+use nexir::timeline::ids::ClipId;
+use nexir::timeline::keyframe::{AnimParam, InterpMode};
 use nexir::timeline::transform::{BlendMode, CropRect};
+use crate::layout::keyframe_editor::keyframe_toggle_button;
 
 pub struct InspectorState {
     // Local edit copies — written back to the project on change
@@ -61,6 +64,8 @@ pub struct InspectorState {
     pub chroma_key_color: [f32; 3],
     pub chroma_key_tolerance: f32,
     pub chroma_key_softness: f32,
+    pub chroma_key_min_saturation: f32,
+    pub chroma_key_spill_suppress: f32,
 
     /// When true, the next viewport click picks a color for chroma key.
     pub eyedropper_active: bool,
@@ -117,6 +122,8 @@ impl Default for InspectorState {
             chroma_key_color: [0.0, 1.0, 0.0],
             chroma_key_tolerance: 0.3,
             chroma_key_softness: 0.1,
+            chroma_key_min_saturation: 0.08,
+            chroma_key_spill_suppress: 0.3,
             eyedropper_active: false,
             last_loaded_clip: None,
         }
@@ -129,6 +136,7 @@ pub fn draw(
     project: &mut Project,
     selected_clip: Option<usize>,
     history: &mut HistoryState,
+    playhead_pts: i64,
 ) {
     ui.heading(RichText::new("Inspector").color(Color32::WHITE));
     ui.separator();
@@ -138,7 +146,7 @@ pub fn draw(
     egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
         .show(ui, |ui| {
-            draw_inner(ui, state, project, selected_clip, history);
+            draw_inner(ui, state, project, selected_clip, history, playhead_pts);
         });
 }
 
@@ -148,6 +156,7 @@ fn draw_inner(
     project: &mut Project,
     selected_clip: Option<usize>,
     history: &mut HistoryState,
+    playhead_pts: i64,
 ) {
     // ── Sync local state when selection changes ──────────────────────────
     if selected_clip != state.last_loaded_clip {
@@ -192,6 +201,8 @@ fn draw_inner(
             state.chroma_key_color = eff.chroma_key_color;
             state.chroma_key_tolerance = eff.chroma_key_tolerance;
             state.chroma_key_softness = eff.chroma_key_softness;
+            state.chroma_key_min_saturation = eff.chroma_key_min_saturation;
+            state.chroma_key_spill_suppress = eff.chroma_key_spill_suppress;
 
             // Load text clip properties
             match project.clips.kind_at(idx) {
@@ -226,6 +237,44 @@ fn draw_inner(
             *state = InspectorState::default();
         }
         state.last_loaded_clip = selected_clip;
+    }
+
+    // Sync external effect changes (e.g. from timeline drag) and evaluated keyframe values at the current playhead
+    if let Some(idx) = selected_clip {
+        let eff = project.clips.effects_at(idx);
+        state.color_enabled = eff.color_enabled;
+        state.blur_enabled = eff.blur_enabled;
+        state.sharpen_enabled = eff.sharpen_enabled;
+        state.vignette_enabled = eff.vignette_enabled;
+        state.chroma_key_enabled = eff.chroma_key_enabled;
+
+        let clip_id = project.clips.clip_id_at(idx);
+        let kf = project.clips.keyframes();
+        if let Some(v) = kf.eval(clip_id, AnimParam::Scale, playhead_pts) { state.scale = v; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::PositionX, playhead_pts) { state.pos_x = v; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::PositionY, playhead_pts) { state.pos_y = v; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::Rotation, playhead_pts) { state.rotation = v.to_degrees(); }
+        if let Some(v) = kf.eval(clip_id, AnimParam::Opacity, playhead_pts) { state.opacity = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::CropLeft, playhead_pts) { state.crop_left = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::CropTop, playhead_pts) { state.crop_top = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::CropRight, playhead_pts) { state.crop_right = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::CropBottom, playhead_pts) { state.crop_bottom = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::CropFeather, playhead_pts) { state.crop_feather = v; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::Brightness, playhead_pts) { state.brightness = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::Contrast, playhead_pts) { state.contrast = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::Saturation, playhead_pts) { state.saturation = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::HueShift, playhead_pts) { state.hue = v; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::BlurRadius, playhead_pts) { state.blur_radius = v; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::BlurSigma, playhead_pts) { state.blur_sigma = v; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::SharpenAmount, playhead_pts) { state.sharpen_amount = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::VignetteIntensity, playhead_pts) { state.vignette_intensity = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::VignetteRadius, playhead_pts) { state.vignette_radius = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::VignetteSoftness, playhead_pts) { state.vignette_softness = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::VignetteRoundness, playhead_pts) { state.vignette_roundness = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::ChromaKeyTolerance, playhead_pts) { state.chroma_key_tolerance = v; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::ChromaKeySoftness, playhead_pts) { state.chroma_key_softness = v; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::Volume, playhead_pts) { state.volume = v * 100.0; }
+        if let Some(v) = kf.eval(clip_id, AnimParam::Pan, playhead_pts) { state.pan = v * 100.0; }
     }
 
     match selected_clip {
@@ -274,6 +323,7 @@ fn draw_inner(
 
         Some(idx) => {
             // ── Clip selected — show real editable properties ────────────
+            let clip_id = project.clips.clip_id_at(idx);
             let source_id = project.clips.source_id_at(idx);
             let clip_name = {
                 let sources = project.sources.read().unwrap();
@@ -402,34 +452,74 @@ fn draw_inner(
                     .num_columns(2)
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label("Scale");
-                        transform_changed |= ui
-                            .add(egui::Slider::new(&mut state.scale, 0.1..=5.0).suffix("x"))
-                            .changed();
+                        ui.horizontal(|ui| {
+                            transform_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::Scale, playhead_pts, state.scale, history);
+                            ui.label("Scale");
+                        });
+                        let scale_resp = ui.add(egui::Slider::new(&mut state.scale, 0.1..=5.0).suffix("x"));
+                        if scale_resp.changed() {
+                            transform_changed = true;
+                            if project.clips.keyframes().has_keyframes(clip_id, AnimParam::Scale) {
+                                history.record(project);
+                                project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::Scale, playhead_pts, state.scale, InterpMode::Linear);
+                            }
+                        }
                         ui.end_row();
 
-                        ui.label("Position X");
-                        transform_changed |= ui
-                            .add(egui::Slider::new(&mut state.pos_x, -(project.settings.width as f32)..=(project.settings.width as f32)).suffix("px"))
-                            .changed();
+                        ui.horizontal(|ui| {
+                            transform_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::PositionX, playhead_pts, state.pos_x, history);
+                            ui.label("Position X");
+                        });
+                        let px_resp = ui.add(egui::Slider::new(&mut state.pos_x, -(project.settings.width as f32)..=(project.settings.width as f32)).suffix("px"));
+                        if px_resp.changed() {
+                            transform_changed = true;
+                            if project.clips.keyframes().has_keyframes(clip_id, AnimParam::PositionX) {
+                                history.record(project);
+                                project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::PositionX, playhead_pts, state.pos_x, InterpMode::Linear);
+                            }
+                        }
                         ui.end_row();
 
-                        ui.label("Position Y");
-                        transform_changed |= ui
-                            .add(egui::Slider::new(&mut state.pos_y, -(project.settings.height as f32)..=(project.settings.height as f32)).suffix("px"))
-                            .changed();
+                        ui.horizontal(|ui| {
+                            transform_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::PositionY, playhead_pts, state.pos_y, history);
+                            ui.label("Position Y");
+                        });
+                        let py_resp = ui.add(egui::Slider::new(&mut state.pos_y, -(project.settings.height as f32)..=(project.settings.height as f32)).suffix("px"));
+                        if py_resp.changed() {
+                            transform_changed = true;
+                            if project.clips.keyframes().has_keyframes(clip_id, AnimParam::PositionY) {
+                                history.record(project);
+                                project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::PositionY, playhead_pts, state.pos_y, InterpMode::Linear);
+                            }
+                        }
                         ui.end_row();
 
-                        ui.label("Rotation");
-                        transform_changed |= ui
-                            .add(egui::Slider::new(&mut state.rotation, -180.0..=180.0).suffix("°"))
-                            .changed();
+                        ui.horizontal(|ui| {
+                            transform_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::Rotation, playhead_pts, state.rotation.to_radians(), history);
+                            ui.label("Rotation");
+                        });
+                        let rot_resp = ui.add(egui::Slider::new(&mut state.rotation, -180.0..=180.0).suffix("°"));
+                        if rot_resp.changed() {
+                            transform_changed = true;
+                            if project.clips.keyframes().has_keyframes(clip_id, AnimParam::Rotation) {
+                                history.record(project);
+                                project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::Rotation, playhead_pts, state.rotation.to_radians(), InterpMode::Linear);
+                            }
+                        }
                         ui.end_row();
 
-                        ui.label("Opacity");
-                        opacity_changed |= ui
-                            .add(egui::Slider::new(&mut state.opacity, 0.0..=100.0).suffix("%"))
-                            .changed();
+                        ui.horizontal(|ui| {
+                            opacity_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::Opacity, playhead_pts, state.opacity / 100.0, history);
+                            ui.label("Opacity");
+                        });
+                        let op_resp = ui.add(egui::Slider::new(&mut state.opacity, 0.0..=100.0).suffix("%"));
+                        if op_resp.changed() {
+                            opacity_changed = true;
+                            if project.clips.keyframes().has_keyframes(clip_id, AnimParam::Opacity) {
+                                history.record(project);
+                                project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::Opacity, playhead_pts, state.opacity / 100.0, InterpMode::Linear);
+                            }
+                        }
                         ui.end_row();
 
                         // ── Blend Mode ────────────────────────────────────
@@ -454,24 +544,74 @@ fn draw_inner(
                         .num_columns(2)
                         .spacing([8.0, 6.0])
                         .show(ui, |ui| {
-                            ui.label("Left");
-                            crop_changed |= ui.add(egui::Slider::new(&mut state.crop_left, 0.0..=100.0).suffix("%")).changed();
+                            ui.horizontal(|ui| {
+                                crop_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::CropLeft, playhead_pts, state.crop_left / 100.0, history);
+                                ui.label("Left");
+                            });
+                            let cl_resp = ui.add(egui::Slider::new(&mut state.crop_left, 0.0..=100.0).suffix("%"));
+                            if cl_resp.changed() {
+                                crop_changed = true;
+                                if project.clips.keyframes().has_keyframes(clip_id, AnimParam::CropLeft) {
+                                    history.record(project);
+                                    project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::CropLeft, playhead_pts, state.crop_left / 100.0, InterpMode::Linear);
+                                }
+                            }
                             ui.end_row();
 
-                            ui.label("Top");
-                            crop_changed |= ui.add(egui::Slider::new(&mut state.crop_top, 0.0..=100.0).suffix("%")).changed();
+                            ui.horizontal(|ui| {
+                                crop_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::CropTop, playhead_pts, state.crop_top / 100.0, history);
+                                ui.label("Top");
+                            });
+                            let ct_resp = ui.add(egui::Slider::new(&mut state.crop_top, 0.0..=100.0).suffix("%"));
+                            if ct_resp.changed() {
+                                crop_changed = true;
+                                if project.clips.keyframes().has_keyframes(clip_id, AnimParam::CropTop) {
+                                    history.record(project);
+                                    project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::CropTop, playhead_pts, state.crop_top / 100.0, InterpMode::Linear);
+                                }
+                            }
                             ui.end_row();
 
-                            ui.label("Right");
-                            crop_changed |= ui.add(egui::Slider::new(&mut state.crop_right, 0.0..=100.0).suffix("%")).changed();
+                            ui.horizontal(|ui| {
+                                crop_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::CropRight, playhead_pts, state.crop_right / 100.0, history);
+                                ui.label("Right");
+                            });
+                            let cr_resp = ui.add(egui::Slider::new(&mut state.crop_right, 0.0..=100.0).suffix("%"));
+                            if cr_resp.changed() {
+                                crop_changed = true;
+                                if project.clips.keyframes().has_keyframes(clip_id, AnimParam::CropRight) {
+                                    history.record(project);
+                                    project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::CropRight, playhead_pts, state.crop_right / 100.0, InterpMode::Linear);
+                                }
+                            }
                             ui.end_row();
 
-                            ui.label("Bottom");
-                            crop_changed |= ui.add(egui::Slider::new(&mut state.crop_bottom, 0.0..=100.0).suffix("%")).changed();
+                            ui.horizontal(|ui| {
+                                crop_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::CropBottom, playhead_pts, state.crop_bottom / 100.0, history);
+                                ui.label("Bottom");
+                            });
+                            let cb_resp = ui.add(egui::Slider::new(&mut state.crop_bottom, 0.0..=100.0).suffix("%"));
+                            if cb_resp.changed() {
+                                crop_changed = true;
+                                if project.clips.keyframes().has_keyframes(clip_id, AnimParam::CropBottom) {
+                                    history.record(project);
+                                    project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::CropBottom, playhead_pts, state.crop_bottom / 100.0, InterpMode::Linear);
+                                }
+                            }
                             ui.end_row();
 
-                            ui.label("Feather");
-                            crop_changed |= ui.add(egui::Slider::new(&mut state.crop_feather, 0.0..=1.0)).changed();
+                            ui.horizontal(|ui| {
+                                crop_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::CropFeather, playhead_pts, state.crop_feather, history);
+                                ui.label("Feather");
+                            });
+                            let cf_resp = ui.add(egui::Slider::new(&mut state.crop_feather, 0.0..=1.0));
+                            if cf_resp.changed() {
+                                crop_changed = true;
+                                if project.clips.keyframes().has_keyframes(clip_id, AnimParam::CropFeather) {
+                                    history.record(project);
+                                    project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::CropFeather, playhead_pts, state.crop_feather, InterpMode::Linear);
+                                }
+                            }
                             ui.end_row();
                         });
 
@@ -542,24 +682,40 @@ fn draw_inner(
                         audio_changed |= ui.checkbox(&mut state.audio_muted, "").changed();
                         ui.end_row();
 
-                        ui.label("Volume");
-                        audio_changed |= ui
-                            .add(
-                                egui::Slider::new(&mut state.volume, 0.0..=200.0)
-                                    .suffix("%")
-                                    .fixed_decimals(0),
-                            )
-                            .changed();
+                        ui.horizontal(|ui| {
+                            audio_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::Volume, playhead_pts, state.volume / 100.0, history);
+                            ui.label("Volume");
+                        });
+                        let vol_resp = ui.add(
+                            egui::Slider::new(&mut state.volume, 0.0..=200.0)
+                                .suffix("%")
+                                .fixed_decimals(0),
+                        );
+                        if vol_resp.changed() {
+                            audio_changed = true;
+                            if project.clips.keyframes().has_keyframes(clip_id, AnimParam::Volume) {
+                                history.record(project);
+                                project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::Volume, playhead_pts, state.volume / 100.0, InterpMode::Linear);
+                            }
+                        }
                         ui.end_row();
 
-                        ui.label("Pan");
-                        audio_changed |= ui
-                            .add(
-                                egui::Slider::new(&mut state.pan, -100.0..=100.0)
-                                    .suffix("%")
-                                    .fixed_decimals(0),
-                            )
-                            .changed();
+                        ui.horizontal(|ui| {
+                            audio_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::Pan, playhead_pts, state.pan / 100.0, history);
+                            ui.label("Pan");
+                        });
+                        let pan_resp = ui.add(
+                            egui::Slider::new(&mut state.pan, -100.0..=100.0)
+                                .suffix("%")
+                                .fixed_decimals(0),
+                        );
+                        if pan_resp.changed() {
+                            audio_changed = true;
+                            if project.clips.keyframes().has_keyframes(clip_id, AnimParam::Pan) {
+                                history.record(project);
+                                project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::Pan, playhead_pts, state.pan / 100.0, InterpMode::Linear);
+                            }
+                        }
                         ui.end_row();
 
                         ui.label("Fade In");
@@ -737,20 +893,60 @@ fn draw_inner(
                             .num_columns(2)
                             .spacing([8.0, 6.0])
                             .show(ui, |ui| {
-                                ui.label("Brightness");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.brightness, -100.0..=100.0).suffix("%")).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::Brightness, playhead_pts, state.brightness / 100.0, history);
+                                    ui.label("Brightness");
+                                });
+                                let br_resp = ui.add(egui::Slider::new(&mut state.brightness, -100.0..=100.0).suffix("%"));
+                                if br_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::Brightness) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::Brightness, playhead_pts, state.brightness / 100.0, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
 
-                                ui.label("Contrast");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.contrast, 0.0..=200.0).suffix("%")).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::Contrast, playhead_pts, state.contrast / 100.0, history);
+                                    ui.label("Contrast");
+                                });
+                                let ct_resp = ui.add(egui::Slider::new(&mut state.contrast, 0.0..=200.0).suffix("%"));
+                                if ct_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::Contrast) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::Contrast, playhead_pts, state.contrast / 100.0, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
 
-                                ui.label("Saturation");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.saturation, 0.0..=200.0).suffix("%")).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::Saturation, playhead_pts, state.saturation / 100.0, history);
+                                    ui.label("Saturation");
+                                });
+                                let st_resp = ui.add(egui::Slider::new(&mut state.saturation, 0.0..=200.0).suffix("%"));
+                                if st_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::Saturation) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::Saturation, playhead_pts, state.saturation / 100.0, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
 
-                                ui.label("Hue Shift");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.hue, -180.0..=180.0).suffix("°")).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::HueShift, playhead_pts, state.hue, history);
+                                    ui.label("Hue Shift");
+                                });
+                                let hue_resp = ui.add(egui::Slider::new(&mut state.hue, -180.0..=180.0).suffix("°"));
+                                if hue_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::HueShift) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::HueShift, playhead_pts, state.hue, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
                             });
 
@@ -782,12 +978,32 @@ fn draw_inner(
                             .num_columns(2)
                             .spacing([8.0, 6.0])
                             .show(ui, |ui| {
-                                ui.label("Radius");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.blur_radius, 1.0..=50.0).suffix(" px")).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::BlurRadius, playhead_pts, state.blur_radius, history);
+                                    ui.label("Radius");
+                                });
+                                let rad_resp = ui.add(egui::Slider::new(&mut state.blur_radius, 1.0..=50.0).suffix(" px"));
+                                if rad_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::BlurRadius) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::BlurRadius, playhead_pts, state.blur_radius, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
 
-                                ui.label("Sigma");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.blur_sigma, 0.5..=25.0)).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::BlurSigma, playhead_pts, state.blur_sigma, history);
+                                    ui.label("Sigma");
+                                });
+                                let sig_resp = ui.add(egui::Slider::new(&mut state.blur_sigma, 0.5..=25.0));
+                                if sig_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::BlurSigma) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::BlurSigma, playhead_pts, state.blur_sigma, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
                             });
 
@@ -811,8 +1027,18 @@ fn draw_inner(
                             .num_columns(2)
                             .spacing([8.0, 6.0])
                             .show(ui, |ui| {
-                                ui.label("Amount");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.sharpen_amount, 0.0..=200.0).suffix("%")).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::SharpenAmount, playhead_pts, state.sharpen_amount / 100.0, history);
+                                    ui.label("Amount");
+                                });
+                                let sh_resp = ui.add(egui::Slider::new(&mut state.sharpen_amount, 0.0..=200.0).suffix("%"));
+                                if sh_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::SharpenAmount) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::SharpenAmount, playhead_pts, state.sharpen_amount / 100.0, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
                             });
 
@@ -836,20 +1062,60 @@ fn draw_inner(
                             .num_columns(2)
                             .spacing([8.0, 6.0])
                             .show(ui, |ui| {
-                                ui.label("Intensity");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.vignette_intensity, 0.0..=100.0).suffix("%")).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::VignetteIntensity, playhead_pts, state.vignette_intensity / 100.0, history);
+                                    ui.label("Intensity");
+                                });
+                                let vi_resp = ui.add(egui::Slider::new(&mut state.vignette_intensity, 0.0..=100.0).suffix("%"));
+                                if vi_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::VignetteIntensity) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::VignetteIntensity, playhead_pts, state.vignette_intensity / 100.0, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
 
-                                ui.label("Radius");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.vignette_radius, 10.0..=150.0).suffix("%")).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::VignetteRadius, playhead_pts, state.vignette_radius / 100.0, history);
+                                    ui.label("Radius");
+                                });
+                                let vr_resp = ui.add(egui::Slider::new(&mut state.vignette_radius, 10.0..=150.0).suffix("%"));
+                                if vr_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::VignetteRadius) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::VignetteRadius, playhead_pts, state.vignette_radius / 100.0, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
 
-                                ui.label("Softness");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.vignette_softness, 0.0..=100.0).suffix("%")).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::VignetteSoftness, playhead_pts, state.vignette_softness / 100.0, history);
+                                    ui.label("Softness");
+                                });
+                                let vs_resp = ui.add(egui::Slider::new(&mut state.vignette_softness, 0.0..=100.0).suffix("%"));
+                                if vs_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::VignetteSoftness) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::VignetteSoftness, playhead_pts, state.vignette_softness / 100.0, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
 
-                                ui.label("Roundness");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.vignette_roundness, 0.0..=100.0).suffix("%")).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::VignetteRoundness, playhead_pts, state.vignette_roundness / 100.0, history);
+                                    ui.label("Roundness");
+                                });
+                                let vrnd_resp = ui.add(egui::Slider::new(&mut state.vignette_roundness, 0.0..=100.0).suffix("%"));
+                                if vrnd_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::VignetteRoundness) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::VignetteRoundness, playhead_pts, state.vignette_roundness / 100.0, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
                             });
 
@@ -902,12 +1168,46 @@ fn draw_inner(
                                 });
                                 ui.end_row();
 
-                                ui.label("Tolerance");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.chroma_key_tolerance, 0.01..=1.0)).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::ChromaKeyTolerance, playhead_pts, state.chroma_key_tolerance, history);
+                                    ui.label("Tolerance");
+                                });
+                                let tol_resp = ui.add(egui::Slider::new(&mut state.chroma_key_tolerance, 0.01..=1.0));
+                                if tol_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::ChromaKeyTolerance) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::ChromaKeyTolerance, playhead_pts, state.chroma_key_tolerance, InterpMode::Linear);
+                                    }
+                                }
                                 ui.end_row();
 
-                                ui.label("Softness");
-                                effects_changed |= ui.add(egui::Slider::new(&mut state.chroma_key_softness, 0.0..=state.chroma_key_tolerance)).changed();
+                                ui.horizontal(|ui| {
+                                    effects_changed |= keyframe_toggle_button(ui, project, clip_id, AnimParam::ChromaKeySoftness, playhead_pts, state.chroma_key_softness, history);
+                                    ui.label("Softness");
+                                });
+                                let sft_resp = ui.add(egui::Slider::new(&mut state.chroma_key_softness, 0.0..=state.chroma_key_tolerance));
+                                if sft_resp.changed() {
+                                    effects_changed = true;
+                                    if project.clips.keyframes().has_keyframes(clip_id, AnimParam::ChromaKeySoftness) {
+                                        history.record(project);
+                                        project.clips.keyframes_mut().set_keyframe(clip_id, AnimParam::ChromaKeySoftness, playhead_pts, state.chroma_key_softness, InterpMode::Linear);
+                                    }
+                                }
+                                ui.end_row();
+
+                                ui.label("Spill Suppress");
+                                let sp_resp = ui.add(egui::Slider::new(&mut state.chroma_key_spill_suppress, 0.0..=1.0).custom_formatter(|n, _| format!("{:.0}%", n * 100.0)));
+                                if sp_resp.changed() {
+                                    effects_changed = true;
+                                }
+                                ui.end_row();
+
+                                ui.label("Min Saturation");
+                                let sat_resp = ui.add(egui::Slider::new(&mut state.chroma_key_min_saturation, 0.0..=1.0).custom_formatter(|n, _| format!("{:.0}%", n * 100.0)));
+                                if sat_resp.changed() {
+                                    effects_changed = true;
+                                }
                                 ui.end_row();
                             });
                     }
@@ -916,31 +1216,71 @@ fn draw_inner(
 
             if effects_changed {
                 history.record(project);
+                let eff = nexir::timeline::transform::ClipEffects {
+                    color_enabled: state.color_enabled,
+                    brightness: state.brightness / 100.0,
+                    contrast: state.contrast / 100.0,
+                    saturation: state.saturation / 100.0,
+                    hue: state.hue,
+                    blur_enabled: state.blur_enabled,
+                    blur_radius: state.blur_radius,
+                    blur_sigma: state.blur_sigma,
+                    sharpen_enabled: state.sharpen_enabled,
+                    sharpen_amount: state.sharpen_amount / 100.0,
+                    vignette_enabled: state.vignette_enabled,
+                    vignette_intensity: state.vignette_intensity / 100.0,
+                    vignette_radius: state.vignette_radius / 100.0,
+                    vignette_softness: state.vignette_softness / 100.0,
+                    vignette_roundness: state.vignette_roundness / 100.0,
+                    chroma_key_enabled: state.chroma_key_enabled,
+                    chroma_key_color: state.chroma_key_color,
+                    chroma_key_tolerance: state.chroma_key_tolerance,
+                    chroma_key_softness: state.chroma_key_softness,
+                    chroma_key_min_saturation: state.chroma_key_min_saturation,
+                    chroma_key_spill_suppress: state.chroma_key_spill_suppress,
+                };
+                project.clips.set_effects_at(idx, eff);
             }
 
-            // Sync effect changes back to clip in timeline store
-            let eff = nexir::timeline::transform::ClipEffects {
-                color_enabled: state.color_enabled,
-                brightness: state.brightness / 100.0,
-                contrast: state.contrast / 100.0,
-                saturation: state.saturation / 100.0,
-                hue: state.hue,
-                blur_enabled: state.blur_enabled,
-                blur_radius: state.blur_radius,
-                blur_sigma: state.blur_sigma,
-                sharpen_enabled: state.sharpen_enabled,
-                sharpen_amount: state.sharpen_amount / 100.0,
-                vignette_enabled: state.vignette_enabled,
-                vignette_intensity: state.vignette_intensity / 100.0,
-                vignette_radius: state.vignette_radius / 100.0,
-                vignette_softness: state.vignette_softness / 100.0,
-                vignette_roundness: state.vignette_roundness / 100.0,
-                chroma_key_enabled: state.chroma_key_enabled,
-                chroma_key_color: state.chroma_key_color,
-                chroma_key_tolerance: state.chroma_key_tolerance,
-                chroma_key_softness: state.chroma_key_softness,
-            };
-            project.clips.set_effects_at(idx, eff);
+            // ── Keyframe Tracks Section ───────────────────────────────────
+            if project.clips.keyframes().has_any_keyframes_for_clip(clip_id) {
+                ui.add_space(6.0);
+                ui.collapsing("◆  Keyframe Tracks", |ui| {
+                    for param in [
+                        AnimParam::Scale,
+                        AnimParam::PositionX,
+                        AnimParam::PositionY,
+                        AnimParam::Rotation,
+                        AnimParam::Opacity,
+                        AnimParam::CropLeft,
+                        AnimParam::CropTop,
+                        AnimParam::CropRight,
+                        AnimParam::CropBottom,
+                        AnimParam::CropFeather,
+                        AnimParam::Brightness,
+                        AnimParam::Contrast,
+                        AnimParam::Saturation,
+                        AnimParam::HueShift,
+                        AnimParam::BlurRadius,
+                        AnimParam::BlurSigma,
+                        AnimParam::SharpenAmount,
+                        AnimParam::VignetteIntensity,
+                        AnimParam::VignetteRadius,
+                        AnimParam::VignetteSoftness,
+                        AnimParam::VignetteRoundness,
+                        AnimParam::ChromaKeyTolerance,
+                        AnimParam::ChromaKeySoftness,
+                        AnimParam::Volume,
+                        AnimParam::Pan,
+                    ] {
+                        if project.clips.keyframes().has_keyframes(clip_id, param) {
+                            ui.label(RichText::new(param.label()).strong().small().color(Color32::from_rgb(0, 200, 255)));
+                            crate::layout::keyframe_editor::draw_keyframe_track_editor(ui, project, clip_id, param, history);
+                            ui.add_space(4.0);
+                        }
+                    }
+                });
+            }
         }
     }
 }

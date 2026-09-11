@@ -12,21 +12,23 @@ use crate::render::compute::ComputePipelineCache;
 use crate::render::device::GpuDevice;
 use crate::render::frame_state::FrameState;
 use crate::render::graph::{CompiledGraph, RenderGraphCompiler};
-use crate::render::nodes::composite::CompositeNode;
-use crate::render::nodes::color_correction::{ColorCorrectionNode, ColorCorrectionParams};
 use crate::render::nodes::chroma_key::{ChromaKeyNode, ChromaKeyParams};
-use crate::render::nodes::gaussian_blur::{BlurPassNode, BlurParams};
+use crate::render::nodes::color_correction::{ColorCorrectionNode, ColorCorrectionParams};
+use crate::render::nodes::composite::CompositeNode;
+use crate::render::nodes::gaussian_blur::{BlurParams, BlurPassNode};
 use crate::render::nodes::sharpen::{SharpenNode, SharpenParams};
+use crate::render::nodes::tonemap::{
+    GamutConversion, InputTransferFn, ToneMapMode, ToneMapNode, ToneMapPushConstants,
+};
 use crate::render::nodes::vignette::{VignetteNode, VignetteParams};
 use crate::render::nodes::yuv_to_rgb::YuvToRgbNode;
 use crate::render::nodes::yuv_upload::YuvUploadNode;
-use crate::render::nodes::tonemap::{ToneMapNode, ToneMapPushConstants, InputTransferFn, GamutConversion, ToneMapMode};
 use crate::render::resource::ResourceId;
 use crate::render::shader::registry::ShaderRegistry;
 use crate::render::still_image::StillImageCache;
 use crate::scheduler::frame_scheduler::FrameScheduler;
-use crate::timeline::source::{DecodedFrameMeta, SourceRegistry, is_still_image_path};
 use crate::timeline::ids::SourceId;
+use crate::timeline::source::{is_still_image_path, DecodedFrameMeta, SourceRegistry};
 use crate::timeline::store::TimelineStore;
 use crate::timeline::track::TrackList;
 use std::sync::Arc;
@@ -255,7 +257,12 @@ impl ExportRenderer {
                             clip.clip_height,
                             &mut id_counter,
                         );
-                        let final_id = self.add_effect_chain(&mut compiler, transformed_id, clip, &mut id_counter);
+                        let final_id = self.add_effect_chain(
+                            &mut compiler,
+                            transformed_id,
+                            clip,
+                            &mut id_counter,
+                        );
                         comp_node.input_textures.push(final_id);
                         upload_indices.push(None);
                         continue;
@@ -266,7 +273,9 @@ impl ExportRenderer {
                         );
                     }
                 } else {
-                    log::warn!("[export] slot {slot}: still image has no registered path, skipping");
+                    log::warn!(
+                        "[export] slot {slot}: still image has no registered path, skipping"
+                    );
                 }
 
                 // If load failed, push a sentinel so the slot count stays in sync.
@@ -279,7 +288,7 @@ impl ExportRenderer {
             // actually produced.  Reading them off the source registry instead was
             // wrong whenever the decoder converted the frame (swscale fallback) or
             // the stream header disagreed with the frame's own metadata.
-            let layout     = clip_sig.frame_meta.layout;
+            let layout = clip_sig.frame_meta.layout;
             let color_info = clip_sig.frame_meta.color;
 
             // G2d — where the two paths diverge, and the ONE thing this branch must
@@ -329,18 +338,21 @@ impl ExportRenderer {
                 upload_indices.push(Some(node_idx));
             }
 
-            compiler.add_node(Box::new(YuvToRgbNode::new_with_layout(
-                &self.device,
-                &self.shaders,
-                &self.compute_cache,
-                y_id,
-                uv_id,
-                rgba_id,
-                clip.clip_width,
-                clip.clip_height,
-                color_info,
-                layout.semi_planar,
-            ).with_imported_planes(clip.is_interop())));
+            compiler.add_node(Box::new(
+                YuvToRgbNode::new_with_layout(
+                    &self.device,
+                    &self.shaders,
+                    &self.compute_cache,
+                    y_id,
+                    uv_id,
+                    rgba_id,
+                    clip.clip_width,
+                    clip.clip_height,
+                    color_info,
+                    layout.semi_planar,
+                )
+                .with_imported_planes(clip.is_interop()),
+            ));
 
             // ── Colour transform into the output's space ──────────────────────
             //
@@ -367,10 +379,10 @@ impl ExportRenderer {
                 &mut id_counter,
             );
 
-            let final_rgba_id = self.add_effect_chain(&mut compiler, final_rgba_id, clip, &mut id_counter);
+            let final_rgba_id =
+                self.add_effect_chain(&mut compiler, final_rgba_id, clip, &mut id_counter);
             comp_node.input_textures.push(final_rgba_id);
         }
-
 
         compiler.add_node(Box::new(comp_node));
 
@@ -404,25 +416,26 @@ impl ExportRenderer {
     /// pixels. Both the source and the destination are now consulted.
     fn add_color_transform(
         &self,
-        compiler:    &mut RenderGraphCompiler,
-        input:       ResourceId,
-        clip_color:  &crate::timeline::source::ColorInfo,
-        width:       u32,
-        height:      u32,
-        id_counter:  &mut u32,
+        compiler: &mut RenderGraphCompiler,
+        input: ResourceId,
+        clip_color: &crate::timeline::source::ColorInfo,
+        width: u32,
+        height: u32,
+        id_counter: &mut u32,
     ) -> ResourceId {
         use crate::timeline::source::TransferFunction;
 
-        let job_is_hdr  = self.job.is_hdr();
+        let job_is_hdr = self.job.is_hdr();
         let clip_is_hdr = matches!(
             clip_color.transfer_fn,
             TransferFunction::Pq | TransferFunction::Hlg
         );
 
         let src_primaries = clip_color.effective_primaries(width, height);
-        let dst_primaries = self.job.output_color.effective_primaries(
-            self.job.width, self.job.height,
-        );
+        let dst_primaries = self
+            .job
+            .output_color
+            .effective_primaries(self.job.width, self.job.height);
         let gamut = GamutConversion::between(src_primaries, dst_primaries);
         let src_trc = InputTransferFn::from_color_info(clip_color);
 
@@ -442,7 +455,7 @@ impl ExportRenderer {
                 TransferFunction::Hlg => InputTransferFn::Hlg,
                 // Everything else on an HDR job is PQ — `ExportJob::is_hdr` only
                 // returns true for PQ or HLG.
-                _                     => InputTransferFn::Pq,
+                _ => InputTransferFn::Pq,
             };
             let peak = self
                 .job
@@ -454,9 +467,7 @@ impl ExportRenderer {
                 "[export] colour transform: {src_trc:?}/{src_primaries:?} → \
                  {dst_trc:?}/{dst_primaries:?} (HDR passthrough, peak {peak} nits)"
             );
-            ToneMapPushConstants::for_hdr_output(
-                src_trc, gamut, dst_trc, peak, width, height,
-            )
+            ToneMapPushConstants::for_hdr_output(src_trc, gamut, dst_trc, peak, width, height)
         } else {
             // SDR target: tone-map down to display-referred sRGB.
             log::info!(
@@ -603,11 +614,13 @@ impl ExportRenderer {
                 output,
                 ChromaKeyParams {
                     key_hue: hue,
-                    tolerance: effects.chroma_key_tolerance * 360.0,
-                    softness: effects.chroma_key_softness * 360.0,
-                    min_saturation: 0.15,
-                    min_value: 0.08,
-                    spill_suppress: 0.3,
+                    tolerance: (effects.chroma_key_tolerance * 180.0).max(1.0),
+                    softness: (effects.chroma_key_softness * 180.0)
+                        .min(effects.chroma_key_tolerance * 180.0 - 0.1)
+                        .max(0.01),
+                    min_saturation: effects.chroma_key_min_saturation,
+                    min_value: 0.05,
+                    spill_suppress: effects.chroma_key_spill_suppress,
                     width,
                     height,
                 },
@@ -779,12 +792,10 @@ impl ExportRenderer {
                 // ── Check cancellation & pause ───────────────────────────────
                 if progress.control().is_cancelled() {
                     log::info!("[export] cancelled by user during CPU render at frame {frame_idx}");
-                    progress.report(self.frames_done, ExportPhase::Cancelled);
                     return Ok(());
                 }
                 while progress.control().is_paused() {
                     if progress.control().is_cancelled() {
-                        progress.report(self.frames_done, ExportPhase::Cancelled);
                         return Ok(());
                     }
                     progress.report(self.frames_done, ExportPhase::Paused);
@@ -939,12 +950,10 @@ impl ExportRenderer {
                 // ── Check cancellation & pause ───────────────────────────────
                 if progress.control().is_cancelled() {
                     log::info!("[export] cancelled by user during GPU render at frame {frame_idx}");
-                    progress.report(self.frames_done, ExportPhase::Cancelled);
                     return Ok(());
                 }
                 while progress.control().is_paused() {
                     if progress.control().is_cancelled() {
-                        progress.report(self.frames_done, ExportPhase::Cancelled);
                         return Ok(());
                     }
                     progress.report(self.frames_done, ExportPhase::Paused);
@@ -972,13 +981,17 @@ impl ExportRenderer {
                 self.upload_frame_data(&frame_state);
 
                 let mut encoder = self.device.begin_frame();
-                let rtt_id    = ResourceId::FINAL_COLOR;
+                let rtt_id = ResourceId::FINAL_COLOR;
                 let device_ref = &self.device;
 
                 let graph = self.cached_graph.as_mut().unwrap();
 
-                if let ExportBackend::GpuNvenc { video_enc, nv12, .. } = &mut self.backend {
-                    let interop = video_enc.nvenc_interop()
+                if let ExportBackend::GpuNvenc {
+                    video_enc, nv12, ..
+                } = &mut self.backend
+                {
+                    let interop = video_enc
+                        .nvenc_interop()
                         .expect("nvenc_interop: invariant — GpuNvenc arm");
                     // The pitch comes from the encoder, not from a second
                     // computation here: the shader must write at exactly the
@@ -1051,7 +1064,9 @@ impl ExportRenderer {
             log::info!(
                 "[export] render_segment {} done (NVENC async pipeline, {} slot(s), \
                  {} GPU frame(s) of lookahead)",
-                segment.index, slot_count, gpu_lookahead
+                segment.index,
+                slot_count,
+                gpu_lookahead
             );
         }
 

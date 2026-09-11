@@ -311,9 +311,10 @@ pub fn draw(
         }
     }
 
-    // Hit-testing (only when eyedropper is not active)
+    // Hit-testing (only when eyedropper is not active and pointer is inside preview area)
     if !eyedropper_active && response.clicked() && !state.is_interacting_with_clip()
-        && let Some(pos) = ui.ctx().pointer_interact_pos() {
+        && let Some(pos) = ui.ctx().pointer_interact_pos()
+        && rect.contains(pos) {
             let mut clicked_idx = None;
             for clip in active_clips.iter().rev() {
                 let track_id = project.clips.track_id_at(clip.store_index);
@@ -395,10 +396,11 @@ pub fn draw(
                 let clip_id = project.clips.clip_id_at(idx);
 
                 let corners = clip_corners_ui(&transform, clip_w, clip_h, draw_rect, canvas_w, canvas_h);
+                let vp_painter = ui.painter().with_clip_rect(rect);
 
-                // Draw outline
+                // Draw outline (clipped to viewport)
                 for i in 0..4 {
-                    ui.painter().line_segment(
+                    vp_painter.line_segment(
                         [corners[i], corners[(i + 1) % 4]],
                         egui::Stroke::new(2.0, Color32::LIGHT_BLUE),
                     );
@@ -407,19 +409,19 @@ pub fn draw(
                 let handle_radius = 6.0;
                 let delete_radius = 8.0;
                 let handle_rects = corners.map(|corner| {
-                    Rect::from_center_size(corner, Vec2::splat(handle_radius * 3.0))
+                    Rect::from_center_size(corner, Vec2::splat(handle_radius * 3.0)).intersect(rect)
                 });
                 
                 // Rotate handle (above top-center)
                 let top_center = corners[0].lerp(corners[1], 0.5);
                 let up_vector = (corners[0] - corners[3]).normalized(); 
                 let rotate_center = top_center + up_vector * 25.0; // Extend outward above the top edge
-                let rotate_rect = Rect::from_center_size(rotate_center, Vec2::splat(handle_radius * 3.0));
+                let rotate_rect = Rect::from_center_size(rotate_center, Vec2::splat(handle_radius * 3.0)).intersect(rect);
 
                 let tr = corners[1];
                 let del_center = tr + egui::vec2(12.0, -12.0);
                 let del_rect =
-                    Rect::from_center_size(del_center, Vec2::splat(delete_radius * 2.5));
+                    Rect::from_center_size(del_center, Vec2::splat(delete_radius * 2.5)).intersect(rect);
 
                 let mut min = corners[0];
                 let mut max = corners[0];
@@ -429,7 +431,7 @@ pub fn draw(
                     max.x = max.x.max(corner.x);
                     max.y = max.y.max(corner.y);
                 }
-                let body_rect = Rect::from_min_max(min, max);
+                let body_rect = Rect::from_min_max(min, max).intersect(rect);
                 let move_resp = ui.interact(
                     body_rect,
                     egui::Id::new(("viewport_move", idx)),
@@ -468,8 +470,8 @@ pub fn draw(
                     } else {
                         Color32::from_rgb(200, 200, 255)
                     };
-                    ui.painter().circle_filled(corner, handle_radius, color);
-                    ui.painter().circle_stroke(
+                    vp_painter.circle_filled(corner, handle_radius, color);
+                    vp_painter.circle_stroke(
                         corner,
                         handle_radius,
                         egui::Stroke::new(1.0, Color32::BLACK),
@@ -485,14 +487,14 @@ pub fn draw(
                     }
                 
                 // Draw connecting line to rotate handle
-                ui.painter().line_segment(
+                vp_painter.line_segment(
                     [top_center, rotate_center],
                     egui::Stroke::new(1.5, Color32::LIGHT_BLUE),
                 );
                 
                 let rot_color = if rotate_resp.hovered() { Color32::WHITE } else { Color32::from_rgb(150, 255, 150) };
-                ui.painter().circle_filled(rotate_center, handle_radius, rot_color);
-                ui.painter().circle_stroke(
+                vp_painter.circle_filled(rotate_center, handle_radius, rot_color);
+                vp_painter.circle_stroke(
                     rotate_center,
                     handle_radius,
                     egui::Stroke::new(1.0, Color32::BLACK),

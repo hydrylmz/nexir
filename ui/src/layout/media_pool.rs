@@ -24,21 +24,17 @@ impl MediaEntry {
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_string();
+            .into_owned();
         let ext = path
             .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase()
-            .to_string();
-        let kind = if nexir::timeline::source::is_still_image_path(&path) {
-            MediaKind::Image
-        } else {
-            match ext.as_str() {
-                "mp4" | "mov" | "mkv" | "avi" | "webm" | "mxf" | "m4v" => MediaKind::Video,
-                "mp3" | "wav" | "aac" | "flac" | "ogg" | "m4a" => MediaKind::Audio,
-                _ => MediaKind::Video, // default
-            }
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        let kind = match ext.as_str() {
+            "mp4" | "mov" | "mkv" | "avi" | "webm" | "mxf" | "m4v" => MediaKind::Video,
+            "mp3" | "wav" | "aac" | "flac" | "ogg" | "m4a" => MediaKind::Audio,
+            "png" | "jpg" | "jpeg" | "bmp" | "webp" | "tiff" => MediaKind::Image,
+            _ => MediaKind::Video,
         };
         Self { path, name, kind }
     }
@@ -54,18 +50,14 @@ impl MediaEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum LibraryPanel {
-    #[default]
     MediaPool,
     Text,
     Effects,
 }
 
-
-/// State owned by `NexirApp` for the media pool panel.
-#[derive(Default)]
+/// State for the media pool panel.
 pub struct MediaPoolState {
     pub entries: Vec<MediaEntry>,
     pub selected: Option<usize>,
@@ -74,19 +66,23 @@ pub struct MediaPoolState {
     pub active_panel: LibraryPanel,
 }
 
+impl Default for MediaPoolState {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            selected: None,
+            pending_import: None,
+            dragging_item: None,
+            active_panel: LibraryPanel::MediaPool,
+        }
+    }
+}
+
 impl MediaPoolState {
-    /// Take whatever the file dialog selected and fold it into the entry list.
-    ///
-    /// P2.7 — this is split out of [`draw`] on purpose. The only untestable part of
-    /// media import is `rfd::FileDialog::pick_files`, which blocks on a human and
-    /// panics without a display; everything that decides what an import MEANS —
-    /// classification, de-duplication, ordering — is on this side of that seam and
-    /// needs no window. `draw` calls this immediately after setting
-    /// `pending_import`, so the tested path is the shipped path rather than a
-    /// parallel implementation.
-    ///
-    /// Returns how many entries were added, which is what a caller needs to know
-    /// whether anything actually happened.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn apply_pending_import(&mut self) -> usize {
         let Some(paths) = self.pending_import.take() else {
             return 0;
@@ -94,9 +90,6 @@ impl MediaPoolState {
         let before = self.entries.len();
         for path in paths {
             let entry = MediaEntry::from_path(path);
-            // Re-importing a file the pool already holds must not duplicate it: the
-            // list is a library keyed by path, and a second entry would give the
-            // same media two selectable rows and two drag sources.
             if !self.entries.iter().any(|e| e.path == entry.path) {
                 self.entries.push(entry);
             }
@@ -105,12 +98,20 @@ impl MediaPoolState {
     }
 }
 
-
 pub fn draw(ui: &mut Ui, state: &mut MediaPoolState) {
+    // Flush any paths queued by the import dialog into the entries list.
+    // This is called unconditionally every frame so imports are visible
+    // on the very next repaint after the dialog closes.
+    state.apply_pending_import();
+
+    // Capture the full available height before splitting into columns so the
+    // content area and its scroll views fill the entire panel height.
+    let available_height = ui.available_height();
     ui.horizontal(|ui| {
         // --- Left Vertical Bar ---
         ui.vertical(|ui| {
             ui.set_width(40.0);
+            ui.set_min_height(available_height);
             ui.add_space(8.0);
             
             let button_size = egui::vec2(36.0, 36.0);
@@ -160,6 +161,7 @@ pub fn draw(ui: &mut Ui, state: &mut MediaPoolState) {
         // --- Main Content Area ---
         ui.vertical(|ui| {
             ui.set_min_width(ui.available_width());
+            ui.set_min_height(available_height);
             match state.active_panel {
                 LibraryPanel::MediaPool => draw_media_pool(ui, state),
                 LibraryPanel::Text => draw_text_panel(ui, state),
@@ -319,93 +321,97 @@ fn draw_media_pool(ui: &mut Ui, state: &mut MediaPoolState) {
             let import_btn = egui::Button::new(RichText::new("+ Import").color(Color32::WHITE))
                 .fill(Color32::from_rgb(0, 130, 220));
             if ui.add(import_btn).clicked() {
-                // Trigger native file dialog — runs on main thread synchronously via rfd blocking API
-                let files = rfd::FileDialog::new()
+                if let Some(paths) = rfd::FileDialog::new()
                     .add_filter(
-                        "Media",
-                        &[
-                            "mp4", "mov", "mkv", "avi", "webm", "mxf", "m4v", "mp3", "wav", "aac",
-                            "flac", "ogg", "m4a", "png", "jpg", "jpeg", "bmp", "tiff", "webp",
-                        ],
+                        "Media Files",
+                        &["mp4", "mov", "mkv", "avi", "webm", "mp3", "wav", "aac", "flac", "ogg", "png", "jpg", "jpeg", "bmp", "webp"],
                     )
-                    .set_title("Import Media")
-                    .pick_files();
-                if let Some(paths) = files {
+                    .pick_files()
+                {
                     state.pending_import = Some(paths);
                 }
             }
         });
     });
-
     ui.separator();
+    ui.add_space(4.0);
 
-    // ── Process any pending imports ────────────────────────────────────
-    // The classification and de-duplication live on `MediaPoolState` so they can
-    // be tested without a file dialog; see `apply_pending_import`.
-    state.apply_pending_import();
-
-    // ── Entry list ────────────────────────────────────────────────────
+    // ── Media List / Grid ─────────────────────────────────────────────
     if state.entries.is_empty() {
-        ui.add_space(20.0);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("📂").size(32.0));
-            ui.add_space(6.0);
+            ui.add_space(30.0);
+            ui.label(RichText::new("📁").size(32.0));
+            ui.add_space(4.0);
             ui.label(
-                RichText::new("No media imported.\nClick + Import to add files.")
+                RichText::new("No media imported yet")
                     .color(Color32::GRAY)
-                    .size(12.0),
+                    .italics(),
+            );
+            ui.label(
+                RichText::new("Click '+ Import' above to add video, audio, or images.")
+                    .color(Color32::DARK_GRAY)
+                    .small(),
             );
         });
-        return;
-    }
+    } else {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, entry) in state.entries.iter().enumerate() {
+                    let is_selected = state.selected == Some(i);
+                    let bg = if is_selected {
+                        Color32::from_rgb(45, 60, 80)
+                    } else if i % 2 == 0 {
+                        Color32::from_rgb(32, 32, 32)
+                    } else {
+                        Color32::from_rgb(28, 28, 28)
+                    };
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for (i, entry) in state.entries.iter().enumerate() {
-                let is_selected = state.selected == Some(i);
-                let bg = if is_selected {
-                    Color32::from_rgb(0, 100, 200)
-                } else if i % 2 == 0 {
-                    Color32::from_rgb(32, 32, 32)
-                } else {
-                    Color32::from_rgb(28, 28, 28)
-                };
+                    let response = egui::Frame::none()
+                        .fill(bg)
+                        .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                        .rounding(4.0)
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(entry.icon());
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(&entry.name)
+                                        .color(if is_selected {
+                                            Color32::WHITE
+                                        } else {
+                                            Color32::LIGHT_GRAY
+                                        }),
+                                );
+                            });
+                        })
+                        .response
+                        .interact(egui::Sense::click_and_drag());
 
-                let response = egui::Frame::none()
-                    .fill(bg)
-                    .inner_margin(egui::Margin::symmetric(8.0, 5.0))
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(entry.icon()).size(18.0));
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(&entry.name)
-                                    .color(if is_selected {
-                                        Color32::WHITE
-                                    } else {
-                                        Color32::LIGHT_GRAY
-                                    })
-                                    .size(12.0),
-                            );
+                    if response.clicked() {
+                        state.selected = Some(i);
+                    }
+
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+
+                    if response.drag_started() {
+                        state.dragging_item = Some(entry.clone());
+                    }
+
+                    if response.dragged() {
+                        egui::show_tooltip_at_pointer(ui.ctx(), egui::Id::new("drag_tooltip"), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(entry.icon());
+                                ui.label(RichText::new(&entry.name).strong());
+                            });
                         });
-                    })
-                    .response
-                    .interact(egui::Sense::click_and_drag());
+                    }
 
-                if response.clicked() {
-                    state.selected = Some(i);
+                    ui.add_space(2.0);
                 }
-
-                if response.drag_started() {
-                    state.dragging_item = Some(entry.clone());
-                }
-                if response.dragged() {
-                    egui::show_tooltip_at_pointer(ui.ctx(), egui::Id::new("drag_tooltip"), |ui| {
-                        ui.label(format!("{} {}", entry.icon(), entry.name));
-                    });
-                }
-            }
-        });
+            });
+    }
 }

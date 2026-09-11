@@ -3,6 +3,7 @@
 
 use crate::timeline::ids::{ClipId, TrackId, SourceId};
 use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode, ClipEffects};
+use crate::timeline::keyframe::KeyframeStore;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ClipKind {
@@ -83,6 +84,10 @@ pub struct TimelineStore {
     pub(crate) effect_start: Vec<u32>,
     pub(crate) effect_count: Vec<u16>,
 
+    // --- keyframes ---
+    #[serde(default)]
+    pub(crate) keyframes: KeyframeStore,
+
     pub(crate) next_id:      u32,
 }
 
@@ -119,6 +124,7 @@ impl TimelineStore {
             pitch: Vec::new(),
             effect_start: Vec::new(),
             effect_count: Vec::new(),
+            keyframes: KeyframeStore::new(),
             next_id: 0,
         }
     }
@@ -396,5 +402,13 @@ impl TimelineStore {
         if idx < self.effects.len() {
             self.effects[idx] = effects;
         }
+    }
+
+    pub fn keyframes(&self) -> &KeyframeStore {
+        &self.keyframes
+    }
+
+    pub fn keyframes_mut(&mut self) -> &mut KeyframeStore {
+        &mut self.keyframes
     }
 }
