@@ -728,8 +728,16 @@ impl ExportRenderer {
     ///
     /// Non-blocking with respect to *this* frame: it returns as soon as the driver
     /// has accepted the picture.  The packets it yields belong to earlier frames.
+    ///
+    /// **PTS units:** `pts` must be in encoder timebase (1/frame_rate), i.e. one tick
+    /// per frame.  This matches `enc_video_tb = { fps.den, fps.num }` declared to the
+    /// muxer in `engine.rs`.  Do NOT pass `job.frame_pts(frame_idx)` here — that value
+    /// is in the 90 kHz project timebase and would make every timestamp ~3 000 × too
+    /// large, producing an hours-long output file.
     fn nvenc_submit_frame(&mut self, frame_idx: usize, slot: usize) -> Result<(), RenderError> {
-        let pts = self.job.frame_pts(frame_idx);
+        // Encoder timebase is 1/frame_rate (one tick per frame), matching enc_video_tb
+        // declared to the muxer.  frame_idx is already in those units.
+        let pts = frame_idx as i64;
         let packets = match &mut self.backend {
             ExportBackend::GpuNvenc { video_enc, .. } => {
                 let interop = video_enc

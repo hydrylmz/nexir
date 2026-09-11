@@ -611,6 +611,16 @@ impl ExportEngine {
             // Running sample counter for fade envelope
             let mut samples_decoded: u64 = 0;
 
+            // Hard cap: stop decoding once we have covered the full clip duration in
+            // samples.  This guards against sources whose packets carry AV_NOPTS_VALUE
+            // (i64::MIN), where the `pkt.pts > stream_end_pts` break below never fires,
+            // causing the loop to drain the entire source file and produce an audio track
+            // that is as long as the source rather than the export range.
+            // One extra codec frame of headroom avoids clipping the tail.
+            let max_audio_samples =
+                ((eff_t_out - eff_t_in) as f64 * 48_000.0 / 90_000.0).ceil() as u64
+                + 1024; // one AAC frame of headroom to avoid clipping the tail
+
             // Decode all audio packets in the needed range
             'decode: loop {
                 let pkt = match demuxer.next_audio_packet() {
@@ -687,6 +697,13 @@ impl ExportEngine {
                             swr_right[s] *= gain_r * fade;
                         }
                         samples_decoded += converted as u64;
+
+                        // Stop once the clip's full duration has been decoded.
+                        if samples_decoded >= max_audio_samples {
+                            accum_left.extend_from_slice(&swr_left[..converted]);
+                            accum_right.extend_from_slice(&swr_right[..converted]);
+                            break 'decode;
+                        }
 
                         accum_left.extend_from_slice(&swr_left[..converted]);
                         accum_right.extend_from_slice(&swr_right[..converted]);
