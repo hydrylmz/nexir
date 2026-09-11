@@ -82,7 +82,6 @@ pub fn draw_keyframe_track_editor(
             ui.label("");
             ui.end_row();
 
-            
             for (pts, val, interp) in &keys {
                 let frame = project.pts_to_frame(*pts);
                 ui.label(RichText::new(format!("{}", frame)).small().monospace());

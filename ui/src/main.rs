@@ -13,7 +13,6 @@ mod history;
 mod history_tests;
 mod image_still;
 pub mod layout;
-mod self_update;
 #[cfg(test)]
 mod media_pool_tests;
 mod self_update;
@@ -124,7 +123,6 @@ fn main() {
     }));
 
     info!("Starting Nexir UI");
-    self_update::check_for_updates();
 
     let event_loop = EventLoop::new().unwrap();
     let window = Arc::new(
