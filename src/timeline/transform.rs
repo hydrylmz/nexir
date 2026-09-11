@@ -559,6 +559,13 @@ pub struct ClipEffects {
     pub chroma_key_color: [f32; 3],
     pub chroma_key_tolerance: f32,
     pub chroma_key_softness: f32,
+    /// Minimum saturation a pixel must have to be considered for keying.
+    /// Lower values key shadow/dark-green areas too. Range [0, 1]. Default 0.08.
+    #[serde(default = "default_ck_min_saturation")]
+    pub chroma_key_min_saturation: f32,
+    /// Spill suppression strength. 0 = none, 1 = full. Default 0.3.
+    #[serde(default = "default_ck_spill_suppress")]
+    pub chroma_key_spill_suppress: f32,
 }
 
 impl Default for ClipEffects {
@@ -583,6 +590,11 @@ impl Default for ClipEffects {
             chroma_key_color: [0.0, 1.0, 0.0],
             chroma_key_tolerance: 0.3,
             chroma_key_softness: 0.1,
+            chroma_key_min_saturation: default_ck_min_saturation(),
+            chroma_key_spill_suppress: default_ck_spill_suppress(),
         }
     }
 }
+
+fn default_ck_min_saturation() -> f32 { 0.08 }
+fn default_ck_spill_suppress()  -> f32 { 0.3  }

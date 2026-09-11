@@ -603,11 +603,13 @@ impl ExportRenderer {
                 output,
                 ChromaKeyParams {
                     key_hue: hue,
-                    tolerance: effects.chroma_key_tolerance * 360.0,
-                    softness: effects.chroma_key_softness * 360.0,
-                    min_saturation: 0.15,
-                    min_value: 0.08,
-                    spill_suppress: 0.3,
+                    tolerance: (effects.chroma_key_tolerance * 180.0).max(1.0),
+                    softness:  (effects.chroma_key_softness  * 180.0)
+                                   .min(effects.chroma_key_tolerance * 180.0 - 0.1)
+                                   .max(0.01),
+                    min_saturation: effects.chroma_key_min_saturation,
+                    min_value: 0.05,
+                    spill_suppress: effects.chroma_key_spill_suppress,
                     width,
                     height,
                 },
