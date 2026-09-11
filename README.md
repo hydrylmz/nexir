@@ -123,6 +123,27 @@ builds; if `target/release/` lacks them, copy them from `target/debug/`.
 Anything it cannot measure prints `n/a`, and a benchmark whose hardware is
 missing prints a skip with the reason rather than a row of zeros.
 
+### Windows releases and updates
+
+Build a redistributable Windows archive from a Developer PowerShell prompt:
+
+```powershell
+.\package_windows.ps1
+```
+
+This creates `nexir-x86_64-pc-windows-msvc.zip`, containing `nexir.exe` and the
+required FFmpeg runtime DLLs. Extract the complete archive into a directory the
+current user can write to (for example, under `%LOCALAPPDATA%`); installing under
+`Program Files` can prevent the updater from replacing the executable without
+UAC elevation.
+
+Releases use the workspace version in `Cargo.toml`. Push a matching
+`v<version>` tag (for example, `v0.1.0`) to run the Windows release workflow; a
+mismatched tag fails before publishing. Nexir checks `hydrylmz/nexir` releases
+in the background and only accepts the exact asset name above. The initial ZIP
+provides the runtime DLLs, while subsequent in-app updates replace only
+`nexir.exe`, so do not delete the DLLs from the installation directory.
+
 ## Testing
 
 Tests live beside the code they cover, plus `src/tests/` for the integration

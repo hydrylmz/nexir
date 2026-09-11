@@ -15,6 +15,7 @@ mod image_still;
 pub mod layout;
 #[cfg(test)]
 mod media_pool_tests;
+mod self_update;
 mod waveform;
 
 struct SimpleFileLogger {

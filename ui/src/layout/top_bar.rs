@@ -1,3 +1,4 @@
+use crate::self_update::{UpdateStatus, UpdateView};
 use egui::{Color32, Ui};
 use nexir::project::ProjectSettings;
 use nexir::timeline::rational::Rational;
@@ -11,6 +12,10 @@ pub enum TopBarAction {
     Save,
     SaveAs,
     Export,
+    InstallUpdate,
+    RetryUpdate,
+    DismissUpdateError,
+    RestartUpdatedApp,
 }
 
 /// Persistent state for the top bar (kept alive across frames via egui memory).
@@ -24,6 +29,7 @@ pub fn draw(
     can_undo: bool,
     can_redo: bool,
     settings: &mut ProjectSettings,
+    updater: UpdateView<'_>,
 ) -> Option<TopBarAction> {
     // Load/store persistent state in egui memory so it survives across frames.
     let mut state = ui.ctx().data(|d| {
@@ -137,6 +143,50 @@ pub fn draw(
 
             ui.add_space(8.0);
             ui.label("nexir Editor");
+
+            match updater.status {
+                UpdateStatus::Available { version } => {
+                    ui.add_space(8.0);
+                    if ui
+                        .button(
+                            egui::RichText::new(format!("v{version} available — Update & Restart"))
+                                .color(Color32::from_rgb(120, 210, 255)),
+                        )
+                        .clicked()
+                    {
+                        action = Some(TopBarAction::InstallUpdate);
+                    }
+                }
+                UpdateStatus::Installing { version } => {
+                    ui.add_space(8.0);
+                    ui.spinner();
+                    ui.label(format!("Installing v{version}…"));
+                }
+                UpdateStatus::Installed { version } => {
+                    ui.add_space(8.0);
+                    if ui.button(format!("Restart to use v{version}")).clicked() {
+                        action = Some(TopBarAction::RestartUpdatedApp);
+                    }
+                }
+                UpdateStatus::RestartError { version, message } => {
+                    ui.add_space(8.0);
+                    ui.colored_label(Color32::from_rgb(255, 140, 120), message);
+                    if ui.button(format!("Retry restart for v{version}")).clicked() {
+                        action = Some(TopBarAction::RestartUpdatedApp);
+                    }
+                }
+                UpdateStatus::Error { message, can_retry } => {
+                    ui.add_space(8.0);
+                    ui.colored_label(Color32::from_rgb(255, 140, 120), message);
+                    if *can_retry && ui.small_button("Retry").clicked() {
+                        action = Some(TopBarAction::RetryUpdate);
+                    }
+                    if ui.small_button("Dismiss").clicked() {
+                        action = Some(TopBarAction::DismissUpdateError);
+                    }
+                }
+                UpdateStatus::Checking | UpdateStatus::UpToDate | UpdateStatus::Unsupported => {}
+            }
         });
     });
 
@@ -166,7 +216,7 @@ pub fn draw(
                     ui.label("built in Rust with wgpu + egui.");
                     ui.add_space(12.0);
                     ui.label(
-                        egui::RichText::new("v0.1.0")
+                        egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                             .monospace()
                             .color(Color32::LIGHT_GRAY),
                     );
