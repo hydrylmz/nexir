@@ -12,7 +12,6 @@ pub const CU_DEVICE_ATTRIBUTE_PCI_BUS_ID:    i32 = 33;
 pub const CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID: i32 = 34;
 pub const CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID: i32 = 50;
 
-#[link(name = "cuda")]
 unsafe extern "C" {
     pub fn cuInit(flags: u32) -> CUresult;
 
