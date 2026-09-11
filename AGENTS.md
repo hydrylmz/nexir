@@ -2,6 +2,16 @@
 
 GPU-accelerated non-linear video editor in Rust. Workspace with two packages: `nexir` (library) and `ui` (winit+egui desktop app).
 
+## Architecture map
+
+ARCHITECTURE.md contains the full module tree for both crates (`nexir` and `ui`),
+generated with `cargo-modules`. Read it before exploring the codebase manually —
+it lists every module, struct, enum, and function with its visibility.
+
+Regenerate after adding/removing modules or functions:
+    cargo modules structure -p nexir --lib > ARCHITECTURE.md
+    cargo modules structure -p ui >> ARCHITECTURE.md
+
 ## Build & Dev Commands
 
 ```bash
