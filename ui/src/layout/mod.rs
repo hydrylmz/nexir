@@ -6,3 +6,4 @@ pub mod relink_dialog;
 pub mod timeline;
 pub mod top_bar;
 pub mod viewport;
+pub mod keyframe_editor;

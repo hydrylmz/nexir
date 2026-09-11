@@ -375,6 +375,7 @@ pub fn remove_clip(store: &mut TimelineStore, id: ClipId) -> Result<(), Mutation
     store.pitch.remove(idx);
     store.effect_start.remove(idx);
     store.effect_count.remove(idx);
+    store.keyframes.remove_clip(id);
 
     Ok(())
 }
@@ -387,6 +388,7 @@ pub fn move_clip(
     let idx = store.index_of(id).ok_or(MutationError::ClipNotFound(id))?;
 
     let duration = store.pts_out[idx] - store.pts_in[idx];
+    let delta = new_pts_in - store.pts_in[idx];
     let new_pts_out = new_pts_in + duration;
 
     let params = ClipInsertParams {
@@ -413,8 +415,11 @@ pub fn move_clip(
         pitch: store.pitch[idx],
     };
 
+    let new_id = insert_clip(store, params)?;
+    store.keyframes.copy_clip_keyframes(id, new_id, None);
+    store.keyframes.shift_clip_keyframes(new_id, delta);
     remove_clip(store, id)?;
-    insert_clip(store, params)
+    Ok(new_id)
 }
 
 pub fn trim_clip_in(
@@ -437,12 +442,13 @@ pub fn trim_clip_in(
         });
     }
 
+    let pts_out = store.pts_out[idx];
     let params = ClipInsertParams {
         track_id: store.track_ids[idx],
         source_id: store.source_ids[idx],
         kind: store.kind[idx].clone(),
         pts_in: new_pts_in,
-        pts_out: store.pts_out[idx],
+        pts_out,
         source_in: new_source_in,
         layer_order: store.layer_order[idx],
         opacity: store.opacity[idx],
@@ -461,8 +467,10 @@ pub fn trim_clip_in(
         pitch: store.pitch[idx],
     };
 
+    let new_id = insert_clip(store, params)?;
+    store.keyframes.copy_clip_keyframes(id, new_id, Some((new_pts_in, pts_out)));
     remove_clip(store, id)?;
-    insert_clip(store, params)
+    Ok(new_id)
 }
 
 pub fn trim_clip_out(
@@ -476,6 +484,7 @@ pub fn trim_clip_out(
         return Err(MutationError::TrimPastOppositeEnd);
     }
 
+    store.keyframes.trim_clip_keyframes(id, store.pts_in[idx], new_pts_out);
     store.pts_out[idx] = new_pts_out;
     Ok(())
 }
@@ -526,7 +535,10 @@ pub fn split_clip(
     store.pts_out[idx] = split_pts;
     store.fade_out_pts[idx] = 0;
 
-    insert_clip(store, params)
+    let tail_id = insert_clip(store, params)?;
+    store.keyframes.copy_clip_keyframes(id, tail_id, Some((split_pts, pts_out)));
+    store.keyframes.trim_clip_keyframes(id, pts_in, split_pts);
+    Ok(tail_id)
 }
 
 pub fn duplicate_clip(store: &mut TimelineStore, id: ClipId) -> Result<ClipId, MutationError> {

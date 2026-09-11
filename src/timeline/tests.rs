@@ -1506,6 +1506,126 @@ mod tests {
         set_matte_mode(&mut store, id, MatteMode::LumaMatte).unwrap();
         assert_eq!(store.matte_mode_at(0), MatteMode::LumaMatte);
     }
+
+    // ── Keyframe Animation Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_keyframe_linear_and_hold_interpolation() {
+        use crate::timeline::keyframe::{AnimParam, InterpMode, KeyframeStore};
+        use crate::timeline::ids::ClipId;
+
+        let mut store = KeyframeStore::new();
+        let clip = ClipId(1);
+
+        // Linear interpolation between 0.0 at PTS 0 and 100.0 at PTS 1000
+        store.set_keyframe(clip, AnimParam::Opacity, 0, 0.0, InterpMode::Linear);
+        store.set_keyframe(clip, AnimParam::Opacity, 1000, 100.0, InterpMode::Linear);
+
+        // Clamping before first keyframe
+        assert_eq!(store.eval(clip, AnimParam::Opacity, -500), Some(0.0));
+        assert_eq!(store.eval(clip, AnimParam::Opacity, 0), Some(0.0));
+
+        // Exact midpoint
+        assert_eq!(store.eval(clip, AnimParam::Opacity, 500), Some(50.0));
+        assert_eq!(store.eval(clip, AnimParam::Opacity, 250), Some(25.0));
+        assert_eq!(store.eval(clip, AnimParam::Opacity, 750), Some(75.0));
+
+        // Clamping after last keyframe
+        assert_eq!(store.eval(clip, AnimParam::Opacity, 1000), Some(100.0));
+        assert_eq!(store.eval(clip, AnimParam::Opacity, 2000), Some(100.0));
+
+        // Hold interpolation
+        store.set_keyframe(clip, AnimParam::Brightness, 0, 10.0, InterpMode::Hold);
+        store.set_keyframe(clip, AnimParam::Brightness, 1000, 50.0, InterpMode::Hold);
+
+        assert_eq!(store.eval(clip, AnimParam::Brightness, 0), Some(10.0));
+        assert_eq!(store.eval(clip, AnimParam::Brightness, 499), Some(10.0));
+        assert_eq!(store.eval(clip, AnimParam::Brightness, 999), Some(10.0));
+        assert_eq!(store.eval(clip, AnimParam::Brightness, 1000), Some(50.0));
+        assert_eq!(store.eval(clip, AnimParam::Brightness, 1500), Some(50.0));
+
+        // Untracked param returns None
+        assert_eq!(store.eval(clip, AnimParam::Saturation, 500), None);
+    }
+
+    #[test]
+    fn test_keyframe_add_remove_move() {
+        use crate::timeline::keyframe::{AnimParam, InterpMode, KeyframeStore};
+        use crate::timeline::ids::ClipId;
+
+        let mut store = KeyframeStore::new();
+        let clip = ClipId(1);
+
+        store.set_keyframe(clip, AnimParam::Scale, 100, 1.0, InterpMode::Linear);
+        store.set_keyframe(clip, AnimParam::Scale, 300, 2.0, InterpMode::Linear);
+        assert!(store.has_keyframe_at(clip, AnimParam::Scale, 100));
+        assert!(store.has_keyframe_at(clip, AnimParam::Scale, 300));
+        assert!(!store.has_keyframe_at(clip, AnimParam::Scale, 200));
+
+        // Move keyframe
+        assert!(store.move_keyframe(clip, AnimParam::Scale, 100, 200));
+        assert!(!store.has_keyframe_at(clip, AnimParam::Scale, 100));
+        assert!(store.has_keyframe_at(clip, AnimParam::Scale, 200));
+        assert_eq!(store.eval(clip, AnimParam::Scale, 200), Some(1.0));
+
+        // Remove keyframe
+        assert!(store.remove_keyframe(clip, AnimParam::Scale, 200));
+        assert!(!store.has_keyframe_at(clip, AnimParam::Scale, 200));
+        assert_eq!(store.eval(clip, AnimParam::Scale, 300), Some(2.0));
+    }
+
+    #[test]
+    fn test_keyframe_timeline_mutations() {
+        use crate::timeline::keyframe::{AnimParam, InterpMode};
+
+        let mut store = TimelineStore::new();
+        let p = make_test_params(TrackId(0), 0, 1000, 0);
+        let id = insert_clip(&mut store, p).unwrap();
+
+        store.keyframes_mut().set_keyframe(id, AnimParam::Opacity, 0, 0.0, InterpMode::Linear);
+        store.keyframes_mut().set_keyframe(id, AnimParam::Opacity, 1000, 1.0, InterpMode::Linear);
+
+        // Split at 500
+        let tail_id = split_clip(&mut store, id, 500).unwrap();
+
+        // Head should have keyframe at 0 (and clamped after)
+        assert!(store.keyframes().has_keyframe_at(id, AnimParam::Opacity, 0));
+        assert!(!store.keyframes().has_keyframe_at(id, AnimParam::Opacity, 1000));
+        assert_eq!(store.keyframes().eval(id, AnimParam::Opacity, 0), Some(0.0));
+
+        // Tail should have keyframe at 1000
+        assert!(store.keyframes().has_keyframe_at(tail_id, AnimParam::Opacity, 1000));
+        assert_eq!(store.keyframes().eval(tail_id, AnimParam::Opacity, 1000), Some(1.0));
+
+        // Move clip shifts keyframes
+        let moved_id = move_clip(&mut store, tail_id, 800).unwrap();
+        // Tail was at [500..1000] with key at 1000. Now moved to [800..1300], delta is +300 -> key is at 1300
+        assert!(store.keyframes().has_keyframe_at(moved_id, AnimParam::Opacity, 1300));
+        assert_eq!(store.keyframes().eval(moved_id, AnimParam::Opacity, 1300), Some(1.0));
+
+        // Remove clip removes keyframes
+        remove_clip(&mut store, id).unwrap();
+        assert!(!store.keyframes().has_any_keyframes_for_clip(id));
+    }
+
+    #[test]
+    fn test_keyframe_serialization_roundtrip_and_compat() {
+        use crate::timeline::keyframe::{AnimParam, InterpMode};
+
+        let mut store = TimelineStore::new();
+        let p = make_test_params(TrackId(0), 0, 1000, 0);
+        let id = insert_clip(&mut store, p).unwrap();
+        store.keyframes_mut().set_keyframe(id, AnimParam::Rotation, 500, 45.0, InterpMode::Linear);
+
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(json.contains("Rotation"));
+
+        let deserialized: TimelineStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.keyframes().eval(id, AnimParam::Rotation, 500), Some(45.0));
+
+        // Backward compatibility: deserialize JSON without keyframes field
+        let raw_json = json.replace("\"keyframes\":", "\"old_unused\":");
+        let legacy: TimelineStore = serde_json::from_str(&raw_json).unwrap();
+        assert!(legacy.keyframes().is_empty());
+    }
 }
-
-

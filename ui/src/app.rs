@@ -597,6 +597,8 @@ impl NexirApp {
 
         self.advance_playhead(just_started_playing);
 
+        let playhead_pts = self.project.frame_to_pts(self.timeline.playhead_frame);
+
         egui::SidePanel::right("inspector")
             .resizable(true)
             .default_width(320.0)
@@ -608,11 +610,11 @@ impl NexirApp {
                     &mut self.project,
                     self.timeline.selected_clip,
                     &mut self.history,
+                    playhead_pts,
                 );
             });
 
         // Query active clips to pass to viewport for interaction (hit testing, drawing handles)
-        let playhead_pts = self.project.frame_to_pts(self.timeline.playhead_frame);
         let mut active_clips = Vec::new();
         query_active(&self.project.clips, playhead_pts, &mut active_clips);
 

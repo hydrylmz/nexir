@@ -9,4 +9,5 @@ pub mod mutation;
 pub mod transform;
 pub mod timecode;
 pub mod marker;
+pub mod keyframe;
 pub mod tests;

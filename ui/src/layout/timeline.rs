@@ -1024,6 +1024,31 @@ pub fn draw(
                             clip_text_color,
                         );
                     }
+
+                    // ── Keyframe Diamonds on Clip ─────────────────────────
+                    if !is_being_dragged && !is_being_resized {
+                        for track in project.clips.keyframes().tracks_for_clip(clip_id) {
+                            for key in &track.keys {
+                                let key_frame = project.pts_to_frame(key.pts);
+                                if key_frame >= frame_in && key_frame <= frame_out {
+                                    let kf_x = clip_rect.min.x + (key_frame - frame_in) as f32 * state.zoom;
+                                    let kf_center = egui::pos2(kf_x, clip_rect.bottom() - 6.0);
+                                    let diamond_size = 4.0;
+                                    let points = [
+                                        egui::pos2(kf_center.x, kf_center.y - diamond_size),
+                                        egui::pos2(kf_center.x + diamond_size, kf_center.y),
+                                        egui::pos2(kf_center.x, kf_center.y + diamond_size),
+                                        egui::pos2(kf_center.x - diamond_size, kf_center.y),
+                                    ];
+                                    ui.painter().add(egui::Shape::convex_polygon(
+                                        points.to_vec(),
+                                        Color32::from_rgb(0, 220, 255),
+                                        egui::Stroke::new(1.0, Color32::from_rgb(20, 20, 20)),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 } // end clips loop
 
                 // Deselect on empty lane click
