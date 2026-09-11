@@ -1,7 +1,8 @@
-// src/scheduler/island.rs
+﻿// src/scheduler/island.rs
 
 use std::collections::HashMap;
 use crate::timeline::ids::{TrackId, SourceId};
+use crate::timeline::keyframe::AnimParam;
 use crate::timeline::transform::{ClipTransform, BlendMode, CropRect, CornerPin, MatteMode, ClipEffects};
 use crate::timeline::store::TimelineStore;
 use crate::timeline::source::SourceRegistry;
@@ -39,25 +40,100 @@ pub fn build_islands(
     store:          &TimelineStore,
     source_reg:     &SourceRegistry,
     active_indices: &[ActiveClip],
-    _query_pts:     i64,
+    query_pts:      i64,
 ) -> Vec<Island> {
     let mut island_map: HashMap<TrackId, Island> = HashMap::new();
+    let kf_store = store.keyframes();
 
     for active in active_indices {
         let idx = active.store_index;
+        let clip_id = store.clip_id_at(idx);
         
         let track_id   = store.track_id_at(idx);
         let source_id  = store.source_id_at(idx);
         let source_pts = active.source_pts;
-        let transform  = *store.transform_at(idx);
-        let opacity    = store.opacity_at(idx);
+        let mut transform  = *store.transform_at(idx);
+        let mut opacity    = store.opacity_at(idx);
         let blend_mode = store.blend_mode_at(idx);
-        let crop       = *store.crop_at(idx);
+        let mut crop       = *store.crop_at(idx);
         let corner_pin = *store.corner_pin_at(idx);
         let matte_mode = store.matte_mode_at(idx);
-        let effects    = store.effects_at(idx);
+        let mut effects    = store.effects_at(idx);
         let layer      = store.layer_order_at(idx);
         let (effect_start, effect_count) = store.effect_range_at(idx);
+
+        // Evaluate animated parameters at query_pts
+        if let Some(op) = kf_store.eval(clip_id, AnimParam::Opacity, query_pts) {
+            opacity = op.clamp(0.0, 1.0);
+        }
+        if let Some(px) = kf_store.eval(clip_id, AnimParam::PositionX, query_pts) {
+            transform.position[0] = px;
+        }
+        if let Some(py) = kf_store.eval(clip_id, AnimParam::PositionY, query_pts) {
+            transform.position[1] = py;
+        }
+        if let Some(scale) = kf_store.eval(clip_id, AnimParam::Scale, query_pts) {
+            transform.scale = [scale, scale];
+        }
+        if let Some(rot) = kf_store.eval(clip_id, AnimParam::Rotation, query_pts) {
+            transform.rotation = rot;
+        }
+
+        if let Some(cl) = kf_store.eval(clip_id, AnimParam::CropLeft, query_pts) {
+            crop.left = cl;
+        }
+        if let Some(ct) = kf_store.eval(clip_id, AnimParam::CropTop, query_pts) {
+            crop.top = ct;
+        }
+        if let Some(cr) = kf_store.eval(clip_id, AnimParam::CropRight, query_pts) {
+            crop.right = cr;
+        }
+        if let Some(cb) = kf_store.eval(clip_id, AnimParam::CropBottom, query_pts) {
+            crop.bottom = cb;
+        }
+        if let Some(cf) = kf_store.eval(clip_id, AnimParam::CropFeather, query_pts) {
+            crop.feather = cf;
+        }
+
+        if let Some(b) = kf_store.eval(clip_id, AnimParam::Brightness, query_pts) {
+            effects.brightness = b;
+        }
+        if let Some(c) = kf_store.eval(clip_id, AnimParam::Contrast, query_pts) {
+            effects.contrast = c;
+        }
+        if let Some(s) = kf_store.eval(clip_id, AnimParam::Saturation, query_pts) {
+            effects.saturation = s;
+        }
+        if let Some(h) = kf_store.eval(clip_id, AnimParam::HueShift, query_pts) {
+            effects.hue = h;
+        }
+        if let Some(r) = kf_store.eval(clip_id, AnimParam::BlurRadius, query_pts) {
+            effects.blur_radius = r;
+        }
+        if let Some(sig) = kf_store.eval(clip_id, AnimParam::BlurSigma, query_pts) {
+            effects.blur_sigma = sig;
+        }
+        if let Some(sh) = kf_store.eval(clip_id, AnimParam::SharpenAmount, query_pts) {
+            effects.sharpen_amount = sh;
+        }
+        if let Some(vi) = kf_store.eval(clip_id, AnimParam::VignetteIntensity, query_pts) {
+            effects.vignette_intensity = vi;
+        }
+        if let Some(vr) = kf_store.eval(clip_id, AnimParam::VignetteRadius, query_pts) {
+            effects.vignette_radius = vr;
+        }
+        if let Some(vs) = kf_store.eval(clip_id, AnimParam::VignetteSoftness, query_pts) {
+            effects.vignette_softness = vs;
+        }
+        if let Some(vround) = kf_store.eval(clip_id, AnimParam::VignetteRoundness, query_pts) {
+            effects.vignette_roundness = vround;
+        }
+        if let Some(ct) = kf_store.eval(clip_id, AnimParam::ChromaKeyTolerance, query_pts) {
+            effects.chroma_key_tolerance = ct;
+        }
+        if let Some(cs) = kf_store.eval(clip_id, AnimParam::ChromaKeySoftness, query_pts) {
+            effects.chroma_key_softness = cs;
+        }
         
         let (clip_width, clip_height) = {
             let kind = store.kind_at(idx);
@@ -80,7 +156,6 @@ pub fn build_islands(
                     .unwrap_or((1920, 1080))
             }
         };
-
 
         let kind = store.kind_at(idx).clone();
 
