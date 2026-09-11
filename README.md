@@ -137,12 +137,47 @@ current user can write to (for example, under `%LOCALAPPDATA%`); installing unde
 `Program Files` can prevent the updater from replacing the executable without
 UAC elevation.
 
-Releases use the workspace version in `Cargo.toml`. Push a matching
-`v<version>` tag (for example, `v0.1.0`) to run the Windows release workflow; a
-mismatched tag fails before publishing. Nexir checks `hydrylmz/nexir` releases
-in the background and only accepts the exact asset name above. The initial ZIP
-provides the runtime DLLs, while subsequent in-app updates replace only
-`nexir.exe`, so do not delete the DLLs from the installation directory.
+Nexir checks `hydrylmz/nexir` releases in the background and only accepts the
+exact asset name above. When a release has a version newer than the running
+application, the UI offers **Update & Restart**. The initial ZIP provides the
+runtime DLLs, while subsequent in-app updates replace only `nexir.exe`, so do
+not delete the DLLs from the installation directory.
+
+#### Publishing the next release
+
+The authoritative version is `[workspace.package].version` in the root
+`Cargo.toml`; both the `nexir` and `ui` packages inherit it. To publish a new
+release (for example, `0.1.2`):
+
+1. Create a branch from the current `main`; do not prepare a release from an
+   unrelated or dirty working tree.
+2. Change the workspace version in `Cargo.toml` from the current version to
+   `0.1.2` and refresh `Cargo.lock`. Verify that both workspace packages report
+   `0.1.2` with `cargo metadata --no-deps --format-version 1`.
+3. Run the relevant tests and a locked release build:
+   `cargo test -p ui`, then `cargo build -p ui --release --locked` from a
+   Developer PowerShell prompt with the documented FFmpeg prerequisites.
+4. Commit the version and lockfile changes, open a pull request, and merge it
+   into `main`.
+5. Tag the merge commit with the exact matching annotated tag and push it:
+
+   ```powershell
+   git switch main
+   git pull --ff-only origin main
+   git tag -a v0.1.2 -m "Nexir v0.1.2"
+   git push origin v0.1.2
+   ```
+
+6. Watch the **Release Windows** workflow. It rejects a tag that differs from
+   the Cargo workspace version, builds with `--locked`, creates
+   `nexir-x86_64-pc-windows-msvc.zip`, and publishes the GitHub release.
+7. On the release page, confirm that the ZIP exists and contains root-level
+   `nexir.exe` plus all required FFmpeg DLLs.
+
+Always increment the version and create a new tag. Never move, delete, or reuse
+a public release tag to repair a failed release; merge the fix, increment the
+patch version, and publish a new tag instead. Existing installations will then
+detect the strictly newer semantic version and offer **Update & Restart**.
 
 ## Testing
 
