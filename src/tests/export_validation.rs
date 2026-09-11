@@ -36,15 +36,18 @@ mod export_validation {
     use crate::timeline::mutation::{insert_clip, ClipInsertParams};
     use crate::timeline::rational::Rational;
     use crate::timeline::source::{
-        ColorInfo, MatrixCoefficients, PixelFormat, SourceRegistry, VideoStreamInfo,
-        VideoRotation,
+        AudioStreamInfo, ColorInfo, MatrixCoefficients, PixelFormat, SampleFormat, SourceRegistry,
+        VideoRotation, VideoStreamInfo,
     };
     use crate::timeline::store::{ClipKind, TimelineStore};
     use crate::timeline::track::{Track, TrackList};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    const TB: Rational = Rational { num: 1, den: 90_000 };
+    const TB: Rational = Rational {
+        num: 1,
+        den: 90_000,
+    };
     const FPS: Rational = Rational { num: 30, den: 1 };
 
     /// Export canvas.  320x240 keeps the encode fast, and both dimensions are
@@ -64,12 +67,12 @@ mod export_validation {
     /// ABGR10 repack test uses, so a channel swap anywhere in the chain shows up
     /// as a specific patch being wrong rather than as uniform noise.
     const PATCHES: [(&str, [u8; 3]); 6] = [
-        ("black",     [0, 0, 0]),
-        ("white",     [255, 255, 255]),
-        ("red",       [255, 0, 0]),
-        ("green",     [0, 255, 0]),
-        ("blue",      [0, 0, 255]),
-        ("50% gray",  [128, 128, 128]),
+        ("black", [0, 0, 0]),
+        ("white", [255, 255, 255]),
+        ("red", [255, 0, 0]),
+        ("green", [0, 255, 0]),
+        ("blue", [0, 0, 255]),
+        ("50% gray", [128, 128, 128]),
     ];
 
     /// Per-channel tolerance for the round trip, in 8-bit levels.
@@ -127,6 +130,278 @@ mod export_validation {
         write_test_pattern_sized(path, W, H);
     }
 
+    /// Write deterministic stereo 16-bit PCM so the export test has no codec or
+    /// fixture dependency before the encoder under test sees the samples.
+    fn write_test_tone(path: &Path, duration_pts: i64, frequency_hz: f32) {
+        const SAMPLE_RATE: u32 = 48_000;
+        const CHANNELS: u16 = 2;
+        const BITS_PER_SAMPLE: u16 = 16;
+        let samples = ((duration_pts as i128 * SAMPLE_RATE as i128) / TB.den as i128) as u32;
+        let data_len = samples * CHANNELS as u32 * (BITS_PER_SAMPLE as u32 / 8);
+        let byte_rate = SAMPLE_RATE * CHANNELS as u32 * (BITS_PER_SAMPLE as u32 / 8);
+        let block_align = CHANNELS * (BITS_PER_SAMPLE / 8);
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&CHANNELS.to_le_bytes());
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&BITS_PER_SAMPLE.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for n in 0..samples {
+            let phase = std::f32::consts::TAU * frequency_hz * n as f32 / SAMPLE_RATE as f32;
+            let sample = (phase.sin() * 12_000.0).round() as i16;
+            wav.extend_from_slice(&sample.to_le_bytes());
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(path, wav).expect("failed to write test tone WAV");
+    }
+
+    fn add_audio_clip(harness: &Harness, wav_path: &Path, pts_in: i64, pts_out: i64) {
+        let duration_pts = pts_out - pts_in;
+        let source_id = harness.sources.write().unwrap().register(
+            wav_path.to_path_buf(),
+            None,
+            Some(AudioStreamInfo {
+                sample_rate: 48_000,
+                channels: 2,
+                sample_fmt: SampleFormat::I16Interleaved,
+                duration_pts,
+            }),
+        );
+        let track_id = {
+            let mut tracks = harness.tracks.write().unwrap();
+            let id = crate::timeline::ids::TrackId(tracks.iter().count() as u8);
+            tracks
+                .push(Track::new_audio(id, "A1"))
+                .expect("failed to add the audio track")
+        };
+        insert_clip(
+            &mut harness.timeline.write().unwrap(),
+            ClipInsertParams {
+                track_id,
+                source_id,
+                kind: ClipKind::Audio,
+                pts_in,
+                pts_out,
+                ..Default::default()
+            },
+        )
+        .expect("failed to insert the test audio clip");
+    }
+
+    fn probe_audio_packets(path: &Path) -> Vec<(i64, i64)> {
+        let mut demuxer = crate::io::demuxer::Demuxer::open(path)
+            .expect("failed to open the export for audio verification");
+        assert!(
+            demuxer.audio_stream().is_some(),
+            "exported file has no audio stream"
+        );
+        let mut packets = Vec::new();
+        loop {
+            match demuxer.next_audio_packet() {
+                Ok(Some(packet)) => packets.push((packet.pts, packet.duration)),
+                Ok(None) => break,
+                Err(e) => panic!("demuxing exported audio failed: {e:?}"),
+            }
+        }
+        packets
+    }
+
+    fn decode_audio_levels(path: &Path) -> (f32, f32, usize) {
+        use crate::audio::ffi::avresample::{
+            swr_alloc_set_opts, swr_convert, swr_free, swr_init, AV_CH_LAYOUT_STEREO,
+            AV_SAMPLE_FMT_FLTP,
+        };
+        use crate::io::ffi::avcodec::{
+            avcodec_ctx_get_channel_layout, avcodec_ctx_get_channels, avcodec_ctx_get_sample_fmt,
+            avcodec_ctx_get_sample_rate, avcodec_receive_frame, avcodec_send_packet,
+        };
+        use crate::io::ffi::avutil::{
+            av_frame_alloc, av_frame_free, av_frame_get_data, av_frame_get_nb_samples,
+            AVERROR_EAGAIN, AVERROR_EOF,
+        };
+
+        let mut demuxer = crate::io::demuxer::Demuxer::open(path)
+            .expect("failed to open export for audio decoding");
+        let stream = demuxer
+            .audio_stream()
+            .cloned()
+            .expect("exported file has no audio stream");
+        let decoder = crate::io::decoder::Decoder::open(&stream, stream.codecpar, false)
+            .expect("failed to open exported audio decoder");
+        let (mut layout, channels, format, sample_rate) = unsafe {
+            let ctx = decoder.ctx();
+            (
+                avcodec_ctx_get_channel_layout(ctx),
+                avcodec_ctx_get_channels(ctx),
+                avcodec_ctx_get_sample_fmt(ctx),
+                avcodec_ctx_get_sample_rate(ctx),
+            )
+        };
+        if layout == 0 {
+            layout = if channels == 1 { 4 } else { 3 };
+        }
+        let swr = unsafe {
+            swr_alloc_set_opts(
+                std::ptr::null_mut(),
+                AV_CH_LAYOUT_STEREO as i64,
+                AV_SAMPLE_FMT_FLTP,
+                48_000,
+                layout as i64,
+                format,
+                sample_rate,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            !swr.is_null(),
+            "failed to allocate exported audio resampler"
+        );
+        assert!(
+            unsafe { swr_init(swr) } >= 0,
+            "failed to initialize exported audio resampler"
+        );
+        let frame = unsafe { av_frame_alloc() };
+        assert!(!frame.is_null(), "failed to allocate exported audio frame");
+        let mut left = Vec::<f32>::new();
+        let mut right = Vec::<f32>::new();
+        let decode_error = std::cell::RefCell::new(None::<String>);
+
+        let mut receive = |draining: bool| unsafe {
+            loop {
+                let ret = avcodec_receive_frame(decoder.ctx(), frame);
+                if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
+                    break;
+                }
+                if ret < 0 {
+                    *decode_error.borrow_mut() = Some(format!("audio receive failed: {ret}"));
+                    break;
+                }
+                let input_count = av_frame_get_nb_samples(frame).max(0) as usize;
+                if input_count == 0 {
+                    continue;
+                }
+                let output_count = input_count * 48_000 / sample_rate.max(1) as usize + 32;
+                let base = left.len();
+                left.resize(base + output_count, 0.0);
+                right.resize(base + output_count, 0.0);
+                let mut planes = [
+                    left[base..].as_mut_ptr() as *mut u8,
+                    right[base..].as_mut_ptr() as *mut u8,
+                ];
+                let converted = swr_convert(
+                    swr,
+                    planes.as_mut_ptr(),
+                    output_count as i32,
+                    av_frame_get_data(frame) as *const *const u8,
+                    input_count as i32,
+                );
+                if converted < 0 {
+                    *decode_error.borrow_mut() =
+                        Some(format!("audio resample failed: {converted}"));
+                    break;
+                }
+                left.truncate(base + converted as usize);
+                right.truncate(base + converted as usize);
+            }
+            draining
+        };
+
+        loop {
+            match demuxer.next_audio_packet() {
+                Ok(Some(packet)) => unsafe {
+                    let ret = avcodec_send_packet(decoder.ctx(), packet.as_ptr());
+                    if ret < 0 && ret != AVERROR_EAGAIN {
+                        *decode_error.borrow_mut() =
+                            Some(format!("audio packet send failed: {ret}"));
+                        break;
+                    }
+                    receive(false);
+                },
+                Ok(None) => break,
+                Err(e) => {
+                    *decode_error.borrow_mut() = Some(format!("audio demux failed: {e:?}"));
+                    break;
+                }
+            }
+        }
+        unsafe {
+            let ret = avcodec_send_packet(decoder.ctx(), std::ptr::null());
+            if ret < 0 && ret != AVERROR_EOF {
+                *decode_error.borrow_mut() = Some(format!("audio drain send failed: {ret}"));
+            } else {
+                receive(true);
+            }
+        }
+        drop(receive);
+        unsafe {
+            let mut frame_ptr = frame;
+            av_frame_free(&mut frame_ptr);
+            let mut swr_ptr = swr;
+            swr_free(&mut swr_ptr);
+        }
+        let decode_error = decode_error.into_inner();
+        assert!(
+            decode_error.is_none(),
+            "{}",
+            decode_error.unwrap_or_default()
+        );
+        assert!(!left.is_empty(), "exported audio decoded no PCM samples");
+        let sample_count = left.len().min(right.len()) * 2;
+        let mut peak = 0.0f32;
+        let mut sum_squares = 0.0f64;
+        for sample in left.iter().chain(right.iter()) {
+            peak = peak.max(sample.abs());
+            sum_squares += (*sample as f64) * (*sample as f64);
+        }
+        let rms = (sum_squares / sample_count as f64).sqrt() as f32;
+        (peak, rms, sample_count)
+    }
+
+    fn assert_audio_program(path: &Path, duration_pts: i64, label: &str) {
+        let packets = probe_audio_packets(path);
+        assert!(
+            !packets.is_empty(),
+            "{label}: exported file has no audio packets"
+        );
+        let demuxer = crate::io::demuxer::Demuxer::open(path)
+            .expect("failed to reopen export for audio duration");
+        let stream = demuxer
+            .audio_stream()
+            .expect("exported file has no audio stream");
+        let expected = TB.rescale_pts(duration_pts, stream.time_base);
+        // AAC reports its priming packet before PTS zero. Exclude that codec delay
+        // from the rendered program span, while retaining final-frame padding.
+        let start = packets.iter().map(|p| p.0).min().unwrap().max(0);
+        let end = packets.iter().map(|p| p.0 + p.1.max(0)).max().unwrap();
+        let tolerance = TB
+            .rescale_pts(TB.den * 1024 / 48_000, stream.time_base)
+            .abs()
+            + 1;
+        assert!(
+            (end - start - expected).abs() <= tolerance,
+            "{label}: audio spans {} stream ticks, expected {expected} ± {tolerance}; packets={}",
+            end - start,
+            packets.len(),
+        );
+        let (peak, rms, sample_count) = decode_audio_levels(path);
+        assert!(
+            peak > 0.05,
+            "{label}: decoded audio is silent or too quiet (peak={peak}, samples={sample_count})"
+        );
+        assert!(
+            rms > 0.01,
+            "{label}: decoded audio is silent or too quiet (rms={rms}, samples={sample_count})"
+        );
+    }
+
     /// Limited-range YUV → RGB for the matrix the file is tagged with.
     ///
     /// Both matrices are needed because the two encoder paths land on different
@@ -145,7 +420,7 @@ mod export_validation {
         // Kr = 0.2126 / Kb = 0.0722, BT.601 uses Kr = 0.299 / Kb = 0.114.
         let (ar, bg, cg, db) = match matrix {
             MatrixCoefficients::Bt601 => (1.402, 0.344_136, 0.714_136, 1.772),
-            _                         => (1.5748, 0.187_324, 0.468_124, 1.8556),
+            _ => (1.5748, 0.187_324, 0.468_124, 1.8556),
         };
 
         let r = yf + ar * vf;
@@ -161,14 +436,14 @@ mod export_validation {
 
     /// A decoded frame's planes, copied out of the decoder's staging buffer.
     struct DecodedFrame {
-        width:  u32,
+        width: u32,
         height: u32,
         /// Matrix the file is tagged with, so `rgb_at` inverts the same conversion
         /// the encoder applied rather than a hardcoded guess.
         matrix: MatrixCoefficients,
-        y:      Vec<u8>,
-        u:      Vec<u8>,
-        v:      Vec<u8>,
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
     }
 
     impl DecodedFrame {
@@ -177,7 +452,8 @@ mod export_validation {
             assert!(
                 x < self.width && y < self.height,
                 "sample ({x},{y}) is outside the decoded {}x{} frame",
-                self.width, self.height
+                self.width,
+                self.height
             );
             let cw = self.width.div_ceil(2);
             let yi = (y * self.width + x) as usize;
@@ -204,26 +480,24 @@ mod export_validation {
             .clone()
             .expect("exported file has no video stream");
 
-        let width  = stream.width.expect("exported stream has no width");
+        let width = stream.width.expect("exported stream has no width");
         let height = stream.height.expect("exported stream has no height");
 
         // Raw codecpar, not `StreamInfo::color_info`: the latter fills unspecified
         // fields in with resolution heuristics, which would report BT.601 for this
         // SD frame regardless of what the file says.
-        let tagged_matrix = match unsafe {
-            crate::io::ffi::avcodec::avcodecpar_get_color_space(stream.codecpar)
-        } {
-            5 | 6 => MatrixCoefficients::Bt601, // BT470BG / SMPTE170M
-            9     => MatrixCoefficients::Bt2020,
-            _     => MatrixCoefficients::Bt709,
-        };
+        let tagged_matrix =
+            match unsafe { crate::io::ffi::avcodec::avcodecpar_get_color_space(stream.codecpar) } {
+                5 | 6 => MatrixCoefficients::Bt601, // BT470BG / SMPTE170M
+                9 => MatrixCoefficients::Bt2020,
+                _ => MatrixCoefficients::Bt709,
+            };
         eprintln!("[export_validation] stream is tagged matrix {tagged_matrix:?}");
 
         // enable_hw = false: a hardware decoder would hand back NV12 (or a
         // hw-frame that needs a transfer), and this check wants one fixed layout.
-        let mut decoder =
-            crate::io::decoder::Decoder::open_sw(&stream, stream.codecpar)
-                .expect("failed to open a software decoder for the exported file");
+        let mut decoder = crate::io::decoder::Decoder::open_sw(&stream, stream.codecpar)
+            .expect("failed to open a software decoder for the exported file");
 
         // Big enough for YUV444 at this size, so a surprise pixel format cannot
         // overflow the buffer.
@@ -267,7 +541,8 @@ mod export_validation {
                 frame.meta.layout.bit_depth
             );
             assert_eq!(
-                (w, h), (width, height),
+                (w, h),
+                (width, height),
                 "decoded frame size does not match the stream header"
             );
 
@@ -277,7 +552,7 @@ mod export_validation {
             let chroma_len = cw * ch;
 
             frames.push(DecodedFrame {
-                width:  w,
+                width: w,
                 height: h,
                 matrix: tagged_matrix,
                 y: buf[..luma_len].to_vec(),
@@ -306,7 +581,7 @@ mod export_validation {
                     let ch = h.div_ceil(2) as usize;
                     let chroma_len = cw * ch;
                     frames.push(DecodedFrame {
-                        width:  w,
+                        width: w,
                         height: h,
                         matrix: tagged_matrix,
                         y: buf[..luma_len].to_vec(),
@@ -328,7 +603,11 @@ mod export_validation {
         eprintln!(
             "[export_validation] decoded {} frame(s) from {} packet(s) \
              ({} need-more-input, {} from the drain, {} error(s))",
-            frames.len(), packets_read, empty_returns, drained, decode_errors
+            frames.len(),
+            packets_read,
+            empty_returns,
+            drained,
+            decode_errors
         );
         assert_eq!(
             decode_errors, 0,
@@ -341,8 +620,8 @@ mod export_validation {
     /// One demuxed packet's container timing, for the P1.5 timestamp assertions.
     #[derive(Debug, Clone, Copy)]
     struct PacketTiming {
-        pts:      i64,
-        dts:      i64,
+        pts: i64,
+        dts: i64,
         keyframe: bool,
     }
 
@@ -366,8 +645,8 @@ mod export_validation {
         loop {
             match demuxer.next_video_packet() {
                 Ok(Some(p)) => out.push(PacketTiming {
-                    pts:      p.pts,
-                    dts:      p.dts,
+                    pts: p.pts,
+                    dts: p.dts,
                     keyframe: p.is_keyframe(),
                 }),
                 Ok(None) => break,
@@ -398,13 +677,10 @@ mod export_validation {
     /// constant: the muxer rescales into the container's own timebase (mp4 picks
     /// one from the stream's), so the numeric spacing is a property of the file,
     /// not of the job. What matters is that it is uniform.
-    fn assert_packet_timing_is_sane(
-        packets: &[PacketTiming],
-        expected_frames: usize,
-        label: &str,
-    ) {
+    fn assert_packet_timing_is_sane(packets: &[PacketTiming], expected_frames: usize, label: &str) {
         assert_eq!(
-            packets.len(), expected_frames,
+            packets.len(),
+            expected_frames,
             "{label}: the container holds {} video packet(s), expected {expected_frames}",
             packets.len()
         );
@@ -428,14 +704,19 @@ mod export_validation {
                 p.dts <= p.pts,
                 "{label}: packet {i} has DTS {} > PTS {} — a frame cannot be \
                  decoded after it is presented",
-                p.dts, p.pts
+                p.dts,
+                p.pts
             );
         }
 
         // 3.
         let mut seen: Vec<i64> = packets.iter().map(|p| p.pts).collect();
         seen.sort_unstable();
-        assert_eq!(seen[0], 0, "{label}: the earliest PTS is {} , expected 0", seen[0]);
+        assert_eq!(
+            seen[0], 0,
+            "{label}: the earliest PTS is {} , expected 0",
+            seen[0]
+        );
         if expected_frames > 1 {
             let step = seen[1] - seen[0];
             assert!(
@@ -445,11 +726,13 @@ mod export_validation {
             );
             for (i, w) in seen.windows(2).enumerate() {
                 assert_eq!(
-                    w[1] - w[0], step,
+                    w[1] - w[0],
+                    step,
                     "{label}: the PTS grid steps by {} between frames {i} and {} \
                      but by {step} elsewhere — a frame was dropped, duplicated, or \
                      stamped off-grid. Sorted PTS: {seen:?}",
-                    w[1] - w[0], i + 1
+                    w[1] - w[0],
+                    i + 1
                 );
             }
         }
@@ -467,20 +750,24 @@ mod export_validation {
             "[export_validation] {label}: {} packet(s), DTS strictly increasing, \
              reordering {}",
             packets.len(),
-            if reordered { "PRESENT (B-frames)" } else { "absent" }
+            if reordered {
+                "PRESENT (B-frames)"
+            } else {
+                "absent"
+            }
         );
     }
 
     /// Everything the export engine needs, built around one still-image clip
     /// holding the test pattern.
     struct Harness {
-        device:    Arc<GpuDevice>,
+        device: Arc<GpuDevice>,
         scheduler: Arc<FrameScheduler>,
-        timeline:  Arc<std::sync::RwLock<TimelineStore>>,
-        tracks:    Arc<std::sync::RwLock<TrackList>>,
-        sources:   Arc<std::sync::RwLock<SourceRegistry>>,
-        shaders:   Arc<ShaderRegistry>,
-        compute:   Arc<ComputePipelineCache>,
+        timeline: Arc<std::sync::RwLock<TimelineStore>>,
+        tracks: Arc<std::sync::RwLock<TrackList>>,
+        sources: Arc<std::sync::RwLock<SourceRegistry>>,
+        shaders: Arc<ShaderRegistry>,
+        compute: Arc<ComputePipelineCache>,
         /// Kept alive so the prefetch worker's channel does not disconnect.
         _shutdown: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -497,12 +784,11 @@ mod export_validation {
     fn build_harness_sized(
         pattern_path: &Path,
         duration_pts: i64,
-        width:  u32,
+        width: u32,
         height: u32,
     ) -> Harness {
-        let device = Arc::new(
-            pollster::block_on(GpuDevice::new_headless()).expect("headless GpuDevice"),
-        );
+        let device =
+            Arc::new(pollster::block_on(GpuDevice::new_headless()).expect("headless GpuDevice"));
 
         let sources = Arc::new(std::sync::RwLock::new(SourceRegistry::new()));
         let source_id = {
@@ -512,13 +798,13 @@ mod export_validation {
                 Some(VideoStreamInfo {
                     width,
                     height,
-                    frame_rate:   FPS,
-                    pixel_fmt:    PixelFormat::Rgba8,
-                    color_info:   ColorInfo::srgb(),
+                    frame_rate: FPS,
+                    pixel_fmt: PixelFormat::Rgba8,
+                    color_info: ColorInfo::srgb(),
                     duration_pts,
-                    is_vfr:       false,
-                    time_base:    TB,
-                    rotation:     VideoRotation::None,
+                    is_vfr: false,
+                    time_base: TB,
+                    rotation: VideoRotation::None,
                 }),
                 None, // no audio stream
             )
@@ -574,9 +860,8 @@ mod export_validation {
 
         let scheduler = Arc::new(FrameScheduler::new(io_layer, width, height));
 
-        let shaders = Arc::new(
-            ShaderRegistry::compile_all(&device).expect("shader compilation failed"),
-        );
+        let shaders =
+            Arc::new(ShaderRegistry::compile_all(&device).expect("shader compilation failed"));
         let compute = Arc::new(ComputePipelineCache::new());
 
         Harness {
@@ -596,34 +881,29 @@ mod export_validation {
     }
 
     /// [`make_job`] at an arbitrary output resolution.
-    fn make_job_sized(
-        output: PathBuf,
-        duration_pts: i64,
-        width:  u32,
-        height: u32,
-    ) -> ExportJob {
+    fn make_job_sized(output: PathBuf, duration_pts: i64, width: u32, height: u32) -> ExportJob {
         ExportJob {
-            output_path:    output,
-            container:      Container::Mp4,
-            video_codec:    VideoCodec::H264,
-            audio_codec:    AudioCodec::Aac,
+            output_path: output,
+            container: Container::Mp4,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::Aac,
             // CRF 18 keeps flat patches close to lossless without making the
             // encode slow enough to matter here.
-            quality:        VideoQuality::Crf(18),
-            audio_bitrate:  128_000,
-            pts_in:         0,
-            pts_out:        duration_pts,
+            quality: VideoQuality::Crf(18),
+            audio_bitrate: 128_000,
+            pts_in: 0,
+            pts_out: duration_pts,
             width,
             height,
-            frame_rate:     FPS,
-            project_tb:     TB,
+            frame_rate: FPS,
+            project_tb: TB,
             // One segment: keeps frame order and the encoder's GOP simple.
             render_threads: 1,
-            cpu_preset:     CpuPreset::Medium,
-            output_color:   crate::timeline::source::ColorInfo::bt709(),
+            cpu_preset: CpuPreset::Medium,
+            output_color: crate::timeline::source::ColorInfo::bt709(),
             // SDR by default; the HDR test calls `set_hdr10` on the returned job
             // so the colour tags and the static metadata can never disagree.
-            hdr10:          None,
+            hdr10: None,
         }
     }
 
@@ -738,9 +1018,9 @@ mod export_validation {
                 Some(update) => {
                     last = update.phase.clone();
                     match update.phase {
-                        ExportPhase::Done
-                        | ExportPhase::Cancelled
-                        | ExportPhase::Failed(_) => return (last, backend_is_nvenc),
+                        ExportPhase::Done | ExportPhase::Cancelled | ExportPhase::Failed(_) => {
+                            return (last, backend_is_nvenc);
+                        }
                         _ => {}
                     }
                 }
@@ -750,6 +1030,54 @@ mod export_validation {
         panic!("export did not reach a terminal phase within {timeout:?} (last phase: {last:?})");
     }
 
+    fn start_cpu_export(
+        harness: &Harness,
+        job: ExportJob,
+    ) -> crate::export::progress::ProgressReceiver {
+        let capability = InteropCapability::probe(&harness.device);
+        ExportEngine::new(
+            Arc::clone(&harness.device),
+            job,
+            Arc::clone(&harness.scheduler),
+            Arc::clone(&harness.timeline),
+            Arc::clone(&harness.tracks),
+            Arc::clone(&harness.sources),
+            capability,
+            None,
+            true,
+        )
+        .start(Arc::clone(&harness.shaders), Arc::clone(&harness.compute))
+        .expect("ExportEngine::start failed")
+    }
+
+    fn terminal_updates(
+        rx: &crate::export::progress::ProgressReceiver,
+        timeout: std::time::Duration,
+    ) -> Vec<ExportPhase> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut terminal = Vec::new();
+        let mut terminal_seen_at = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(update) = rx.try_recv() {
+                if matches!(
+                    update.phase,
+                    ExportPhase::Done | ExportPhase::Cancelled | ExportPhase::Failed(_)
+                ) {
+                    terminal.push(update.phase);
+                    terminal_seen_at.get_or_insert_with(std::time::Instant::now);
+                }
+                continue;
+            }
+            if terminal_seen_at
+                .is_some_and(|seen| seen.elapsed() >= std::time::Duration::from_millis(100))
+            {
+                return terminal;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("export did not complete within {timeout:?}; terminal updates: {terminal:?}");
+    }
+
     /// Assert that the exported container describes the colour the job asked for.
     ///
     /// Reads the RAW `AVCodecParameters` codes rather than `StreamInfo::color_info`
@@ -757,10 +1085,14 @@ mod export_validation {
     /// resolution heuristics, so going through it would report Rec.709 for a file
     /// that carries no colour description at all — which is the exact failure this
     /// is meant to catch.
-    fn assert_container_color(path: &Path, expected: &crate::timeline::source::ColorInfo, label: &str) {
+    fn assert_container_color(
+        path: &Path,
+        expected: &crate::timeline::source::ColorInfo,
+        label: &str,
+    ) {
         use crate::io::ffi::avcodec::{
-            avcodecpar_get_color_space, avcodecpar_get_color_range,
-            avcodecpar_get_color_trc, avcodecpar_get_color_primaries,
+            avcodecpar_get_color_primaries, avcodecpar_get_color_range, avcodecpar_get_color_space,
+            avcodecpar_get_color_trc,
         };
 
         let demuxer = crate::io::demuxer::Demuxer::open(path)
@@ -780,23 +1112,27 @@ mod export_validation {
         };
 
         assert_eq!(
-            space, expected.av_color_space(),
+            space,
+            expected.av_color_space(),
             "{label}: container colour space is {space}, expected {} — \
              the encoder's VUI / the mp4 `colr` box was not written",
             expected.av_color_space()
         );
         assert_eq!(
-            trc, expected.av_color_trc(),
+            trc,
+            expected.av_color_trc(),
             "{label}: container transfer characteristic is {trc}, expected {}",
             expected.av_color_trc()
         );
         assert_eq!(
-            primaries, expected.av_color_primaries(),
+            primaries,
+            expected.av_color_primaries(),
             "{label}: container colour primaries are {primaries}, expected {}",
             expected.av_color_primaries()
         );
         assert_eq!(
-            range, expected.av_color_range(),
+            range,
+            expected.av_color_range(),
             "{label}: container colour range is {range}, expected {} — \
              a wrong range flag shifts every level by 16/235 on playback",
             expected.av_color_range()
@@ -905,21 +1241,27 @@ mod export_validation {
             std::time::Duration::from_secs(120),
         );
         assert_eq!(
-            phase, ExportPhase::Done,
+            phase,
+            ExportPhase::Done,
             "CPU export did not finish cleanly: {phase:?}"
         );
 
         assert!(mp4.exists(), "export reported Done but produced no file");
         let size = std::fs::metadata(&mp4).unwrap().len();
-        assert!(size > 1024, "exported file is implausibly small ({size} bytes)");
+        assert!(
+            size > 1024,
+            "exported file is implausibly small ({size} bytes)"
+        );
 
         let (frames, pts_list) = decode_file(&mp4, expected_frames + 4);
 
         assert_eq!(
-            frames.len(), expected_frames,
+            frames.len(),
+            expected_frames,
             "decoded {} frame(s) from the export, expected {} — the muxer or the \
              encoder flush is dropping frames",
-            frames.len(), expected_frames
+            frames.len(),
+            expected_frames
         );
 
         // Decoded frames arrive in presentation order, so this only says the
@@ -936,11 +1278,7 @@ mod export_validation {
         // a complete PTS grid, and a keyframe first.  `decode_file` above cannot
         // see any of that, because the decoder reorders before handing frames
         // back.
-        assert_packet_timing_is_sane(
-            &probe_packet_timing(&mp4),
-            expected_frames,
-            "cpu export",
-        );
+        assert_packet_timing_is_sane(&probe_packet_timing(&mp4), expected_frames, "cpu export");
 
         // Every frame shows the same static pattern, so check the first, a middle
         // one and the last: that also catches a pipeline that only gets the first
@@ -951,7 +1289,11 @@ mod export_validation {
 
         // P1.7 — the colour description the job asked for must survive to the
         // container.  On this path it travels encoder context → codecpar.
-        assert_container_color(&mp4, &make_job(mp4.clone(), duration_pts).output_color, "cpu export");
+        assert_container_color(
+            &mp4,
+            &make_job(mp4.clone(), duration_pts).output_color,
+            "cpu export",
+        );
 
         let _ = std::fs::remove_file(&png);
         if std::env::var("NEXIR_KEEP_EXPORT").is_ok() {
@@ -959,6 +1301,128 @@ mod export_validation {
         } else {
             let _ = std::fs::remove_file(&mp4);
         }
+    }
+
+    #[test]
+    fn external_audio_is_muxed_at_its_timeline_duration() {
+        init_logging();
+        let _guard = export_lock();
+        let png = scratch("external_audio").with_extension("png");
+        let wav = scratch("external_audio").with_extension("wav");
+        let mp4 = scratch("external_audio").with_extension("mp4");
+        write_test_pattern(&png);
+
+        let duration_pts = 12 * (TB.den / FPS.num);
+        write_test_tone(&wav, duration_pts, 440.0);
+        let harness = build_harness(&png, duration_pts);
+        add_audio_clip(&harness, &wav, 0, duration_pts);
+
+        let (phase, _) = run_export(
+            &harness,
+            make_job(mp4.clone(), duration_pts),
+            true,
+            std::time::Duration::from_secs(120),
+        );
+        assert_eq!(phase, ExportPhase::Done, "audio export failed: {phase:?}");
+        assert_audio_program(&mp4, duration_pts, "external audio");
+
+        let _ = std::fs::remove_file(&png);
+        let _ = std::fs::remove_file(&wav);
+        let _ = std::fs::remove_file(&mp4);
+    }
+
+    #[test]
+    fn overlapping_audio_clips_share_one_timeline_program() {
+        init_logging();
+        let _guard = export_lock();
+        let png = scratch("overlap_audio").with_extension("png");
+        let wav_a = scratch("overlap_audio_a").with_extension("wav");
+        let wav_b = scratch("overlap_audio_b").with_extension("wav");
+        let mp4 = scratch("overlap_audio").with_extension("mp4");
+        write_test_pattern(&png);
+
+        let duration_pts = 12 * (TB.den / FPS.num);
+        write_test_tone(&wav_a, duration_pts, 440.0);
+        write_test_tone(&wav_b, duration_pts, 660.0);
+        let harness = build_harness(&png, duration_pts);
+        add_audio_clip(&harness, &wav_a, 0, duration_pts);
+        add_audio_clip(&harness, &wav_b, 0, duration_pts);
+
+        let (phase, _) = run_export(
+            &harness,
+            make_job(mp4.clone(), duration_pts),
+            true,
+            std::time::Duration::from_secs(120),
+        );
+        assert_eq!(phase, ExportPhase::Done, "overlap export failed: {phase:?}");
+        assert_audio_program(&mp4, duration_pts, "overlapping audio");
+
+        let _ = std::fs::remove_file(&png);
+        let _ = std::fs::remove_file(&wav_a);
+        let _ = std::fs::remove_file(&wav_b);
+        let _ = std::fs::remove_file(&mp4);
+    }
+
+    #[test]
+    fn cancelling_external_audio_export_emits_one_terminal_phase() {
+        init_logging();
+        let _guard = export_lock();
+        let png = scratch("cancel_audio").with_extension("png");
+        let wav = scratch("cancel_audio").with_extension("wav");
+        let mp4 = scratch("cancel_audio").with_extension("mp4");
+        write_test_pattern(&png);
+
+        let duration_pts = 120 * (TB.den / FPS.num);
+        write_test_tone(&wav, duration_pts, 440.0);
+        let harness = build_harness(&png, duration_pts);
+        add_audio_clip(&harness, &wav, 0, duration_pts);
+
+        let rx = start_cpu_export(&harness, make_job(mp4.clone(), duration_pts));
+        rx.cancel();
+        let terminal = terminal_updates(&rx, std::time::Duration::from_secs(120));
+        assert_eq!(
+            terminal,
+            vec![ExportPhase::Cancelled],
+            "cancellation must emit exactly one truthful terminal phase"
+        );
+
+        let _ = std::fs::remove_file(&png);
+        let _ = std::fs::remove_file(&wav);
+        let _ = std::fs::remove_file(&mp4);
+    }
+
+    #[test]
+    fn missing_audio_source_fails_once_after_video_worker_stops() {
+        init_logging();
+        let _guard = export_lock();
+        let png = scratch("audio_failure").with_extension("png");
+        let wav = scratch("audio_failure").with_extension("wav");
+        let mp4 = scratch("audio_failure").with_extension("mp4");
+        write_test_pattern(&png);
+
+        let duration_pts = 12 * (TB.den / FPS.num);
+        write_test_tone(&wav, duration_pts, 440.0);
+        let harness = build_harness(&png, duration_pts);
+        add_audio_clip(&harness, &wav, 0, duration_pts);
+        std::fs::remove_file(&wav).expect("failed to remove audio failure fixture");
+
+        let rx = start_cpu_export(&harness, make_job(mp4.clone(), duration_pts));
+        let terminal = terminal_updates(&rx, std::time::Duration::from_secs(120));
+        assert_eq!(
+            terminal.len(),
+            1,
+            "worker failure emitted multiple terminal phases"
+        );
+        match &terminal[0] {
+            ExportPhase::Failed(message) => assert!(
+                message.contains("failed to open audio source"),
+                "unexpected worker failure: {message}"
+            ),
+            phase => panic!("missing audio source should fail export, got {phase:?}"),
+        }
+
+        let _ = std::fs::remove_file(&png);
+        let _ = std::fs::remove_file(&mp4);
     }
 
     /// The colour description reaches the ENCODER context, for an HDR profile that
@@ -994,8 +1458,8 @@ mod export_validation {
             .expect("opening the FFmpeg video encoder failed");
 
         use crate::export::ffi::encoder_ffi::{
-            avcodec_ctx_get_color_space, avcodec_ctx_get_color_range,
-            avcodec_ctx_get_color_trc, avcodec_ctx_get_color_primaries,
+            avcodec_ctx_get_color_primaries, avcodec_ctx_get_color_range,
+            avcodec_ctx_get_color_space, avcodec_ctx_get_color_trc,
         };
         let ctx = encoder.codec_ctx();
         let (space, range, trc, primaries) = unsafe {
@@ -1007,10 +1471,22 @@ mod export_validation {
             )
         };
 
-        assert_eq!(space, 9, "encoder colorspace is {space}, expected 9 (BT2020_NCL)");
-        assert_eq!(trc, 16, "encoder color_trc is {trc}, expected 16 (SMPTE ST 2084 / PQ)");
-        assert_eq!(primaries, 9, "encoder color_primaries is {primaries}, expected 9 (BT.2020)");
-        assert_eq!(range, 1, "encoder color_range is {range}, expected 1 (limited/MPEG)");
+        assert_eq!(
+            space, 9,
+            "encoder colorspace is {space}, expected 9 (BT2020_NCL)"
+        );
+        assert_eq!(
+            trc, 16,
+            "encoder color_trc is {trc}, expected 16 (SMPTE ST 2084 / PQ)"
+        );
+        assert_eq!(
+            primaries, 9,
+            "encoder color_primaries is {primaries}, expected 9 (BT.2020)"
+        );
+        assert_eq!(
+            range, 1,
+            "encoder color_range is {range}, expected 1 (limited/MPEG)"
+        );
 
         // Nothing was written: `open` only opens a codec context.  No file to clean.
     }
@@ -1094,10 +1570,7 @@ mod export_validation {
                 "CUDA interop is unavailable on this machine (transport={:?})",
                 capability.transport
             );
-            assert!(
-                !require_nvenc,
-                "NEXIR_REQUIRE_NVENC is set but {reason}"
-            );
+            assert!(!require_nvenc, "NEXIR_REQUIRE_NVENC is set but {reason}");
             eprintln!(
                 "[export_validation] SKIP nvenc_export_matches_pattern: {reason}. \
                  The GPU export path was NOT exercised."
@@ -1129,18 +1602,24 @@ mod export_validation {
         );
 
         assert_eq!(
-            phase, ExportPhase::Done,
+            phase,
+            ExportPhase::Done,
             "GPU export did not finish cleanly: {phase:?}"
         );
-        assert!(mp4.exists(), "GPU export reported Done but produced no file");
+        assert!(
+            mp4.exists(),
+            "GPU export reported Done but produced no file"
+        );
 
         let expected_frames = job.total_frames();
         let (frames, pts_list) = decode_file(&mp4, expected_frames + 4);
         assert_eq!(
-            frames.len(), expected_frames,
+            frames.len(),
+            expected_frames,
             "GPU export decoded {} frame(s), expected {} — NVENC's EOS flush is \
              dropping the tail of the stream",
-            frames.len(), expected_frames
+            frames.len(),
+            expected_frames
         );
         for w in pts_list.windows(2) {
             assert!(
@@ -1153,11 +1632,7 @@ mod export_validation {
         // CPU path: libavcodec stamps its own DTS, whereas these packets were
         // built by hand in `write_nvenc_packet` from `DtsQueue`.  A regression to
         // `dts = pts` shows up here and nowhere else.
-        assert_packet_timing_is_sane(
-            &probe_packet_timing(&mp4),
-            expected_frames,
-            "gpu export",
-        );
+        assert_packet_timing_is_sane(&probe_packet_timing(&mp4), expected_frames, "gpu export");
 
         assert_frame_matches_pattern(&frames[0], "gpu frame 0");
         assert_frame_matches_pattern(&frames[frames.len() - 1], "gpu last frame");
@@ -1210,10 +1685,10 @@ mod export_validation {
     /// the same properties. Returns `false` when the case was skipped because the
     /// engine did not select NVENC for reasons the caller decides how to treat.
     fn run_nvenc_case(
-        label:  &str,
-        width:  u32,
+        label: &str,
+        width: u32,
         height: u32,
-        codec:  VideoCodec,
+        codec: VideoCodec,
         frames_wanted: usize,
     ) -> bool {
         let tag = format!("{label}_{width}x{height}");
@@ -1251,31 +1726,38 @@ mod export_validation {
              resolution/codec. The [export] log lines above say why \
              EncodeInterop::open was rejected."
         );
-        assert_eq!(phase, ExportPhase::Done, "{tag}: export did not finish cleanly: {phase:?}");
-        assert!(out.exists(), "{tag}: export reported Done but produced no file");
+        assert_eq!(
+            phase,
+            ExportPhase::Done,
+            "{tag}: export did not finish cleanly: {phase:?}"
+        );
+        assert!(
+            out.exists(),
+            "{tag}: export reported Done but produced no file"
+        );
 
         let expected_frames = job.total_frames();
         let (decoded, _) = decode_file(&out, expected_frames + 4);
         assert_eq!(
-            decoded.len(), expected_frames,
+            decoded.len(),
+            expected_frames,
             "{tag}: decoded {} frame(s), expected {expected_frames} — a frame was \
              lost between the encoder and the container",
             decoded.len()
         );
         assert_eq!(
-            (decoded[0].width, decoded[0].height), (width, height),
+            (decoded[0].width, decoded[0].height),
+            (width, height),
             "{tag}: the decoded frame is {}x{}, not the requested size — the \
              encoder or the registration used the wrong dimensions",
-            decoded[0].width, decoded[0].height
+            decoded[0].width,
+            decoded[0].height
         );
 
         // First and last: the first catches a wrong pitch or matrix, the last
         // catches a dropped tail.
         assert_frame_matches_pattern(&decoded[0], &format!("{tag} frame 0"));
-        assert_frame_matches_pattern(
-            &decoded[decoded.len() - 1],
-            &format!("{tag} last frame"),
-        );
+        assert_frame_matches_pattern(&decoded[decoded.len() - 1], &format!("{tag} last frame"));
         assert_packet_timing_is_sane(&probe_packet_timing(&out), expected_frames, &tag);
         assert_container_color(&out, &job.output_color, &tag);
 
@@ -1331,11 +1813,11 @@ mod export_validation {
         // the doc comment above; heights are all multiples of 6 so the six bands
         // divide evenly, and even so 4:2:0 chroma is legal.
         let cases: [(&str, u32, u32, VideoCodec); 5] = [
-            ("res_1080p_h264",    1920, 1080, VideoCodec::H264),
-            ("res_1440p_h265",    2560, 1440, VideoCodec::H265),
-            ("res_2160p_h264",    3840, 2160, VideoCodec::H264),
-            ("res_unaligned_hd",  1918, 1080, VideoCodec::H264),
-            ("res_unaligned_sd",  1282,  722, VideoCodec::H264),
+            ("res_1080p_h264", 1920, 1080, VideoCodec::H264),
+            ("res_1440p_h265", 2560, 1440, VideoCodec::H265),
+            ("res_2160p_h264", 3840, 2160, VideoCodec::H264),
+            ("res_unaligned_hd", 1918, 1080, VideoCodec::H264),
+            ("res_unaligned_sd", 1282, 722, VideoCodec::H264),
         ];
 
         let mut ran = 0usize;
@@ -1349,7 +1831,10 @@ mod export_validation {
                 break;
             }
         }
-        eprintln!("[export_validation] resolution matrix: {ran}/{} case(s) ran", cases.len());
+        eprintln!(
+            "[export_validation] resolution matrix: {ran}/{} case(s) ran",
+            cases.len()
+        );
     }
 
     /// P1.4 — the NVENC EOS flush, at the lengths that can lose a frame.
@@ -1419,12 +1904,11 @@ mod export_validation {
             .video_stream
             .clone()
             .expect("exported HDR file has no video stream");
-        let width  = stream.width.expect("exported HDR stream has no width");
+        let width = stream.width.expect("exported HDR stream has no width");
         let height = stream.height.expect("exported HDR stream has no height");
 
-        let mut decoder =
-            crate::io::decoder::Decoder::open_sw(&stream, stream.codecpar)
-                .expect("failed to open a software decoder for the exported HDR file");
+        let mut decoder = crate::io::decoder::Decoder::open_sw(&stream, stream.codecpar)
+            .expect("failed to open a software decoder for the exported HDR file");
 
         // yuv420p10le is 3 * w * h bytes (2 bytes/sample, 1.5 samples/pixel).
         let mut buf = vec![0u8; width as usize * height as usize * 4 + 64];
@@ -1546,9 +2030,13 @@ mod export_validation {
         job.video_codec = VideoCodec::H265;
         job.set_hdr10(crate::export::job::Hdr10Metadata::bt2020_1000_nits())
             .expect("H.265 must accept an HDR10 configuration");
-        assert!(job.is_hdr(), "set_hdr10 did not put the job on the HDR path");
+        assert!(
+            job.is_hdr(),
+            "set_hdr10 did not put the job on the HDR path"
+        );
         assert_eq!(
-            job.encode_bit_depth(), 10,
+            job.encode_bit_depth(),
+            10,
             "an HDR job must encode at least 10-bit"
         );
         job.validate().expect("the HDR job must validate");
@@ -1565,10 +2053,14 @@ mod export_validation {
             std::time::Duration::from_secs(180),
         );
         assert_eq!(
-            phase, ExportPhase::Done,
+            phase,
+            ExportPhase::Done,
             "HDR export did not finish cleanly: {phase:?}"
         );
-        assert!(mp4.exists(), "HDR export reported Done but produced no file");
+        assert!(
+            mp4.exists(),
+            "HDR export reported Done but produced no file"
+        );
 
         // ── 2. Colour description ────────────────────────────────────────────
         assert_container_color(&mp4, &job.output_color, "hdr export");
@@ -1576,8 +2068,8 @@ mod export_validation {
             use crate::io::ffi::avcodec::{
                 avcodecpar_get_color_primaries, avcodecpar_get_color_trc,
             };
-            let demuxer = crate::io::demuxer::Demuxer::open(&mp4)
-                .expect("failed to reopen the HDR export");
+            let demuxer =
+                crate::io::demuxer::Demuxer::open(&mp4).expect("failed to reopen the HDR export");
             let stream = demuxer.video_stream.clone().expect("no video stream");
             let (trc, primaries) = unsafe {
                 (
@@ -1604,12 +2096,14 @@ mod export_validation {
                 )
             };
             assert_ne!(
-                mask & 1, 0,
+                mask & 1,
+                0,
                 "the container carries no mastering-display metadata (mdcv box) — \
                  an HDR10 file without it is an unmastered grade"
             );
             assert_ne!(
-                mask & 2, 0,
+                mask & 2,
+                0,
                 "the container carries no content-light-level metadata (clli box)"
             );
             assert_eq!(out[0], 1, "mastering display has no primaries");
@@ -1648,8 +2142,8 @@ mod export_validation {
         // colours with a luma that depends on the matrix as well as the curve,
         // which would test two things at once.  Indices are into `PATCHES`.
         for &(idx, name, srgb) in &[
-            (0usize, "black",    0.0f32),
-            (1usize, "white",    1.0f32),
+            (0usize, "black", 0.0f32),
+            (1usize, "white", 1.0f32),
             (5usize, "50% gray", 128.0 / 255.0),
         ] {
             let y = idx as u32 * PATCH_H + PATCH_H / 2;
