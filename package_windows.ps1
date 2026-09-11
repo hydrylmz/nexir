@@ -9,7 +9,7 @@ Write-Host "==================================================" -ForegroundColor
 
 # Step 1: Build the UI binary in Release mode
 Write-Host "[1/5] Building Nexir UI in release mode..." -ForegroundColor Yellow
-cargo build -p ui --release
+cargo build -p ui --release --locked
 
 # Step 2: Create distribution directory
 $distDir = Join-Path $PSScriptRoot "nexir_dist"
@@ -71,18 +71,18 @@ SYSTEM REQUIREMENTS:
 Set-Content -Path (Join-Path $distDir "README.txt") -Value $readmeContent
 
 # Step 5: Archive everything into a single zip file
-$zipFile = Join-Path $PSScriptRoot "nexir_windows_x64.zip"
+$zipFile = Join-Path $PSScriptRoot "nexir-x86_64-pc-windows-msvc.zip"
 if (Test-Path $zipFile) {
     Remove-Item $zipFile
 }
 
-Write-Host "[5/5] Creating zip archive: nexir_windows_x64.zip..." -ForegroundColor Yellow
+Write-Host "[5/5] Creating zip archive: nexir-x86_64-pc-windows-msvc.zip..." -ForegroundColor Yellow
 Compress-Archive -Path (Join-Path $distDir "*") -DestinationPath $zipFile
 
 # Clean up temp dist folder
 Remove-Item -Recurse -Force $distDir
 
 Write-Host "`n==================================================" -ForegroundColor Cyan
-Write-Host "Success! Nexir packaged into nexir_windows_x64.zip" -ForegroundColor Green
+Write-Host "Success! Nexir packaged into nexir-x86_64-pc-windows-msvc.zip" -ForegroundColor Green
 Write-Host "Send this zip to anyone on Windows to run Nexir!" -ForegroundColor Green
 Write-Host "==================================================" -ForegroundColor Cyan

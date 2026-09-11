@@ -1,0 +1,94 @@
+name: Release Windows
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  FFMPEG_ARCHIVE: ffmpeg-8.0.1-r3_x64-windows-shared-gpl-develop.zip
+  FFMPEG_SHA256: 3e4f020329143410b1e3872acee1406b57e30796e9ca5244cfe2f0e7c0d1503b
+  FFMPEG_URL: https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/ffmpeg-8.0.1-r3/ffmpeg-8.0.1-r3_x64-windows-shared-gpl-develop.zip
+  RELEASE_ASSET: nexir-x86_64-pc-windows-msvc.zip
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+          rustup default stable
+
+      - name: Verify tag matches workspace version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object { $_.name -eq "nexir" }).version
+          $uiVersion = ($metadata.packages | Where-Object { $_.name -eq "ui" }).version
+          if ($version -ne $uiVersion) { throw "Workspace packages disagree: nexir=$version ui=$uiVersion" }
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} must equal v$version"
+          }
+
+      - name: Download pinned FFmpeg development bundle
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $env:FFMPEG_ARCHIVE
+          $actual = (Get-FileHash $env:FFMPEG_ARCHIVE -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:FFMPEG_SHA256) { throw "FFmpeg archive checksum mismatch: $actual" }
+          Expand-Archive $env:FFMPEG_ARCHIVE -DestinationPath ffmpeg-package
+          New-Item -ItemType Directory -Force C:\ffmpeg | Out-Null
+          Copy-Item "ffmpeg-package\include" C:\ffmpeg\include -Recurse
+          Copy-Item "ffmpeg-package\lib" C:\ffmpeg\lib -Recurse
+          Copy-Item "ffmpeg-package\bin" C:\ffmpeg\bin -Recurse
+
+      - name: Validate required FFmpeg files
+        shell: pwsh
+        run: |
+          $required = @(
+            "C:\ffmpeg\include\libavcodec\avcodec.h",
+            "C:\ffmpeg\lib\avcodec.lib",
+            "C:\ffmpeg\bin\avcodec-62.dll",
+            "C:\ffmpeg\bin\avdevice-62.dll",
+            "C:\ffmpeg\bin\avfilter-11.dll",
+            "C:\ffmpeg\bin\avformat-62.dll",
+            "C:\ffmpeg\bin\avutil-60.dll",
+            "C:\ffmpeg\bin\swresample-6.dll",
+            "C:\ffmpeg\bin\swscale-9.dll"
+          )
+          $missing = $required | Where-Object { -not (Test-Path $_) }
+          if ($missing) { throw "Required FFmpeg files are missing:`n$($missing -join "`n")" }
+
+      - name: Build release binary
+        shell: pwsh
+        env:
+          VE_FFMPEG_LIB_DIR: C:\ffmpeg\lib
+        run: cargo build -p ui --release --locked
+
+      - name: Package release asset
+        shell: pwsh
+        run: |
+          $dist = "release-dist"
+          New-Item -ItemType Directory $dist | Out-Null
+          Copy-Item target\release\ui.exe "$dist\nexir.exe"
+          $dlls = @(
+            "avcodec-62.dll", "avdevice-62.dll", "avfilter-11.dll",
+            "avformat-62.dll", "avutil-60.dll", "swresample-6.dll", "swscale-9.dll"
+          )
+          foreach ($dll in $dlls) { Copy-Item "C:\ffmpeg\bin\$dll" "$dist\$dll" }
+          Compress-Archive -Path "$dist\*" -DestinationPath $env:RELEASE_ASSET
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          files: nexir-x86_64-pc-windows-msvc.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

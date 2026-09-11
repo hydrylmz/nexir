@@ -45,6 +45,7 @@ fn main() {
     // On Linux: prefer pkg-config for portability.
     // The FFI layer compiles regardless; linking happens at final link time.
 
+    #[cfg(not(target_os = "windows"))]
     println!("cargo:rustc-link-lib=nvidia-encode");
 
     #[cfg(target_os = "linux")]
@@ -59,6 +60,7 @@ fn main() {
     {
         println!("cargo:rustc-link-search=C:/Program Files/NVIDIA Corporation/CUDA/v12.0/lib/x64");
         link_cuda_windows();
+        link_nvenc_windows();
     }
 }
 
@@ -109,7 +111,11 @@ fn link_cuda_windows() {
         return;
     };
 
-    let machine = if target.starts_with("i686") { "X86" } else { "X64" };
+    let machine = if target.starts_with("i686") {
+        "X86"
+    } else {
+        "X64"
+    };
     let out_lib = std::path::Path::new(&out_dir).join("cudaimp.lib");
 
     cmd.arg("/NOLOGO")
@@ -129,5 +135,42 @@ fn link_cuda_windows() {
             String::from_utf8_lossy(&output.stderr).trim(),
         )),
         Err(e) => fall_back(format!("could not run lib.exe: {e}")),
+    }
+}
+
+/// Generate the one-symbol NVENC import library used by the FFI declarations.
+#[cfg(target_os = "windows")]
+fn link_nvenc_windows() {
+    println!("cargo:rerun-if-changed=build/nvidia-encode.def");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let Some(mut cmd) = cc::windows_registry::find(&target, "lib.exe") else {
+        println!("cargo:warning=lib.exe not found; linking any prebuilt nvidia-encode.lib instead");
+        println!("cargo:rustc-link-lib=nvidia-encode");
+        return;
+    };
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is always set for a build script");
+    let def_path = std::path::Path::new("build/nvidia-encode.def");
+    let out_lib = std::path::Path::new(&out_dir).join("nvidia-encode.lib");
+    let machine = if target.starts_with("i686") {
+        "X86"
+    } else {
+        "X64"
+    };
+    cmd.arg("/NOLOGO")
+        .arg(format!("/DEF:{}", def_path.display()))
+        .arg(format!("/MACHINE:{machine}"))
+        .arg(format!("/OUT:{}", out_lib.display()));
+    match cmd.output() {
+        Ok(output) if output.status.success() => {
+            println!("cargo:rustc-link-search=native={out_dir}");
+            println!("cargo:rustc-link-lib=nvidia-encode");
+        }
+        Ok(output) => panic!(
+            "lib.exe failed to build nvidia-encode.lib ({}): {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ),
+        Err(error) => panic!("could not run lib.exe for nvidia-encode.lib: {error}"),
     }
 }

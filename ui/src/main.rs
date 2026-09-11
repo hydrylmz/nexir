@@ -123,7 +123,6 @@ fn main() {
     }));
 
     info!("Starting Nexir UI");
-    self_update::check_for_updates();
 
     let event_loop = EventLoop::new().unwrap();
     let window = Arc::new(
