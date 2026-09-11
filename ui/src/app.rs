@@ -5,6 +5,7 @@ use crate::layout::media_pool::MediaPoolState;
 use crate::layout::recovery_dialog::{self, RecoveryAction};
 use crate::layout::relink_dialog::{self, RelinkDialogState};
 use crate::layout::timeline::TimelineState;
+use crate::self_update::UpdaterState;
 use egui::Context;
 use egui_wgpu::{Renderer, ScreenDescriptor};
 use egui_winit::State;
@@ -150,6 +151,7 @@ pub struct NexirApp {
     pub autosave: AutosaveState,
     pub pending_recovery: Option<RecoveryInfo>,
     pub relink_dialog: RelinkDialogState,
+    updater: UpdaterState,
 }
 
 pub struct AppResponse {
@@ -399,6 +401,7 @@ impl NexirApp {
             autosave,
             pending_recovery,
             relink_dialog,
+            updater: UpdaterState::new(),
         }
     }
 
@@ -410,6 +413,18 @@ impl NexirApp {
     }
 
     pub fn update(&mut self, window: &Window) -> egui::Vec2 {
+        self.updater.poll();
+        if self.updater.ready_to_restart() {
+            let token = self.history.change_token();
+            let project_path = self.current_project_path.as_deref();
+            self.autosave.flush(&self.project, token, project_path);
+            match self.updater.restart() {
+                Ok(()) => self
+                    .egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(message) => self.updater.set_restart_error(message),
+            }
+        }
         let raw_input = self.egui_state.take_egui_input(window);
         self.egui_ctx.begin_frame(raw_input);
 
@@ -443,6 +458,7 @@ impl NexirApp {
                     can_undo,
                     can_redo,
                     &mut self.project.settings,
+                    self.updater.view(),
                 );
             });
             action
@@ -499,6 +515,26 @@ impl NexirApp {
                 }
                 crate::layout::top_bar::TopBarAction::Export => {
                     self.open_export_settings();
+                }
+                crate::layout::top_bar::TopBarAction::InstallUpdate => {
+                    let token = self.history.change_token();
+                    let project_path = self.current_project_path.as_deref();
+                    self.autosave.flush(&self.project, token, project_path);
+                    self.updater.install();
+                }
+                crate::layout::top_bar::TopBarAction::RetryUpdate => {
+                    self.updater.retry_check();
+                }
+                crate::layout::top_bar::TopBarAction::DismissUpdateError => {
+                    self.updater.dismiss_error();
+                }
+                crate::layout::top_bar::TopBarAction::RestartUpdatedApp => {
+                    match self.updater.restart() {
+                        Ok(()) => self
+                            .egui_ctx
+                            .send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(message) => self.updater.set_restart_error(message),
+                    }
                 }
             }
         }
