@@ -31,9 +31,9 @@ impl MediaEntry {
             .to_string_lossy()
             .to_lowercase();
         let kind = match ext.as_str() {
-            "mp4" | "mov" | "mkv" | "avi" | "webm" => MediaKind::Video,
-            "mp3" | "wav" | "aac" | "flac" | "ogg" => MediaKind::Audio,
-            "png" | "jpg" | "jpeg" | "bmp" | "webp" => MediaKind::Image,
+            "mp4" | "mov" | "mkv" | "avi" | "webm" | "mxf" | "m4v" => MediaKind::Video,
+            "mp3" | "wav" | "aac" | "flac" | "ogg" | "m4a" => MediaKind::Audio,
+            "png" | "jpg" | "jpeg" | "bmp" | "webp" | "tiff" => MediaKind::Image,
             _ => MediaKind::Video,
         };
         Self { path, name, kind }
