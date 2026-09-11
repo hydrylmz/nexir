@@ -17,11 +17,21 @@ pub enum QueueItem {
 impl EncoderQueue {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::sync_channel(QUEUE_DEPTH);
-        Self { tx, rx: Mutex::new(rx) }
+        Self {
+            tx,
+            rx: Mutex::new(rx),
+        }
     }
 
     pub fn push(&self, item: QueueItem) {
-        self.tx.send(item).expect("encoder queue receiver disconnected");
+        if self.tx.send(item).is_err() {
+            log::debug!("[export] encoder queue receiver disconnected");
+        }
+    }
+
+    /// Stop the encoder worker without panicking if it has already failed.
+    pub fn finish(&self) {
+        let _ = self.tx.send(QueueItem::AllDone);
     }
 
     pub fn pop(&self) -> Option<QueueItem> {
