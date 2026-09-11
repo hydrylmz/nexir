@@ -131,7 +131,6 @@ pub const CU_AD_FORMAT_HALF:                                u32 = 0x10;
 pub const CU_AD_FORMAT_FLOAT:                               u32 = 0x20;
 pub const CUDA_ARRAY3D_SURFACE_LDST:                        u32 = 2;
 
-#[link(name = "cuda")]
 unsafe extern "C" {
     pub fn cuImportExternalMemory(
         ext_mem: *mut CUexternalMemory,
