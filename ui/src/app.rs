@@ -730,6 +730,12 @@ impl NexirApp {
                         let g = data[byte_offset + 1] as f32 / 255.0;
                         let b = data[byte_offset + 2] as f32 / 255.0;
                         self.inspector.chroma_key_color = [r, g, b];
+                        if let Some(idx) = self.timeline.selected_clip {
+                            self.history.record(&self.project);
+                            let mut eff = self.project.clips.effects_at(idx);
+                            eff.chroma_key_color = [r, g, b];
+                            self.project.clips.set_effects_at(idx, eff);
+                        }
                         log::info!("Eyedropper picked color [{:.3}, {:.3}, {:.3}] at ({}, {})", r, g, b, px, py);
                     }
                 }
@@ -1530,15 +1536,15 @@ impl NexirApp {
                 } else {
                     ((r - g) / delta + 4.0) * 60.0
                 };
-                let tol = (eff.chroma_key_tolerance * 180.0).max(1.0);
-                let soft = (eff.chroma_key_softness * 180.0).min(tol - 0.1).max(0.01);
+                let tol  = (eff.chroma_key_tolerance * 180.0).max(1.0);
+                let soft = (eff.chroma_key_softness  * 180.0).min(tol - 0.1).max(0.01);
                 let ck_params = nexir::render::nodes::chroma_key::ChromaKeyParams {
                     key_hue: hue,
                     tolerance: tol,
                     softness: soft,
-                    min_saturation: 0.15,
-                    min_value: 0.08,
-                    spill_suppress: 0.3,
+                    min_saturation: eff.chroma_key_min_saturation,
+                    min_value: 0.05,
+                    spill_suppress: eff.chroma_key_spill_suppress,
                     width: clip_w,
                     height: clip_h,
                 };

@@ -64,6 +64,8 @@ pub struct InspectorState {
     pub chroma_key_color: [f32; 3],
     pub chroma_key_tolerance: f32,
     pub chroma_key_softness: f32,
+    pub chroma_key_min_saturation: f32,
+    pub chroma_key_spill_suppress: f32,
 
     /// When true, the next viewport click picks a color for chroma key.
     pub eyedropper_active: bool,
@@ -120,6 +122,8 @@ impl Default for InspectorState {
             chroma_key_color: [0.0, 1.0, 0.0],
             chroma_key_tolerance: 0.3,
             chroma_key_softness: 0.1,
+            chroma_key_min_saturation: 0.08,
+            chroma_key_spill_suppress: 0.3,
             eyedropper_active: false,
             last_loaded_clip: None,
         }
@@ -197,6 +201,8 @@ fn draw_inner(
             state.chroma_key_color = eff.chroma_key_color;
             state.chroma_key_tolerance = eff.chroma_key_tolerance;
             state.chroma_key_softness = eff.chroma_key_softness;
+            state.chroma_key_min_saturation = eff.chroma_key_min_saturation;
+            state.chroma_key_spill_suppress = eff.chroma_key_spill_suppress;
 
             // Load text clip properties
             match project.clips.kind_at(idx) {
@@ -1189,6 +1195,20 @@ fn draw_inner(
                                     }
                                 }
                                 ui.end_row();
+
+                                ui.label("Spill Suppress");
+                                let sp_resp = ui.add(egui::Slider::new(&mut state.chroma_key_spill_suppress, 0.0..=1.0).custom_formatter(|n, _| format!("{:.0}%", n * 100.0)));
+                                if sp_resp.changed() {
+                                    effects_changed = true;
+                                }
+                                ui.end_row();
+
+                                ui.label("Min Saturation");
+                                let sat_resp = ui.add(egui::Slider::new(&mut state.chroma_key_min_saturation, 0.0..=1.0).custom_formatter(|n, _| format!("{:.0}%", n * 100.0)));
+                                if sat_resp.changed() {
+                                    effects_changed = true;
+                                }
+                                ui.end_row();
                             });
                     }
                 }
@@ -1216,6 +1236,8 @@ fn draw_inner(
                     chroma_key_color: state.chroma_key_color,
                     chroma_key_tolerance: state.chroma_key_tolerance,
                     chroma_key_softness: state.chroma_key_softness,
+                    chroma_key_min_saturation: state.chroma_key_min_saturation,
+                    chroma_key_spill_suppress: state.chroma_key_spill_suppress,
                 };
                 project.clips.set_effects_at(idx, eff);
             }
