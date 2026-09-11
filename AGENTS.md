@@ -98,6 +98,45 @@ Real-media gap, measured rather than estimated: of 7.18 ms per interop decode, *
   Use the `_v2` name the driver actually exports (`cuMemFree_v2`, not `cuMemFree`).
 - `.cargo/config.toml` sets `/DELAYLOAD:cuda.dll` and `/DELAYLOAD:nvEncodeAPI64.dll` — required for NVENC export
 
+## Windows Release Procedure
+
+The root `[workspace.package].version` in `Cargo.toml` is authoritative; both
+workspace packages inherit it. The GitHub Actions workflow accepts only an
+exact matching `v<version>` tag and publishes the exact updater asset
+`nexir-x86_64-pc-windows-msvc.zip`.
+
+For the next release (for example, `0.1.2` / `v0.1.2`):
+
+1. Start a clean branch from current `origin/main`. Do not release from a dirty
+   feature worktree or include unrelated changes.
+2. Increment `[workspace.package].version` in `Cargo.toml` and refresh
+   `Cargo.lock`. Use `cargo metadata --no-deps --format-version 1` to verify
+   that `nexir` and `ui` expose the same new version.
+3. Run `cargo test -p ui` and
+   `cargo build -p ui --release --locked` with the Windows/FFmpeg build
+   prerequisites above. The tracked lockfile must already match before CI.
+4. Commit both `Cargo.toml` and `Cargo.lock`, open a PR, and merge it to `main`.
+5. Fetch the merged `main`, create an annotated tag on that merge commit, and
+   push only the matching tag:
+
+   ```powershell
+   git switch main
+   git pull --ff-only origin main
+   git tag -a v0.1.2 -m "Nexir v0.1.2"
+   git push origin v0.1.2
+   ```
+
+6. Monitor **Release Windows** through completion. Verify the published ZIP has
+   root-level `nexir.exe` and every required FFmpeg runtime DLL.
+
+Never tag an unmerged branch, reuse a version, or move/delete an already public
+tag to repair a release. Merge the repair, increment the patch version, and
+publish a new tag. Existing Nexir installations compare releases semantically;
+a strictly newer release containing the exact asset is surfaced as **Update &
+Restart**. The initial installation supplies the DLLs, while an in-app update
+replaces only `nexir.exe`, so release packaging must continue to include the
+DLLs for new installations.
+
 ## Architecture
 
 Labelled so the intent of each crate is clear:
